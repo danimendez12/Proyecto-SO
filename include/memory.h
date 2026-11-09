@@ -1,6 +1,19 @@
 #ifndef DSM_MEMORY_H
 #define DSM_MEMORY_H
 
-/* Gestion de la region de memoria local y sus protecciones de pagina. */
+/* Dos vistas MAP_SHARED de un mismo memfd: A_r para la aplicacion y C_r para el gestor. */
+
+#include <stddef.h>
+
+typedef struct dsm_vistas {
+    int fd;
+    size_t bytes;
+    void *a_r;
+    void *c_r;
+} dsm_vistas_t;
+
+int dsm_vistas_crear(size_t bytes, dsm_vistas_t *salida);
+int dsm_vistas_proteger(dsm_vistas_t *vistas, int prot);
+void dsm_vistas_cerrar(dsm_vistas_t *vistas);
 
 #endif
