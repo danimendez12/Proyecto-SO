@@ -2,6 +2,8 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -10,105 +12,171 @@
 #include <time.h>
 #include <unistd.h>
 
-static int esperar(int fd, short evento)
+static int monotono_ms(uint64_t *ms)
 {
-    struct pollfd pfd;
-    pfd.fd = fd;
-    pfd.events = evento;
-    pfd.revents = 0;
-    for (;;) {
-        int rc = poll(&pfd, 1, -1);
-        if (rc < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        return 0;
-    }
-}
-
-int send_all(int fd, const void *buf, size_t len)
-{
-    const uint8_t *p = buf;
-    size_t off = 0;
-    if (p == NULL && len != 0) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         return -1;
     }
-    while (off < len) {
-        ssize_t n = send(fd, p + off, len - off, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (esperar(fd, POLLOUT) != 0) {
-                    return -1;
-                }
-                continue;
-            }
+    *ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return 0;
+}
+
+static int iniciar_plazo(uint32_t timeout_ms, uint64_t *plazo)
+{
+    *plazo = 0;
+    if (timeout_ms != 0) {
+        if (monotono_ms(plazo) != 0) {
             return -1;
         }
-        if (n == 0) {
-            return -1;
-        }
-        off += (size_t)n;
+        *plazo += timeout_ms;
     }
     return 0;
 }
 
-int recv_all(int fd, void *buf, size_t len)
+static int restante_ms(uint64_t plazo)
+{
+    uint64_t ahora;
+    if (monotono_ms(&ahora) != 0) {
+        return -1;
+    }
+    if (ahora >= plazo) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    uint64_t restante = plazo - ahora;
+    return restante > INT_MAX ? INT_MAX : (int)restante;
+}
+
+static int esperar(int fd, short evento, uint64_t plazo)
+{
+    struct pollfd pfd = {.fd = fd, .events = evento};
+    for (;;) {
+        int espera = plazo == 0 ? -1 : restante_ms(plazo);
+        if (plazo != 0 && espera < 0) {
+            return -1;
+        }
+        int rc = poll(&pfd, 1, espera);
+        if (rc > 0) {
+            return 0;
+        }
+        if (rc < 0 && errno != EINTR) {
+            return -1;
+        }
+    }
+}
+
+static int enviar_completo(int fd, const void *buf, size_t len, uint64_t plazo)
+{
+    const uint8_t *p = buf;
+    size_t off = 0;
+    if (p == NULL && len != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    while (off < len) {
+        if (plazo != 0 && restante_ms(plazo) < 0) {
+            return -1;
+        }
+        ssize_t n = send(fd, p + off, len - off, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n > 0) {
+            off += (size_t)n;
+        } else if (n == 0) {
+            errno = EPIPE;
+            return -1;
+        } else if (errno != EINTR) {
+            if ((errno != EAGAIN && errno != EWOULDBLOCK) || esperar(fd, POLLOUT, plazo) != 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int recibir_completo(int fd, void *buf, size_t len, uint64_t plazo)
 {
     uint8_t *p = buf;
     size_t off = 0;
     if (p == NULL && len != 0) {
+        errno = EINVAL;
         return -1;
     }
     while (off < len) {
-        ssize_t n = recv(fd, p + off, len - off, 0);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (esperar(fd, POLLIN) != 0) {
-                    return -1;
-                }
-                continue;
-            }
+        if (plazo != 0 && restante_ms(plazo) < 0) {
             return -1;
         }
-        if (n == 0) {
+        ssize_t n = recv(fd, p + off, len - off, MSG_DONTWAIT);
+        if (n > 0) {
+            off += (size_t)n;
+        } else if (n == 0) {
+            errno = ECONNRESET;
             return -1;
+        } else if (errno != EINTR) {
+            if ((errno != EAGAIN && errno != EWOULDBLOCK) || esperar(fd, POLLIN, plazo) != 0) {
+                return -1;
+            }
         }
-        off += (size_t)n;
     }
+    return 0;
+}
+
+int send_all(int fd, const void *buf, size_t len)
+{
+    return enviar_completo(fd, buf, len, 0);
+}
+
+int recv_all(int fd, void *buf, size_t len)
+{
+    return recibir_completo(fd, buf, len, 0);
+}
+
+int dsm_enviar_trama(int fd, const void *buf, size_t len, uint32_t timeout_ms)
+{
+    uint64_t plazo;
+    if (iniciar_plazo(timeout_ms, &plazo) != 0) {
+        return -1;
+    }
+    return enviar_completo(fd, buf, len, plazo);
+}
+
+static int recibir_trama(int fd, uint8_t *buf, size_t cap, size_t *out, uint64_t plazo)
+{
+    if (buf == NULL || out == NULL || cap < DSM_CABECERA_BYTES) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (recibir_completo(fd, buf, DSM_CABECERA_BYTES, plazo) != 0) {
+        return -1;
+    }
+    dsm_cabecera_t cab;
+    if (dsm_cabecera_decodificar(buf, DSM_CABECERA_BYTES, &cab) != 0) {
+        errno = EPROTO;
+        return -1;
+    }
+    if (cab.longitud > cap) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    size_t resto = cab.longitud - DSM_CABECERA_BYTES;
+    if (recibir_completo(fd, buf + DSM_CABECERA_BYTES, resto, plazo) != 0) {
+        return -1;
+    }
+    *out = cab.longitud;
     return 0;
 }
 
 int dsm_recibir_trama(int fd, uint8_t *buf, size_t cap, size_t *out)
 {
-    if (buf == NULL || out == NULL || cap < DSM_CABECERA_BYTES) {
+    return recibir_trama(fd, buf, cap, out, 0);
+}
+
+int dsm_recibir_trama_plazo(int fd, uint8_t *buf, size_t cap, size_t *out, uint32_t timeout_ms)
+{
+    uint64_t plazo;
+    if (iniciar_plazo(timeout_ms, &plazo) != 0) {
         return -1;
     }
-    if (recv_all(fd, buf, DSM_CABECERA_BYTES) != 0) {
-        return -1;
-    }
-    dsm_cabecera_t cab;
-    if (dsm_cabecera_decodificar(buf, DSM_CABECERA_BYTES, &cab) != 0) {
-        return -1;
-    }
-    if (cab.longitud > cap) {
-        return -1;
-    }
-    if (cab.longitud > DSM_CABECERA_BYTES) {
-        size_t resto = cab.longitud - DSM_CABECERA_BYTES;
-        if (recv_all(fd, buf + DSM_CABECERA_BYTES, resto) != 0) {
-            return -1;
-        }
-    }
-    *out = cab.longitud;
-    return 0;
+    return recibir_trama(fd, buf, cap, out, plazo);
 }
 
 static int activar_nodelay(int fd)
@@ -139,7 +207,7 @@ int dsm_escuchar(uint32_t ipv4_host, uint16_t puerto, int *escucha)
     dir.sin_family = AF_INET;
     dir.sin_port = htons(puerto);
     dir.sin_addr.s_addr = htonl(ipv4_host);
-    if (bind(fd, (struct sockaddr *)&dir, sizeof dir) != 0 || listen(fd, 1) != 0) {
+    if (bind(fd, (struct sockaddr *)&dir, sizeof dir) != 0 || listen(fd, DSM_CONFIG_MAX_NODOS) != 0) {
         close(fd);
         return -1;
     }
@@ -152,9 +220,7 @@ int dsm_aceptar(int escucha, int *conn)
     if (conn == NULL) {
         return -1;
     }
-    struct sockaddr_in dir;
-    socklen_t largo = sizeof dir;
-    int fd = accept(escucha, (struct sockaddr *)&dir, &largo);
+    int fd = accept4(escucha, NULL, NULL, SOCK_CLOEXEC);
     if (fd < 0) {
         return -1;
     }
@@ -166,18 +232,30 @@ int dsm_aceptar(int escucha, int *conn)
     return 0;
 }
 
-int dsm_conectar(uint32_t ipv4_host, uint16_t puerto, int *conn)
+static int cerrar_error(int fd)
+{
+    int error = errno;
+    close(fd);
+    errno = error;
+    return -1;
+}
+
+int dsm_conectar_plazo(uint32_t ipv4_host, uint16_t puerto, uint32_t timeout_ms, int *conn)
 {
     if (conn == NULL || puerto == 0) {
+        errno = EINVAL;
         return -1;
     }
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    uint64_t plazo;
+    if (iniciar_plazo(timeout_ms, &plazo) != 0) {
+        return -1;
+    }
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) {
         return -1;
     }
     if (activar_nodelay(fd) != 0) {
-        close(fd);
-        return -1;
+        return cerrar_error(fd);
     }
     struct sockaddr_in dir;
     memset(&dir, 0, sizeof dir);
@@ -185,11 +263,30 @@ int dsm_conectar(uint32_t ipv4_host, uint16_t puerto, int *conn)
     dir.sin_port = htons(puerto);
     dir.sin_addr.s_addr = htonl(ipv4_host);
     if (connect(fd, (struct sockaddr *)&dir, sizeof dir) != 0) {
-        close(fd);
-        return -1;
+        if ((errno != EINPROGRESS && errno != EINTR) || esperar(fd, POLLOUT, plazo) != 0) {
+            return cerrar_error(fd);
+        }
+        int error = 0;
+        socklen_t largo = sizeof error;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &largo) != 0) {
+            return cerrar_error(fd);
+        }
+        if (error != 0) {
+            errno = error;
+            return cerrar_error(fd);
+        }
+    }
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+        return cerrar_error(fd);
     }
     *conn = fd;
     return 0;
+}
+
+int dsm_conectar(uint32_t ipv4_host, uint16_t puerto, int *conn)
+{
+    return dsm_conectar_plazo(ipv4_host, puerto, 0, conn);
 }
 
 struct alta_ctx {
@@ -197,6 +294,7 @@ struct alta_ctx {
     const dsm_config_t *cfg;
     uint16_t self;
     uint16_t peer;
+    uint64_t plazo;
     uint32_t seq;
     uint32_t id_hello;
     int tiene;
@@ -274,7 +372,7 @@ static int enviar_hello(struct alta_ctx *cx)
     if (dsm_hello_codificar(buf, sizeof buf, &cab, &msg, &n) != 0) {
         return -1;
     }
-    return send_all(cx->fd, buf, n);
+    return enviar_completo(cx->fd, buf, n, cx->plazo);
 }
 
 static int enviar_welcome(struct alta_ctx *cx, uint32_t id_corr)
@@ -315,7 +413,7 @@ static int enviar_welcome(struct alta_ctx *cx, uint32_t id_corr)
     if (dsm_welcome_codificar(buf, sizeof buf, &cab, &msg, &n) != 0) {
         return -1;
     }
-    return send_all(cx->fd, buf, n);
+    return enviar_completo(cx->fd, buf, n, cx->plazo);
 }
 
 static int responder_fuera_de_rango(struct alta_ctx *cx, uint16_t destino, uint32_t id_corr)
@@ -335,9 +433,10 @@ static int responder_fuera_de_rango(struct alta_ctx *cx, uint16_t destino, uint3
     if (dsm_cabecera_codificar(buf, &cab) != 0) {
         return -1;
     }
-    if (send_all(cx->fd, buf, sizeof buf) != 0) {
+    if (enviar_completo(cx->fd, buf, sizeof buf, cx->plazo) != 0) {
         return -1;
     }
+    errno = EPROTO;
     return -1;
 }
 
@@ -366,7 +465,7 @@ static int enviar_latido(struct alta_ctx *cx, dsm_heartbeat_t *enviado, uint32_t
     if (dsm_heartbeat_codificar(buf, sizeof buf, &cab, enviado, &n) != 0) {
         return -1;
     }
-    return send_all(cx->fd, buf, n);
+    return enviar_completo(cx->fd, buf, n, cx->plazo);
 }
 
 static int enviar_latido_ack(struct alta_ctx *cx, const dsm_cabecera_t *pedido,
@@ -387,12 +486,12 @@ static int enviar_latido_ack(struct alta_ctx *cx, const dsm_cabecera_t *pedido,
     if (dsm_heartbeat_codificar(buf, sizeof buf, &cab, eco, &n) != 0) {
         return -1;
     }
-    return send_all(cx->fd, buf, n);
+    return enviar_completo(cx->fd, buf, n, cx->plazo);
 }
 
 static int recibir(struct alta_ctx *cx, uint8_t *buf, size_t cap, size_t *n, dsm_cabecera_t *cab)
 {
-    if (dsm_recibir_trama(cx->fd, buf, cap, n) != 0) {
+    if (recibir_trama(cx->fd, buf, cap, n, cx->plazo) != 0) {
         return -1;
     }
     if (dsm_cabecera_decodificar(buf, *n, cab) != 0) {
@@ -404,7 +503,8 @@ static int recibir(struct alta_ctx *cx, uint8_t *buf, size_t cap, size_t *n, dsm
     return 0;
 }
 
-static int tomar_hello(struct alta_ctx *cx, const uint8_t *buf, size_t n, const dsm_cabecera_t *cab)
+static int tomar_hello(struct alta_ctx *cx, const uint8_t *buf, size_t n,
+                      const dsm_cabecera_t *cab, int identificar_par)
 {
     dsm_hello_t msg;
     dsm_cabecera_t copia;
@@ -417,8 +517,12 @@ static int tomar_hello(struct alta_ctx *cx, const uint8_t *buf, size_t n, const 
     if (msg.node_id != cab->origen) {
         return -1;
     }
-    if (dsm_config_nodo(cx->cfg, msg.node_id) == NULL) {
+    if (dsm_config_nodo(cx->cfg, msg.node_id) == NULL ||
+        (identificar_par && msg.node_id >= cx->self)) {
         return responder_fuera_de_rango(cx, cab->origen, cab->id_msg);
+    }
+    if (identificar_par) {
+        cx->peer = msg.node_id;
     }
     if (anotar(cx, msg.node_id, msg.puerto, msg.ipv4_host, msg.memoria, msg.base, msg.nombre) != 0 ||
         msg.conocidos != 0) {
@@ -543,7 +647,7 @@ static int secuencia_cliente(struct alta_ctx *cx)
         return -1;
     }
     if (recibir(cx, buf, sizeof buf, &n, &cab) != 0 || cab.tipo != DSM_TIPO_NODE_HELLO ||
-        tomar_hello(cx, buf, n, &cab) != 0) {
+        tomar_hello(cx, buf, n, &cab, 0) != 0) {
         return -1;
     }
     if (enviar_welcome(cx, cab.id_msg) != 0) {
@@ -552,13 +656,13 @@ static int secuencia_cliente(struct alta_ctx *cx)
     return ronda_latido_primero_yo(cx);
 }
 
-static int secuencia_servidor(struct alta_ctx *cx)
+static int secuencia_servidor(struct alta_ctx *cx, int identificar_par)
 {
     uint8_t buf[256];
     size_t n = 0;
     dsm_cabecera_t cab;
     if (recibir(cx, buf, sizeof buf, &n, &cab) != 0 || cab.tipo != DSM_TIPO_NODE_HELLO ||
-        tomar_hello(cx, buf, n, &cab) != 0) {
+        tomar_hello(cx, buf, n, &cab, identificar_par) != 0) {
         return -1;
     }
     uint32_t id_hello_ajeno = cab.id_msg;
@@ -572,11 +676,13 @@ static int secuencia_servidor(struct alta_ctx *cx)
     return ronda_latido_primero_el(cx);
 }
 
-int dsm_alta_par(int fd, const dsm_config_t *cfg, uint16_t self_id, uint16_t peer_id,
-                 dsm_alta_resultado_t *out)
+static int alta(int fd, const dsm_config_t *cfg, uint16_t self_id, uint16_t peer_id,
+                int identificar_par, dsm_alta_resultado_t *out)
 {
-    if (cfg == NULL || out == NULL || self_id == peer_id || dsm_config_nodo(cfg, self_id) == NULL ||
-        dsm_config_nodo(cfg, peer_id) == NULL) {
+    if (cfg == NULL || out == NULL || cfg->page_size == 0 ||
+        dsm_config_nodo(cfg, self_id) == NULL ||
+        (!identificar_par && (self_id == peer_id || dsm_config_nodo(cfg, peer_id) == NULL))) {
+        errno = EINVAL;
         return -1;
     }
     struct alta_ctx cx;
@@ -586,7 +692,11 @@ int dsm_alta_par(int fd, const dsm_config_t *cfg, uint16_t self_id, uint16_t pee
     cx.self = self_id;
     cx.peer = peer_id;
     cx.seq = 1;
-    int rc = (self_id < peer_id) ? secuencia_cliente(&cx) : secuencia_servidor(&cx);
+    if (iniciar_plazo(cfg->rpc_timeout_ms, &cx.plazo) != 0) {
+        return -1;
+    }
+    int rc = (!identificar_par && self_id < peer_id) ?
+             secuencia_cliente(&cx) : secuencia_servidor(&cx, identificar_par);
     memset(out, 0, sizeof *out);
     out->hello = cx.hello;
     out->welcome = cx.welcome;
@@ -599,4 +709,15 @@ int dsm_alta_par(int fd, const dsm_config_t *cfg, uint16_t self_id, uint16_t pee
         return -1;
     }
     return 0;
+}
+
+int dsm_alta_par(int fd, const dsm_config_t *cfg, uint16_t self_id, uint16_t peer_id,
+                 dsm_alta_resultado_t *out)
+{
+    return alta(fd, cfg, self_id, peer_id, 0, out);
+}
+
+int dsm_alta_aceptada(int fd, const dsm_config_t *cfg, uint16_t self_id, dsm_alta_resultado_t *out)
+{
+    return alta(fd, cfg, self_id, 0, 1, out);
 }

@@ -252,6 +252,26 @@ static int probar_nodos(const dsm_config_t *cfg)
     return 0;
 }
 
+static int probar_plazo_alta(const dsm_config_t *cfg)
+{
+    int par[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, par) != 0) {
+        return fallar("socketpair para alta sin respuesta");
+    }
+    dsm_config_t corta = *cfg;
+    corta.rpc_timeout_ms = 100;
+    dsm_alta_resultado_t alta;
+    int rc = dsm_alta_par(par[0], &corta, 0, 1, &alta);
+    int error = errno;
+    close(par[0]);
+    close(par[1]);
+    if (rc == 0 || error != ETIMEDOUT) {
+        return fallar("plazo de alta con par silencioso");
+    }
+    puts("alta sin respuesta: ETIMEDOUT");
+    return 0;
+}
+
 int main(void)
 {
     alarm(20);
@@ -262,7 +282,7 @@ int main(void)
     if (dsm_config_cargar("config/lab.ini", &cfg) != 0) {
         return fallar("config");
     }
-    if (probar_nodos(&cfg) != 0) {
+    if (probar_plazo_alta(&cfg) != 0 || probar_nodos(&cfg) != 0) {
         return 1;
     }
     alarm(0);

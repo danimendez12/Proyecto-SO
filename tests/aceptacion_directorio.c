@@ -30,6 +30,57 @@ static int fallar(const char *mensaje)
     return 1;
 }
 
+static int verificar_vistas(dsm_directorio_t *dir, const dsm_cabecera_t *cab,
+                            const dsm_region_info_t *info, const void *remota)
+{
+    dsm_region_info_t invalida = *info;
+    invalida.total_tramos = 2;
+    if (dsm_directorio_instalar(dir, &invalida) == 0) {
+        return fallar("manifiesto incompleto");
+    }
+
+    invalida = *info;
+    invalida.tramos[0].gpn_inicial = (uint64_t)dir->cantidad_nodos * dir->paginas_totales;
+    if (dsm_directorio_instalar(dir, &invalida) == 0) {
+        return fallar("GPN fuera del cluster");
+    }
+
+    invalida = *info;
+    invalida.reserva_id++;
+    invalida.tramos[0].gpn_inicial = UINT64_MAX;
+    if (dsm_directorio_instalar(dir, &invalida) == 0) {
+        return fallar("GPN fuera del cluster");
+    }
+    invalida.tramos[0].gpn_inicial = info->tramos[0].gpn_inicial + 1;
+    dsm_cabecera_t respuesta = *cab;
+    uint8_t trama[76];
+    size_t n;
+    if (dsm_region_info_codificar(trama, sizeof trama, &respuesta, &invalida, &n) != 0 ||
+        dsm_directorio_recibir_info(dir, info->reserva_id, cab->id_corr, trama, n, NULL, NULL) == 0) {
+        return fallar("respuesta para otra reserva");
+    }
+    respuesta.destino = cab->origen;
+    if (dsm_region_info_codificar(trama, sizeof trama, &respuesta, info, &n) != 0 ||
+        dsm_directorio_recibir_info(dir, info->reserva_id, cab->id_corr, trama, n, NULL, NULL) == 0) {
+        return fallar("respuesta para otro nodo");
+    }
+
+    if (dsm_directorio_instalar(dir, info) != 0 || dir->npaginas != 1 || dir->nvistas != 1) {
+        return fallar("instalacion repetida");
+    }
+    dsm_pagina_desc_t local;
+    if (dsm_directorio_reservar_pagina(dir, &local) != 0) {
+        return fallar("reserva local junto a la remota");
+    }
+    void *gestor_local = dsm_directorio_c_r_reserva(dir, local.reserva);
+    if (gestor_local == NULL || gestor_local == remota ||
+        dsm_directorio_c_r_reserva(dir, info->reserva_id) != remota ||
+        dsm_directorio_c_r(dir) != NULL) {
+        return fallar("busqueda de vistas por reserva");
+    }
+    return 0;
+}
+
 static void avisar_escucha(struct trabajo *tx, int estado)
 {
     pthread_mutex_lock(&tx->mu);
@@ -96,14 +147,15 @@ static void *nodo_cero(void *arg)
         avisar_reserva(tx, -1, 0);
         return NULL;
     }
-    uint8_t *gestor = dsm_directorio_c_r(&dir);
-    if (gestor == NULL) {
+    uint8_t *gestor = dsm_directorio_c_r_reserva(&dir, desc.reserva);
+    uint8_t *app = desc.ubicacion_local;
+    if (gestor == NULL || app == NULL) {
         dsm_directorio_cerrar(&dir);
         close(conn);
         avisar_reserva(tx, -1, 0);
         return NULL;
     }
-    gestor[0] = 0xab;
+    app[0] = 0xab;
     pthread_mutex_lock(&tx->mu);
     tx->ubicacion0 = desc.ubicacion_local;
     pthread_mutex_unlock(&tx->mu);
@@ -120,7 +172,7 @@ static void *nodo_cero(void *arg)
     if (publicado == 0 && dir.reservas_globales == 1 && dir.siguiente_local == 2 &&
         dir.paginas_libres == 255 && desc.gpn == 0 && desc.hogar == 0 && desc.poseedor == 0 &&
         desc.reserva == 1 && desc.msi == DSM_MSI_M && desc.version == 0 && desc.orden == 0 &&
-        desc.ubicacion_local != NULL) {
+        desc.ubicacion_local != NULL && gestor[0] == 0xab) {
         tx->ok0 = 1;
     }
     pthread_mutex_lock(&tx->mu);
@@ -185,7 +237,7 @@ static void *nodo_uno(void *arg)
         return NULL;
     }
     uint8_t marca = 0xff;
-    uint8_t *gestor = dsm_directorio_c_r(&dir);
+    uint8_t *gestor = dsm_directorio_c_r_reserva(&dir, reserva);
     if (gestor != NULL) {
         marca = gestor[0];
     }
@@ -210,7 +262,8 @@ static void *nodo_uno(void *arg)
         info.tramos[0].gpn_inicial == 0 && info.tramos[0].cantidad == 1 && dir.reservas_globales == 0 &&
         dir.siguiente_local == 1 && dir.paginas_libres == 256 && dir.npaginas == 1 && desc.gpn == 0 &&
         desc.hogar == 0 && desc.poseedor == DSM_POSEEDOR_NINGUNO && desc.reserva == reserva &&
-        desc.msi == DSM_MSI_I && desc.version == 0 && desc.orden == 0 && marca == 0 && distintas) {
+        desc.msi == DSM_MSI_I && desc.version == 0 && desc.orden == 0 && marca == 0 && distintas &&
+        verificar_vistas(&dir, &cab, &info, gestor) == 0) {
         tx->ok1 = 1;
     }
     dsm_directorio_cerrar(&dir);

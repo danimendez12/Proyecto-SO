@@ -1,5 +1,6 @@
 #include "memory.h"
 
+#include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -51,6 +52,22 @@ int dsm_vistas_proteger(dsm_vistas_t *vistas, int prot)
         return -1;
     }
     return 0;
+}
+
+int dsm_vistas_proteger_pagina(dsm_vistas_t *vistas, size_t indice, size_t page_size, int prot)
+{
+    /* El cociente limita el indice antes de calcular el desplazamiento. */
+    if (vistas == NULL || vistas->a_r == NULL || page_size == 0 ||
+        indice >= vistas->bytes / page_size) {
+        return -1;
+    }
+    long pagina = sysconf(_SC_PAGESIZE);
+    if (pagina <= 0 || page_size % (size_t)pagina != 0 ||
+        (uintptr_t)vistas->a_r % (size_t)pagina != 0) {
+        return -1;
+    }
+    uint8_t *inicio = (uint8_t *)vistas->a_r + indice * page_size;
+    return mprotect(inicio, page_size, prot);
 }
 
 void dsm_vistas_cerrar(dsm_vistas_t *vistas)
