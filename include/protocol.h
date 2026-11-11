@@ -1,7 +1,7 @@
 #ifndef DSM_PROTOCOL_H
 #define DSM_PROTOCOL_H
 
-/* Encabezado de 32 bytes en big-endian y los mensajes de los pasos 2 y 4. */
+/* Encabezado de 32 bytes en big-endian y mensajes TCP del prototipo. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -12,6 +12,8 @@ enum {
     DSM_FLAG_RESPUESTA = 0x0001,
     DSM_CABECERA_BYTES = 32,
     DSM_LONGITUD_MAX = 1048576,
+    DSM_PAGE_REQUEST_BYTES = 48,
+    DSM_PAGE_DATA_BASE = 80,
     DSM_NOMBRE_MAX = 64,
     DSM_MAX_FICHAS = 16,
     DSM_MAX_TRAMOS = 16
@@ -22,6 +24,8 @@ enum {
     DSM_TIPO_NODE_WELCOME = 0x02,
     DSM_TIPO_HEARTBEAT = 0x05,
     DSM_TIPO_HEARTBEAT_ACK = 0x06,
+    DSM_TIPO_PAGE_REQUEST = 0x10,
+    DSM_TIPO_PAGE_DATA = 0x11,
     DSM_TIPO_REGION_LOOKUP = 0x32,
     DSM_TIPO_REGION_INFO = 0x33
 };
@@ -29,6 +33,17 @@ enum {
 enum {
     DSM_ESTADO_OK = 0,
     DSM_ESTADO_RANGO = 12
+};
+
+enum {
+    DSM_MSI_I = 0,
+    DSM_MSI_S = 1,
+    DSM_MSI_M = 2,
+    DSM_ACCESO_LECTURA = 0,
+    DSM_ACCESO_ESCRITURA = 1,
+    DSM_PAGE_PERMISO_LEER = 1,
+    DSM_PAGE_PERMISO_ESCRIBIR = 3,
+    DSM_PAGE_DATA_SIN_CARGA = 0x01
 };
 
 enum {
@@ -85,6 +100,30 @@ typedef struct dsm_heartbeat {
     uint64_t instante_ms;
 } dsm_heartbeat_t;
 
+typedef struct dsm_page_request {
+    uint64_t gpn;
+    uint32_t proc_id;
+    uint8_t acceso;
+    uint8_t msi;
+} dsm_page_request_t;
+
+typedef struct dsm_page_data {
+    uint64_t gpn;
+    uint32_t proc_id;
+    uint32_t reserva_id;
+    uint32_t orden;
+    uint16_t hogar;
+    uint16_t poseedor;
+    uint16_t msi;
+    uint8_t permiso;
+    uint8_t banderas;
+    uint64_t mascara_copias;
+    uint32_t page_nbytes;
+    uint32_t version;
+    /* Al decodificar, apunta a la carga prestada del bufer recibido. */
+    const uint8_t *datos;
+} dsm_page_data_t;
+
 typedef struct dsm_region_lookup {
     uint32_t reserva_id;
     uint32_t primer_tramo;
@@ -123,6 +162,15 @@ int dsm_heartbeat_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                             const dsm_heartbeat_t *msg, size_t *out);
 int dsm_heartbeat_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
                               dsm_heartbeat_t *msg);
+
+int dsm_page_request_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                const dsm_page_request_t *msg, size_t *out);
+int dsm_page_request_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                  dsm_page_request_t *msg);
+int dsm_page_data_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                             const dsm_page_data_t *msg, size_t *out);
+int dsm_page_data_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                               dsm_page_data_t *msg);
 
 int dsm_region_lookup_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                                 const dsm_region_lookup_t *msg, size_t *out);

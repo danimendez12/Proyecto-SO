@@ -47,4 +47,19 @@ int dsm_alta_par(int fd, const dsm_config_t *cfg, uint16_t self_id,
 /* El servidor identifica al par configurado a partir de NODE_HELLO. */
 int dsm_alta_aceptada(int fd, const dsm_config_t *cfg, uint16_t self_id, dsm_alta_resultado_t *out);
 
+typedef struct dsm_red dsm_red_t;
+typedef int (*dsm_red_trama_t)(void *ctx, uint16_t peer, const dsm_cabecera_t *cab,
+                               const uint8_t *buf, size_t n);
+
+/* cfg y ctx viven hasta el cierre. El callback no espera respuestas RPC y
+ * debe copiar la trama si necesita conservarla despues de devolver el control.
+ */
+int dsm_red_iniciar(dsm_red_t **out, const dsm_config_t *cfg, uint16_t self,
+                    dsm_red_trama_t atender, void *ctx);
+/* Cierra tras terminar las operaciones externas y espera a los lectores. */
+void dsm_red_cerrar(dsm_red_t *red);
+int dsm_red_enviar(dsm_red_t *red, uint16_t peer, const uint8_t *buf, size_t n);
+uint32_t dsm_red_id(dsm_red_t *red);
+int dsm_red_esperar(dsm_red_t *red, uint16_t peer);
+
 #endif

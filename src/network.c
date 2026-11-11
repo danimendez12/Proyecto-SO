@@ -7,6 +7,9 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -314,9 +317,9 @@ static int anotar(struct alta_ctx *cx, uint16_t id, uint16_t puerto, uint32_t ip
                   uint64_t memoria, uint64_t base, const char *nombre)
 {
     const dsm_nodo_cfg_t *esperado = dsm_config_nodo(cx->cfg, cx->peer);
-    uint64_t base_esperada = (uint64_t)cx->peer * cx->cfg->memoria_inicial;
+    uint64_t base_esperada = dsm_config_base(cx->cfg, cx->peer);
     if (esperado == NULL || id != cx->peer || puerto != esperado->puerto ||
-        ip != esperado->ipv4_host || memoria != cx->cfg->memoria_inicial ||
+        ip != esperado->ipv4_host || memoria != esperado->memoria ||
         base != base_esperada || !nombres_iguales(nombre, esperado->nombre)) {
         return -1;
     }
@@ -353,8 +356,8 @@ static int enviar_hello(struct alta_ctx *cx)
     msg.conocidos = 0;
     msg.ipv4_host = yo->ipv4_host;
     msg.puerto = yo->puerto;
-    msg.memoria = cx->cfg->memoria_inicial;
-    msg.base = (uint64_t)yo->id * cx->cfg->memoria_inicial;
+    msg.memoria = yo->memoria;
+    msg.base = dsm_config_base(cx->cfg, yo->id);
     memcpy(msg.nombre, yo->nombre, DSM_NOMBRE_MAX);
 
     dsm_cabecera_t cab;
@@ -381,7 +384,7 @@ static int enviar_welcome(struct alta_ctx *cx, uint32_t id_corr)
     if (yo == NULL) {
         return -1;
     }
-    uint32_t totales = (uint32_t)(cx->cfg->memoria_inicial / cx->cfg->page_size);
+    uint32_t totales = (uint32_t)(yo->memoria / cx->cfg->page_size);
     dsm_welcome_t msg;
     memset(&msg, 0, sizeof msg);
     msg.emisor = yo->id;
@@ -391,8 +394,8 @@ static int enviar_welcome(struct alta_ctx *cx, uint32_t id_corr)
     msg.fichas[0].estado = DSM_NODO_UNION;
     msg.fichas[0].ipv4_host = yo->ipv4_host;
     msg.fichas[0].puerto = yo->puerto;
-    msg.fichas[0].memoria = cx->cfg->memoria_inicial;
-    msg.fichas[0].base = (uint64_t)yo->id * cx->cfg->memoria_inicial;
+    msg.fichas[0].memoria = yo->memoria;
+    msg.fichas[0].base = dsm_config_base(cx->cfg, yo->id);
     msg.fichas[0].libres = totales;
     msg.fichas[0].totales = totales;
     memcpy(msg.fichas[0].nombre, yo->nombre, DSM_NOMBRE_MAX);
@@ -546,7 +549,11 @@ static int tomar_welcome(struct alta_ctx *cx, const uint8_t *buf, size_t n, cons
     if (cab->estado != DSM_ESTADO_OK) {
         return -1;
     }
-    uint32_t totales = (uint32_t)(cx->cfg->memoria_inicial / cx->cfg->page_size);
+    const dsm_nodo_cfg_t *par = dsm_config_nodo(cx->cfg, cx->peer);
+    if (par == NULL) {
+        return -1;
+    }
+    uint32_t totales = (uint32_t)(par->memoria / cx->cfg->page_size);
     if (msg.emisor != cab->origen || msg.n != 1 || msg.epoca != 1 || msg.fichas[0].id != msg.emisor ||
         msg.fichas[0].estado != DSM_NODO_UNION || msg.fichas[0].libres != totales ||
         msg.fichas[0].totales != totales) {
@@ -720,4 +727,450 @@ int dsm_alta_par(int fd, const dsm_config_t *cfg, uint16_t self_id, uint16_t pee
 int dsm_alta_aceptada(int fd, const dsm_config_t *cfg, uint16_t self_id, dsm_alta_resultado_t *out)
 {
     return alta(fd, cfg, self_id, 0, 1, out);
+}
+
+struct red_par {
+    int fd;
+    int activo;
+    int enviando;
+};
+
+struct red_trabajador {
+    dsm_red_t *red;
+    pthread_t hilo;
+    uint16_t indice;
+    int creado;
+    int fd;
+    uint8_t *buf;
+};
+
+struct dsm_red {
+    const dsm_config_t *cfg;
+    uint16_t self;
+    dsm_red_trama_t atender;
+    void *ctx;
+    int escucha;
+    pthread_t receptor;
+    int receptor_creado;
+    pthread_mutex_t mutex;
+    pthread_cond_t cambio;
+    int iniciado;
+    int cerrando;
+    uint32_t siguiente;
+    struct red_par pares[DSM_CONFIG_MAX_NODOS];
+    struct red_trabajador trabajadores[DSM_CONFIG_MAX_NODOS];
+};
+
+static int error_red(int error)
+{
+    errno = error;
+    return -1;
+}
+
+/* Se llama con el mutex de la red tomado. */
+static int esperar_cambio(dsm_red_t *red, uint64_t plazo)
+{
+    struct timespec fin = {
+        .tv_sec = (time_t)(plazo / 1000),
+        .tv_nsec = (long)(plazo % 1000) * 1000000L,
+    };
+    return pthread_cond_timedwait(&red->cambio, &red->mutex, &fin);
+}
+
+static int esperar_inicio(dsm_red_t *red)
+{
+    pthread_mutex_lock(&red->mutex);
+    while (!red->iniciado && !red->cerrando) {
+        pthread_cond_wait(&red->cambio, &red->mutex);
+    }
+    int seguir = !red->cerrando;
+    pthread_mutex_unlock(&red->mutex);
+    return seguir;
+}
+
+static int par_valido(const dsm_red_t *red, uint16_t par)
+{
+    return red != NULL && par != red->self && par < red->cfg->cantidad_nodos;
+}
+
+uint32_t dsm_red_id(dsm_red_t *red)
+{
+    pthread_mutex_lock(&red->mutex);
+    if (red->siguiente == 0) {
+        red->siguiente = 1;
+    }
+    uint32_t id = red->siguiente++;
+    pthread_mutex_unlock(&red->mutex);
+    return id;
+}
+
+int dsm_red_esperar(dsm_red_t *red, uint16_t par)
+{
+    if (!par_valido(red, par)) {
+        return error_red(EINVAL);
+    }
+    uint64_t plazo;
+    if (iniciar_plazo(red->cfg->rpc_timeout_ms, &plazo) != 0) {
+        return -1;
+    }
+    pthread_mutex_lock(&red->mutex);
+    int error = 0;
+    while (!red->cerrando && !red->pares[par].activo && error == 0) {
+        error = esperar_cambio(red, plazo);
+    }
+    if (red->cerrando) {
+        error = ECANCELED;
+    }
+    pthread_mutex_unlock(&red->mutex);
+    return error == 0 ? 0 : error_red(error);
+}
+
+int dsm_red_enviar(dsm_red_t *red, uint16_t par, const uint8_t *buf, size_t n)
+{
+    if (!par_valido(red, par) || buf == NULL || n < DSM_CABECERA_BYTES || n > DSM_LONGITUD_MAX) {
+        return error_red(EINVAL);
+    }
+    uint64_t plazo;
+    if (iniciar_plazo(red->cfg->rpc_timeout_ms, &plazo) != 0) {
+        return -1;
+    }
+
+    struct red_par *enlace = &red->pares[par];
+    pthread_mutex_lock(&red->mutex);
+    int error = 0;
+    while (!red->cerrando && enlace->activo && enlace->enviando && error == 0) {
+        error = esperar_cambio(red, plazo);
+    }
+    if (red->cerrando) {
+        error = ECANCELED;
+    } else if (!enlace->activo) {
+        error = ENOTCONN;
+    }
+    if (error != 0) {
+        pthread_mutex_unlock(&red->mutex);
+        return error_red(error);
+    }
+    enlace->enviando = 1;
+    int fd = enlace->fd;
+    pthread_mutex_unlock(&red->mutex);
+
+    int rc = enviar_completo(fd, buf, n, plazo);
+    error = errno;
+    pthread_mutex_lock(&red->mutex);
+    if (rc != 0) {
+        /* Un envio parcial deja la conexion inutilizable. El lector cierra el fd. */
+        enlace->activo = 0;
+        shutdown(fd, SHUT_RDWR);
+    }
+    enlace->enviando = 0;
+    pthread_cond_broadcast(&red->cambio);
+    pthread_mutex_unlock(&red->mutex);
+    return rc == 0 ? 0 : error_red(error);
+}
+
+static int registrar_conexion(dsm_red_t *red, int fd, const dsm_alta_resultado_t *alta)
+{
+    struct red_par *enlace = &red->pares[alta->par.id];
+    pthread_mutex_lock(&red->mutex);
+    int registrar = !red->cerrando && enlace->fd < 0;
+    if (registrar) {
+        enlace->fd = fd;
+        enlace->activo = 1;
+        if (red->siguiente < alta->siguiente_msg) {
+            red->siguiente = alta->siguiente_msg;
+        }
+        pthread_cond_broadcast(&red->cambio);
+    }
+    pthread_mutex_unlock(&red->mutex);
+    if (registrar) {
+        printf("nodo %u par %u hello %d welcome %d estado %u\n",
+               red->self, alta->par.id, alta->hello, alta->welcome, alta->par.estado);
+    }
+    return registrar;
+}
+
+static void atender_conexion(struct red_trabajador *trabajador, uint16_t par)
+{
+    dsm_red_t *red = trabajador->red;
+    int fd = trabajador->fd;
+    while (esperar(fd, POLLIN, 0) == 0) {
+        dsm_cabecera_t cab;
+        size_t n;
+        if (dsm_recibir_trama_plazo(fd, trabajador->buf, DSM_LONGITUD_MAX, &n,
+                                   red->cfg->rpc_timeout_ms) != 0 ||
+            dsm_cabecera_decodificar(trabajador->buf, n, &cab) != 0 ||
+            cab.origen != par || cab.destino != red->self ||
+            red->atender(red->ctx, par, &cab, trabajador->buf, n) != 0) {
+            break;
+        }
+    }
+}
+
+static int procesar_conexion(struct red_trabajador *trabajador, int saliente)
+{
+    dsm_red_t *red = trabajador->red;
+    int fd = trabajador->fd;
+    dsm_alta_resultado_t alta;
+    int rc = saliente ? dsm_alta_par(fd, red->cfg, red->self, trabajador->indice, &alta)
+                      : dsm_alta_aceptada(fd, red->cfg, red->self, &alta);
+    struct red_par *enlace = NULL;
+    if (rc == 0 && registrar_conexion(red, fd, &alta)) {
+        enlace = &red->pares[alta.par.id];
+        atender_conexion(trabajador, alta.par.id);
+    }
+
+    pthread_mutex_lock(&red->mutex);
+    if (enlace != NULL) {
+        enlace->activo = 0;
+        shutdown(fd, SHUT_RDWR);
+        pthread_cond_broadcast(&red->cambio);
+        while (enlace->enviando) {
+            pthread_cond_wait(&red->cambio, &red->mutex);
+        }
+        enlace->fd = -1;
+    }
+    close(fd);
+    trabajador->fd = -1;
+    pthread_mutex_unlock(&red->mutex);
+    return rc;
+}
+
+static int esperar_reintento(dsm_red_t *red)
+{
+    uint64_t plazo;
+    if (iniciar_plazo(red->cfg->heartbeat_intervalo_ms, &plazo) != 0) {
+        return 0;
+    }
+    pthread_mutex_lock(&red->mutex);
+    int error = 0;
+    while (!red->cerrando && error == 0) {
+        error = esperar_cambio(red, plazo);
+    }
+    int seguir = !red->cerrando && error == ETIMEDOUT;
+    pthread_mutex_unlock(&red->mutex);
+    return seguir;
+}
+
+static void conectar_pares(struct red_trabajador *trabajador)
+{
+    dsm_red_t *red = trabajador->red;
+    const dsm_nodo_cfg_t *par = dsm_config_nodo(red->cfg, trabajador->indice);
+    int aviso = 0;
+    do {
+        int fd;
+        int rc = dsm_conectar_plazo(par->ipv4_host, par->puerto, red->cfg->rpc_timeout_ms, &fd);
+        if (rc == 0) {
+            pthread_mutex_lock(&red->mutex);
+            if (red->cerrando) {
+                close(fd);
+                pthread_mutex_unlock(&red->mutex);
+                return;
+            }
+            trabajador->fd = fd;
+            pthread_mutex_unlock(&red->mutex);
+            rc = procesar_conexion(trabajador, 1);
+        }
+        if (rc != 0 && !aviso) {
+            pthread_mutex_lock(&red->mutex);
+            int cerrando = red->cerrando;
+            pthread_mutex_unlock(&red->mutex);
+            if (!cerrando) {
+                fprintf(stderr, "nodo %u par %u no disponible\n", red->self, par->id);
+            }
+        }
+        aviso = rc != 0;
+    } while (esperar_reintento(red));
+}
+
+static void aceptar_pares(struct red_trabajador *trabajador)
+{
+    dsm_red_t *red = trabajador->red;
+    for (;;) {
+        pthread_mutex_lock(&red->mutex);
+        while (trabajador->fd < 0 && !red->cerrando) {
+            pthread_cond_wait(&red->cambio, &red->mutex);
+        }
+        int cerrando = red->cerrando;
+        pthread_mutex_unlock(&red->mutex);
+        if (cerrando) {
+            return;
+        }
+        procesar_conexion(trabajador, 0);
+    }
+}
+
+static void *ejecutar_trabajador(void *arg)
+{
+    struct red_trabajador *trabajador = arg;
+    dsm_red_t *red = trabajador->red;
+    if (esperar_inicio(red)) {
+        if (trabajador->indice < red->self) {
+            aceptar_pares(trabajador);
+        } else {
+            conectar_pares(trabajador);
+        }
+    }
+    return NULL;
+}
+
+static void *escuchar_pares(void *arg)
+{
+    dsm_red_t *red = arg;
+    if (!esperar_inicio(red)) {
+        return NULL;
+    }
+    struct pollfd pfd = {.fd = red->escucha, .events = POLLIN};
+    for (;;) {
+        int listo = poll(&pfd, 1, 100);
+        pthread_mutex_lock(&red->mutex);
+        int cerrando = red->cerrando;
+        pthread_mutex_unlock(&red->mutex);
+        if (cerrando || (listo < 0 && errno != EINTR)) {
+            return NULL;
+        }
+        if (listo <= 0) {
+            continue;
+        }
+        if (!(pfd.revents & POLLIN)) {
+            return NULL;
+        }
+        int fd;
+        if (dsm_aceptar(red->escucha, &fd) != 0) {
+            continue;
+        }
+        pthread_mutex_lock(&red->mutex);
+        for (uint16_t i = 0; i < red->self && !red->cerrando; i++) {
+            if (red->trabajadores[i].fd < 0) {
+                red->trabajadores[i].fd = fd;
+                pthread_cond_broadcast(&red->cambio);
+                fd = -1;
+                break;
+            }
+        }
+        if (fd >= 0) {
+            close(fd);
+        }
+        pthread_mutex_unlock(&red->mutex);
+    }
+}
+
+void dsm_red_cerrar(dsm_red_t *red)
+{
+    if (red == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&red->mutex);
+    red->cerrando = 1;
+    for (uint16_t i = 0; i < red->cfg->cantidad_nodos; i++) {
+        if (red->trabajadores[i].fd >= 0) {
+            shutdown(red->trabajadores[i].fd, SHUT_RDWR);
+        }
+    }
+    pthread_cond_broadcast(&red->cambio);
+    pthread_mutex_unlock(&red->mutex);
+
+    if (red->receptor_creado) {
+        pthread_join(red->receptor, NULL);
+    }
+    for (uint16_t i = 0; i < red->cfg->cantidad_nodos; i++) {
+        struct red_trabajador *trabajador = &red->trabajadores[i];
+        if (trabajador->creado) {
+            pthread_join(trabajador->hilo, NULL);
+        }
+        if (trabajador->fd >= 0) {
+            close(trabajador->fd);
+        }
+        free(trabajador->buf);
+    }
+    if (red->escucha >= 0) {
+        close(red->escucha);
+    }
+    pthread_cond_destroy(&red->cambio);
+    pthread_mutex_destroy(&red->mutex);
+    free(red);
+}
+
+int dsm_red_iniciar(dsm_red_t **out, const dsm_config_t *cfg, uint16_t self,
+                    dsm_red_trama_t atender, void *ctx)
+{
+    if (out == NULL) {
+        return error_red(EINVAL);
+    }
+    *out = NULL;
+    const dsm_nodo_cfg_t *nodo = dsm_config_nodo(cfg, self);
+    if (nodo == NULL || cfg->cantidad_nodos > DSM_CONFIG_MAX_NODOS ||
+        cfg->rpc_timeout_ms == 0 || cfg->heartbeat_intervalo_ms == 0 || atender == NULL) {
+        return error_red(EINVAL);
+    }
+
+    dsm_red_t *red = calloc(1, sizeof *red);
+    if (red == NULL) {
+        return -1;
+    }
+    red->cfg = cfg;
+    red->self = self;
+    red->atender = atender;
+    red->ctx = ctx;
+    red->escucha = -1;
+    for (uint16_t i = 0; i < cfg->cantidad_nodos; i++) {
+        red->pares[i].fd = -1;
+        red->trabajadores[i].fd = -1;
+    }
+    int error = pthread_mutex_init(&red->mutex, NULL);
+    if (error != 0) {
+        free(red);
+        return error_red(error);
+    }
+    pthread_condattr_t atributos;
+    error = pthread_condattr_init(&atributos);
+    if (error == 0) {
+        error = pthread_condattr_setclock(&atributos, CLOCK_MONOTONIC);
+        if (error == 0) {
+            error = pthread_cond_init(&red->cambio, &atributos);
+        }
+        pthread_condattr_destroy(&atributos);
+    }
+    if (error != 0) {
+        pthread_mutex_destroy(&red->mutex);
+        free(red);
+        return error_red(error);
+    }
+    if (dsm_escuchar(nodo->ipv4_host, nodo->puerto, &red->escucha) != 0 ||
+        fcntl(red->escucha, F_SETFL, O_NONBLOCK) != 0) {
+        error = errno;
+        goto fallo;
+    }
+    for (uint16_t i = 0; i < cfg->cantidad_nodos; i++) {
+        if (i == self) {
+            continue;
+        }
+        struct red_trabajador *trabajador = &red->trabajadores[i];
+        trabajador->red = red;
+        trabajador->indice = i;
+        trabajador->buf = malloc(DSM_LONGITUD_MAX);
+        if (trabajador->buf == NULL) {
+            error = errno;
+            goto fallo;
+        }
+        error = pthread_create(&trabajador->hilo, NULL, ejecutar_trabajador, trabajador);
+        if (error != 0) {
+            goto fallo;
+        }
+        trabajador->creado = 1;
+    }
+    error = pthread_create(&red->receptor, NULL, escuchar_pares, red);
+    if (error != 0) {
+        goto fallo;
+    }
+    red->receptor_creado = 1;
+    pthread_mutex_lock(&red->mutex);
+    *out = red;
+    red->iniciado = 1;
+    pthread_cond_broadcast(&red->cambio);
+    pthread_mutex_unlock(&red->mutex);
+    return 0;
+
+fallo:
+    dsm_red_cerrar(red);
+    return error_red(error);
 }

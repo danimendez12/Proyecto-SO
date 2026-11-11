@@ -274,6 +274,139 @@ int dsm_heartbeat_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
     return 0;
 }
 
+static int cabecera_page_request_valida(const dsm_cabecera_t *cab)
+{
+    return cab != NULL && cab->tipo == DSM_TIPO_PAGE_REQUEST && cab->banderas == 0 &&
+           cab->id_corr == 0 && cab->estado == DSM_ESTADO_OK;
+}
+
+int dsm_page_request_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                const dsm_page_request_t *msg, size_t *out)
+{
+    if (!cabecera_page_request_valida(cab) || msg == NULL || out == NULL ||
+        msg->acceso > DSM_ACCESO_ESCRITURA || msg->msi > DSM_MSI_M ||
+        preparar(dst, cap, cab, DSM_PAGE_REQUEST_BYTES) != 0) {
+        return -1;
+    }
+    put_u64(dst + 32, msg->gpn);
+    put_u32(dst + 40, msg->proc_id);
+    dst[44] = msg->acceso;
+    dst[45] = msg->msi;
+    *out = DSM_PAGE_REQUEST_BYTES;
+    return 0;
+}
+
+int dsm_page_request_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                  dsm_page_request_t *msg)
+{
+    if (msg == NULL || n != DSM_PAGE_REQUEST_BYTES ||
+        dsm_cabecera_decodificar(src, n, cab) != 0 || !cabecera_page_request_valida(cab) ||
+        src[44] > DSM_ACCESO_ESCRITURA || src[45] > DSM_MSI_M) {
+        return -1;
+    }
+    *msg = (dsm_page_request_t){
+        .gpn = get_u64(src + 32),
+        .proc_id = get_u32(src + 40),
+        .acceso = src[44],
+        .msi = src[45],
+    };
+    return 0;
+}
+
+static int cabecera_page_data_valida(const dsm_cabecera_t *cab)
+{
+    return cab != NULL && cab->tipo == DSM_TIPO_PAGE_DATA &&
+           cab->banderas == DSM_FLAG_RESPUESTA && cab->id_corr != 0;
+}
+
+static int page_data_valida(const dsm_page_data_t *msg)
+{
+    if (msg == NULL || msg->page_nbytes > DSM_LONGITUD_MAX - DSM_PAGE_DATA_BASE ||
+        (msg->msi != DSM_MSI_S && msg->msi != DSM_MSI_M) ||
+        msg->permiso != (msg->msi == DSM_MSI_S ? DSM_PAGE_PERMISO_LEER : DSM_PAGE_PERMISO_ESCRIBIR)) {
+        return 0;
+    }
+    if (msg->page_nbytes == 0) {
+        return msg->banderas == DSM_PAGE_DATA_SIN_CARGA;
+    }
+    return msg->banderas == 0 && msg->datos != NULL;
+}
+
+int dsm_page_data_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                             const dsm_page_data_t *msg, size_t *out)
+{
+    if (!cabecera_page_data_valida(cab) || out == NULL) {
+        return -1;
+    }
+    if (cab->estado != DSM_ESTADO_OK) {
+        if (preparar(dst, cap, cab, DSM_CABECERA_BYTES) != 0) {
+            return -1;
+        }
+        *out = DSM_CABECERA_BYTES;
+        return 0;
+    }
+    if (!page_data_valida(msg) ||
+        preparar(dst, cap, cab, DSM_PAGE_DATA_BASE + msg->page_nbytes) != 0) {
+        return -1;
+    }
+    put_u64(dst + 32, msg->gpn);
+    put_u32(dst + 40, msg->proc_id);
+    put_u32(dst + 44, msg->reserva_id);
+    put_u32(dst + 48, msg->orden);
+    put_u16(dst + 52, msg->hogar);
+    put_u16(dst + 54, msg->poseedor);
+    put_u16(dst + 56, msg->msi);
+    dst[58] = msg->permiso;
+    dst[59] = msg->banderas;
+    put_u64(dst + 64, msg->mascara_copias);
+    put_u32(dst + 72, msg->page_nbytes);
+    put_u32(dst + 76, msg->version);
+    if (msg->page_nbytes != 0) {
+        memcpy(dst + DSM_PAGE_DATA_BASE, msg->datos, msg->page_nbytes);
+    }
+    *out = cab->longitud;
+    return 0;
+}
+
+int dsm_page_data_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                               dsm_page_data_t *msg)
+{
+    if (msg == NULL || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        !cabecera_page_data_valida(cab) || n != cab->longitud) {
+        return -1;
+    }
+    if (cab->estado != DSM_ESTADO_OK) {
+        if (n != DSM_CABECERA_BYTES) {
+            return -1;
+        }
+        memset(msg, 0, sizeof *msg);
+        return 0;
+    }
+    if (n < DSM_PAGE_DATA_BASE || get_u32(src + 72) != n - DSM_PAGE_DATA_BASE) {
+        return -1;
+    }
+    dsm_page_data_t datos = {
+        .gpn = get_u64(src + 32),
+        .proc_id = get_u32(src + 40),
+        .reserva_id = get_u32(src + 44),
+        .orden = get_u32(src + 48),
+        .hogar = get_u16(src + 52),
+        .poseedor = get_u16(src + 54),
+        .msi = get_u16(src + 56),
+        .permiso = src[58],
+        .banderas = src[59],
+        .mascara_copias = get_u64(src + 64),
+        .page_nbytes = get_u32(src + 72),
+        .version = get_u32(src + 76),
+        .datos = n > DSM_PAGE_DATA_BASE ? src + DSM_PAGE_DATA_BASE : NULL,
+    };
+    if (!page_data_valida(&datos)) {
+        return -1;
+    }
+    *msg = datos;
+    return 0;
+}
+
 int dsm_region_lookup_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                                 const dsm_region_lookup_t *msg, size_t *out)
 {

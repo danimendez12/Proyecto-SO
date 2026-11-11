@@ -44,7 +44,7 @@ static int potencia_de_dos(uint32_t v)
 
 static int parse_u64(const char *s, uint64_t *salida)
 {
-    if (s == NULL || *s == '\0') {
+    if (s == NULL || *s == '\0' || *s == '-') {
         return -1;
     }
     errno = 0;
@@ -89,7 +89,12 @@ static void predeterminados(dsm_config_t *cfg)
     cfg->rpc_timeout_ms = 2000;
 }
 
-static int validar(const dsm_config_t *cfg, const int presente[])
+static int memoria_valida(uint64_t bytes, uint32_t page_size)
+{
+    return bytes != 0 && bytes <= 67108864ull && bytes % page_size == 0;
+}
+
+static int validar(dsm_config_t *cfg, const int presente[])
 {
     long pagina = sysconf(_SC_PAGESIZE);
     if (pagina < 0) {
@@ -101,8 +106,7 @@ static int validar(const dsm_config_t *cfg, const int presente[])
         fallo(0, "page_size fuera de rango");
         return -1;
     }
-    if (cfg->memoria_inicial == 0 || cfg->memoria_inicial > 67108864ull ||
-        (cfg->memoria_inicial % cfg->page_size) != 0) {
+    if (!memoria_valida(cfg->memoria_inicial, cfg->page_size)) {
         fallo(0, "memoria_inicial fuera de rango");
         return -1;
     }
@@ -126,9 +130,10 @@ static int validar(const dsm_config_t *cfg, const int presente[])
         fallo(0, "rpc_timeout_ms fuera de rango");
         return -1;
     }
-    if (cfg->puerto_rango_inicio == 0 || cfg->puerto_rango_fin == 0 ||
+    if (cfg->puerto_rango_inicio < DSM_CONFIG_PUERTO_MIN ||
+        cfg->puerto_rango_fin > DSM_CONFIG_PUERTO_MAX ||
         cfg->puerto_rango_inicio > cfg->puerto_rango_fin) {
-        fallo(0, "rango de puertos invalido");
+        fallo(0, "rango de puertos fuera del intervalo oficial 27200-27299");
         return -1;
     }
     if (cfg->cantidad_nodos == 0 || cfg->cantidad_nodos > cfg->max_nodos) {
@@ -140,14 +145,20 @@ static int validar(const dsm_config_t *cfg, const int presente[])
             fallo(0, "los identificadores de nodo no son densos desde 0");
             return -1;
         }
-        if (cfg->nodos[i].puerto == 0 ||
-            cfg->nodos[i].puerto < cfg->puerto_rango_inicio ||
+        if (cfg->nodos[i].puerto < cfg->puerto_rango_inicio ||
             cfg->nodos[i].puerto > cfg->puerto_rango_fin) {
             fallo(0, "puerto de nodo invalido");
             return -1;
         }
         if (cfg->nodos[i].nombre[0] == '\0') {
             fallo(0, "nombre de nodo vacio");
+            return -1;
+        }
+        if (cfg->nodos[i].memoria == 0) {
+            cfg->nodos[i].memoria = cfg->memoria_inicial;
+        }
+        if (!memoria_valida(cfg->nodos[i].memoria, cfg->page_size)) {
+            fallo(0, "memoria de nodo fuera de rango o desalineada");
             return -1;
         }
         for (uint16_t j = 0; j < i; j++) {
@@ -160,20 +171,24 @@ static int validar(const dsm_config_t *cfg, const int presente[])
     return 0;
 }
 
-static int leer_nodo(dsm_config_t *cfg, int *presente, const char *valor, int linea)
+static int leer_nodo(dsm_config_t *cfg, int *presente, char *valor, int linea)
 {
-    unsigned id = 0;
-    unsigned puerto = 0;
-    char nombre[DSM_CONFIG_NOMBRE];
-    char ip[80];
-    int usado = 0;
-    memset(nombre, 0, sizeof nombre);
-    if (sscanf(valor, "%u %63s %79s %u %n", &id, nombre, ip, &puerto, &usado) != 4 ||
-        valor[usado] != '\0') {
+    const char separadores[] = " \t\r\n";
+    char *resto = NULL;
+    const char *id_texto = strtok_r(valor, separadores, &resto);
+    const char *nombre = strtok_r(NULL, separadores, &resto);
+    const char *ip = strtok_r(NULL, separadores, &resto);
+    const char *puerto_texto = strtok_r(NULL, separadores, &resto);
+    const char *memoria_texto = strtok_r(NULL, separadores, &resto);
+    if (id_texto == NULL || nombre == NULL || strlen(nombre) >= DSM_CONFIG_NOMBRE ||
+        ip == NULL || puerto_texto == NULL || strtok_r(NULL, separadores, &resto) != NULL) {
         fallo(linea, "nodo mal formado");
         return -1;
     }
-    if (id >= DSM_CONFIG_MAX_NODOS || puerto > 65535u) {
+    uint16_t id = 0;
+    uint16_t puerto = 0;
+    if (asignar_u16(id_texto, &id) != 0 || id >= DSM_CONFIG_MAX_NODOS ||
+        asignar_u16(puerto_texto, &puerto) != 0) {
         fallo(linea, "nodo fuera de rango");
         return -1;
     }
@@ -186,13 +201,19 @@ static int leer_nodo(dsm_config_t *cfg, int *presente, const char *valor, int li
         fallo(linea, "IPv4 invalida");
         return -1;
     }
-    cfg->nodos[id].id = (uint16_t)id;
-    cfg->nodos[id].puerto = (uint16_t)puerto;
+    uint64_t memoria = 0;
+    if (memoria_texto != NULL && (parse_u64(memoria_texto, &memoria) != 0 || memoria == 0)) {
+        fallo(linea, "memoria de nodo invalida");
+        return -1;
+    }
+    cfg->nodos[id].id = id;
+    cfg->nodos[id].puerto = puerto;
+    cfg->nodos[id].memoria = memoria;
     cfg->nodos[id].ipv4_host = ((uint32_t)octetos[0] << 24) | ((uint32_t)octetos[1] << 16) |
                                ((uint32_t)octetos[2] << 8) | (uint32_t)octetos[3];
-    memcpy(cfg->nodos[id].nombre, nombre, sizeof nombre);
+    strcpy(cfg->nodos[id].nombre, nombre);
     presente[id] = 1;
-    if ((uint16_t)id + 1u > cfg->cantidad_nodos) {
+    if (id + 1u > cfg->cantidad_nodos) {
         cfg->cantidad_nodos = (uint16_t)(id + 1u);
     }
     return 0;
@@ -317,4 +338,19 @@ const dsm_nodo_cfg_t *dsm_config_nodo(const dsm_config_t *cfg, uint16_t id)
         return NULL;
     }
     return &cfg->nodos[id];
+}
+
+uint64_t dsm_config_base(const dsm_config_t *cfg, uint16_t id)
+{
+    if (cfg == NULL || id > cfg->cantidad_nodos || cfg->cantidad_nodos > DSM_CONFIG_MAX_NODOS) {
+        return UINT64_MAX;
+    }
+    uint64_t base = 0;
+    for (uint16_t i = 0; i < id; i++) {
+        if (cfg->nodos[i].memoria > UINT64_MAX - base) {
+            return UINT64_MAX;
+        }
+        base += cfg->nodos[i].memoria;
+    }
+    return base;
 }
