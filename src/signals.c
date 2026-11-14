@@ -6,6 +6,10 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+#if !defined(__linux__) || !defined(__x86_64__) || !defined(REG_ERR)
+#error "El manejador requiere Linux x86-64 y REG_ERR en ucontext.h"
+#endif
+
 _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "El manejador requiere punteros atomicos lock-free");
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "El manejador requiere enteros atomicos lock-free");
 
@@ -45,10 +49,12 @@ static void atender_fallo(int signo, siginfo_t *info, void *contexto)
 
     const ucontext_t *uc = contexto;
     uintptr_t direccion = (uintptr_t)info->si_addr;
-    /* Bits W/R e I/D del codigo de fallo de pagina de x86-64. */
-    const greg_t escritura_o_ejecucion = (1u << 1) | (1u << 4);
+    /* REG_ERR conserva los bits W/R e I/D del fallo de pagina de x86-64. */
+    const greg_t escritura = 1u << 1;
+    const greg_t ejecucion = 1u << 4;
+    greg_t error_pagina = uc->uc_mcontext.gregs[REG_ERR];
     if (direccion < solicitud->base || direccion - solicitud->base >= solicitud->bytes ||
-        (uc->uc_mcontext.gregs[REG_ERR] & escritura_o_ejecucion) != 0 ||
+        (error_pagina & ejecucion) != 0 ||
         atomic_load_explicit(&solicitud->estado, memory_order_acquire) != DSM_SOLICITUD_QUIETA) {
         fallo_fatal();
     }
@@ -57,6 +63,7 @@ static void atender_fallo(int signo, siginfo_t *info, void *contexto)
     sigdelset(&espera, SIGUSR1);
     sigaddset(&espera, SIGSEGV);
     solicitud->pagina = (direccion - solicitud->base) / solicitud->page_size;
+    solicitud->acceso = (error_pagina & escritura) ? DSM_FALLO_ESCRITURA : DSM_FALLO_LECTURA;
     atomic_store_explicit(&solicitud->estado, DSM_SOLICITUD_PENDIENTE, memory_order_release);
     if (sem_post(solicitud->aviso) != 0) {
         fallo_fatal();

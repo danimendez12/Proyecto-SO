@@ -44,7 +44,7 @@ los ejecutables correspondientes.
 | `make` | Genera `bin/dsm_node`. |
 | `make examples` | Genera los ejemplos en `bin/examples/`. |
 | `make tests` | Genera los programas de prueba en `bin/tests/`. |
-| `make aceptacion` | Compila los cinco binarios de aceptación. |
+| `make aceptacion` | Compila los seis binarios de aceptación. |
 | `make clean` | Elimina el directorio de salida `bin/`. |
 
 ## Demostración de paginación remota
@@ -107,6 +107,42 @@ quedan para pasos posteriores. El alta conserva un latido inicial y una
 ficha WELCOME por conexión. La paginación en este paso se ejercita desde la
 CLI y la API pública del Entregable 1 queda para su integración posterior.
 
+## Paso 10 del Prototipo 2
+
+En Linux x86-64, el manejador usa el bit 1 de `REG_ERR` de `ucontext_t`
+para distinguir un fallo de escritura de uno de lectura. El acceso se
+publica en la ranura del trabajador. El paginador aplica los permisos de
+`Ar` por página según MSI. I corresponde a `PROT_NONE`, S a `PROT_READ`
+y M a `PROT_READ | PROT_WRITE`.
+
+`dsm_pager_iniciar_msi` recibe un adaptador interno para coordinar con la
+División 1. Por cada fallo el adaptador recibe ID de reserva, GPN, nodo
+solicitante, tipo de acceso, estado y versión locales, y un plazo absoluto
+de `CLOCK_MONOTONIC`. Debe resolver el hogar, correlacionar la respuesta y
+devolver antes del plazo con la versión autorizada, la imagen vigente si
+corresponde y la confirmación de exclusividad. Si la página parte de I se
+requiere una imagen completa. Desde S puede omitirse si el hogar confirma
+que la copia local conserva los datos vigentes. Si llega una imagen desde S,
+debe coincidir con Cr para preservar la vista de los lectores activos.
+El paginador exige una
+versión nueva y exclusividad confirmada para conceder M. La consulta al
+adaptador se realiza sin el mutex del paginador. Ante error o vencimiento,
+el trabajador termina por SIGSEGV según la política existente.
+
+La integración de producción requiere acordar el adaptador que completa la
+solicitud después de las confirmaciones de invalidación. También debe
+coordinar la instalación de la concesión con las revocaciones posteriores,
+incluida la actualización de metadatos y permisos locales, y liberar o
+revocar una concesión si su instalación falla. Los nombres internos del
+paginador no forman parte del protocolo ni del API público.
+La CLI continúa usando la entrada de lectura del Prototipo 1. El proveedor
+de prueba de escritura vive en la aceptación local.
+
+La aceptación remota de escritura, una vez integrada la División 1, deberá
+comprobar S en ambos nodos, invalidación de `Ar` del nodo 0 antes de conceder
+M al nodo 1, escritura directa de `Adios TEC`, lectura posterior del nodo 0
+con los datos actualizados, versiones coherentes y un único poseedor M.
+
 ## Pruebas de aceptación
 
 ```bash
@@ -118,9 +154,10 @@ timeout -k 1s 10s ./bin/tests/aceptacion_memoria
 timeout -k 1s 25s ./bin/tests/aceptacion_directorio
 timeout -k 1s 15s ./bin/tests/aceptacion_paginador
 timeout -k 1s 30s ./bin/tests/aceptacion_paginacion_remota
+timeout -k 1s 15s ./bin/tests/aceptacion_escritura_local
 ```
 
-La última prueba ejecuta dos procesos en loopback y después tres procesos
+La aceptación de paginación remota ejecuta dos procesos en loopback y después tres procesos
 activos en orden 2, 0, 3. En ese segundo escenario el nodo 2 lee del hogar 3
 mientras el nodo 1 permanece apagado. Usa aportes distintos para comprobar
 el GPN calculado por suma acumulada.

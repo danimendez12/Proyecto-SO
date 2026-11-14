@@ -1,9 +1,9 @@
 #include "pager.h"
-#include "signals.h"
 
 #include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -19,7 +19,11 @@ struct dsm_pager {
     dsm_vistas_t *vistas;
     size_t page_size;
     size_t max_trabajadores;
-    unsigned char *paginas_listas;
+    dsm_pager_pagina_t *paginas;
+    unsigned char *imagen;
+    dsm_pager_coherencia_t resolver;
+    uint16_t solicitante;
+    uint32_t timeout_ms;
     struct trabajador *trabajadores;
     dsm_pager_preparar_t preparar;
     void *datos;
@@ -36,20 +40,111 @@ static int error_con(int error)
     return -1;
 }
 
-static int cargar_pagina(dsm_pager_t *pager, size_t indice)
+static int permisos(uint8_t msi)
+{
+    switch (msi) {
+    case DSM_MSI_I:
+        return PROT_NONE;
+    case DSM_MSI_S:
+        return PROT_READ;
+    case DSM_MSI_M:
+        return PROT_READ | PROT_WRITE;
+    default:
+        return -1;
+    }
+}
+
+static int vence_en(uint32_t ms, struct timespec *plazo)
+{
+    if (clock_gettime(CLOCK_MONOTONIC, plazo) != 0) {
+        return -1;
+    }
+    plazo->tv_sec += ms / 1000;
+    plazo->tv_nsec += (long)(ms % 1000) * 1000000;
+    if (plazo->tv_nsec >= 1000000000L) {
+        plazo->tv_sec++;
+        plazo->tv_nsec -= 1000000000L;
+    }
+    return 0;
+}
+
+static int antes_del_plazo(const struct timespec *plazo)
+{
+    struct timespec ahora;
+    return clock_gettime(CLOCK_MONOTONIC, &ahora) == 0 &&
+           (ahora.tv_sec < plazo->tv_sec ||
+            (ahora.tv_sec == plazo->tv_sec && ahora.tv_nsec < plazo->tv_nsec));
+}
+
+static int resolver_msi(dsm_pager_t *pager, size_t indice, dsm_acceso_t acceso,
+                         unsigned char *pagina_cr, dsm_pager_pagina_t *pagina)
+{
+    int escritura = acceso == DSM_FALLO_ESCRITURA;
+    dsm_pager_peticion_t peticion = {
+        .pagina = *pagina,
+        .solicitante = pager->solicitante,
+        .acceso = acceso,
+    };
+    dsm_pager_concesion_t concesion = {0};
+    if (vence_en(pager->timeout_ms, &peticion.plazo) != 0 ||
+        pager->resolver(&peticion, pager->imagen, pager->page_size, &concesion, pager->datos) != 0 ||
+        !antes_del_plazo(&peticion.plazo)) {
+        return DSM_SOLICITUD_ERROR;
+    }
+
+    if (concesion.exclusiva != escritura || concesion.version < pagina->version ||
+        (escritura && concesion.version == pagina->version) ||
+        (concesion.bytes_validos != 0 && concesion.bytes_validos != pager->page_size) ||
+        (pagina->msi == DSM_MSI_I && concesion.bytes_validos != pager->page_size)) {
+        return DSM_SOLICITUD_ERROR;
+    }
+    if (concesion.bytes_validos != 0) {
+        if (pagina->msi == DSM_MSI_I) {
+            memcpy(pagina_cr, pager->imagen, pager->page_size);
+        } else if (memcmp(pagina_cr, pager->imagen, pager->page_size) != 0) {
+            /* En S hay lectores activos y la copia ya debe estar vigente. */
+            return DSM_SOLICITUD_ERROR;
+        }
+    }
+
+    uint8_t nuevo = escritura ? DSM_MSI_M : DSM_MSI_S;
+    pthread_mutex_lock(&pager->mutex);
+    int rc = dsm_vistas_proteger_pagina(pager->vistas, indice, pager->page_size, permisos(nuevo));
+    if (rc == 0) {
+        pagina->version = concesion.version;
+        pagina->msi = nuevo;
+    }
+    pthread_mutex_unlock(&pager->mutex);
+    return rc == 0 ? DSM_SOLICITUD_LISTA : DSM_SOLICITUD_ERROR;
+}
+
+static int cargar_pagina(dsm_pager_t *pager, size_t indice, dsm_acceso_t acceso)
 {
     if (indice >= pager->vistas->bytes / pager->page_size) {
         return DSM_SOLICITUD_ERROR;
     }
-    if (!pager->paginas_listas[indice]) {
-        unsigned char *pagina_cr = (unsigned char *)pager->vistas->c_r + indice * pager->page_size;
-        if (pager->preparar(pagina_cr, indice, pager->page_size, pager->datos) != 0 ||
-            dsm_vistas_proteger_pagina(pager->vistas, indice, pager->page_size, PROT_READ) != 0) {
-            return DSM_SOLICITUD_ERROR;
-        }
-        pager->paginas_listas[indice] = 1;
+
+    dsm_pager_pagina_t *pagina = &pager->paginas[indice];
+    if (pagina->msi == DSM_MSI_M ||
+        (pagina->msi == DSM_MSI_S && acceso == DSM_FALLO_LECTURA)) {
+        return DSM_SOLICITUD_LISTA;
     }
-    return DSM_SOLICITUD_LISTA;
+
+    unsigned char *pagina_cr = (unsigned char *)pager->vistas->c_r + indice * pager->page_size;
+    if (pager->resolver != NULL) {
+        return resolver_msi(pager, indice, acceso, pagina_cr, pagina);
+    }
+    if (acceso != DSM_FALLO_LECTURA ||
+        pager->preparar(pagina_cr, indice, pager->page_size, pager->datos) != 0) {
+        return DSM_SOLICITUD_ERROR;
+    }
+    pthread_mutex_lock(&pager->mutex);
+    int rc = dsm_vistas_proteger_pagina(pager->vistas, indice, pager->page_size, PROT_READ);
+    if (rc == 0) {
+        pagina->msi = DSM_MSI_S;
+    }
+    pthread_mutex_unlock(&pager->mutex);
+    return rc == 0 ? DSM_SOLICITUD_LISTA : DSM_SOLICITUD_ERROR;
 }
 
 static struct trabajador *buscar_pendiente(dsm_pager_t *pager)
@@ -87,7 +182,7 @@ static void *paginar(void *arg)
         }
 
         dsm_solicitud_t *solicitud = &trabajador->solicitud;
-        int estado = cargar_pagina(pager, solicitud->pagina);
+        int estado = cargar_pagina(pager, solicitud->pagina, solicitud->acceso);
 
         /* El trabajador puede observar el resultado antes de que llegue la
          * senal. El mutex conserva su registro hasta terminar pthread_kill.
@@ -113,12 +208,15 @@ static void solicitar_cierre(dsm_pager_t *pager)
 static void liberar(dsm_pager_t *pager)
 {
     free(pager->trabajadores);
-    free(pager->paginas_listas);
+    free(pager->imagen);
+    free(pager->paginas);
     free(pager);
 }
 
-int dsm_pager_iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
-                      size_t max_trabajadores, dsm_pager_preparar_t preparar, void *datos)
+static int iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
+                   size_t max_trabajadores, dsm_pager_preparar_t preparar, void *datos,
+                   const dsm_pager_pagina_t *paginas, uint16_t solicitante, uint32_t timeout_ms,
+                   dsm_pager_coherencia_t resolver)
 {
     if (salida == NULL) {
         return error_con(EINVAL);
@@ -128,8 +226,18 @@ int dsm_pager_iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_si
     if (vistas == NULL || vistas->a_r == NULL || vistas->c_r == NULL || vistas->bytes == 0 ||
         pagina_so <= 0 || page_size == 0 || page_size % (size_t)pagina_so != 0 ||
         vistas->bytes % page_size != 0 || (uintptr_t)vistas->a_r % (size_t)pagina_so != 0 ||
-        max_trabajadores == 0 || max_trabajadores > DSM_PAGER_MAX_TRABAJADORES || preparar == NULL) {
+        max_trabajadores == 0 || max_trabajadores > DSM_PAGER_MAX_TRABAJADORES ||
+        (preparar == NULL && (resolver == NULL || paginas == NULL || timeout_ms == 0))) {
         return error_con(EINVAL);
+    }
+
+    size_t cantidad = vistas->bytes / page_size;
+    if (paginas != NULL) {
+        for (size_t i = 0; i < cantidad; i++) {
+            if (permisos(paginas[i].msi) < 0) {
+                return error_con(EINVAL);
+            }
+        }
     }
 
     dsm_pager_t *pager = calloc(1, sizeof *pager);
@@ -137,11 +245,21 @@ int dsm_pager_iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_si
         return -1;
     }
     int error = ENOMEM;
-    pager->paginas_listas = calloc(vistas->bytes / page_size, sizeof *pager->paginas_listas);
+    pager->paginas = calloc(cantidad, sizeof *pager->paginas);
     pager->trabajadores = calloc(max_trabajadores, sizeof *pager->trabajadores);
-    if (pager->paginas_listas == NULL || pager->trabajadores == NULL) {
+    if (pager->paginas == NULL || pager->trabajadores == NULL) {
         goto fallo;
     }
+    if (resolver != NULL) {
+        pager->imagen = malloc(page_size);
+        if (pager->imagen == NULL) {
+            goto fallo;
+        }
+        memcpy(pager->paginas, paginas, cantidad * sizeof *paginas);
+    }
+    pager->resolver = resolver;
+    pager->solicitante = solicitante;
+    pager->timeout_ms = timeout_ms;
     pager->vistas = vistas;
     pager->page_size = page_size;
     pager->max_trabajadores = max_trabajadores;
@@ -176,6 +294,17 @@ int dsm_pager_iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_si
         pthread_join(pager->hilo, NULL);
         goto fallo_aviso;
     }
+    if (paginas != NULL) {
+        for (size_t i = 0; i < cantidad; i++) {
+            int prot = permisos(paginas[i].msi);
+            if (prot != PROT_NONE && dsm_vistas_proteger_pagina(vistas, i, page_size, prot) != 0) {
+                error = errno;
+                dsm_vistas_proteger(vistas, PROT_NONE);
+                dsm_pager_cerrar(pager);
+                return error_con(error);
+            }
+        }
+    }
     *salida = pager;
     return 0;
 
@@ -186,6 +315,33 @@ fallo_mutex:
 fallo:
     liberar(pager);
     return error_con(error);
+}
+
+int dsm_pager_iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
+                      size_t max_trabajadores, dsm_pager_preparar_t preparar, void *datos)
+{
+    return iniciar(salida, vistas, page_size, max_trabajadores, preparar, datos,
+                   NULL, 0, 0, NULL);
+}
+
+int dsm_pager_iniciar_msi(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
+                          size_t max_trabajadores, const dsm_pager_pagina_t *paginas,
+                          uint16_t solicitante, uint32_t timeout_ms,
+                          dsm_pager_coherencia_t resolver, void *contexto)
+{
+    return iniciar(salida, vistas, page_size, max_trabajadores, NULL, contexto,
+                   paginas, solicitante, timeout_ms, resolver);
+}
+
+int dsm_pager_consultar_pagina(dsm_pager_t *pager, size_t indice, dsm_pager_pagina_t *pagina)
+{
+    if (pager == NULL || pagina == NULL || indice >= pager->vistas->bytes / pager->page_size) {
+        return error_con(EINVAL);
+    }
+    pthread_mutex_lock(&pager->mutex);
+    *pagina = pager->paginas[indice];
+    pthread_mutex_unlock(&pager->mutex);
+    return 0;
 }
 
 int dsm_pager_registrar(dsm_pager_t *pager)

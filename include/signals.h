@@ -14,12 +14,18 @@ enum {
     DSM_SOLICITUD_ERROR
 };
 
+typedef enum dsm_acceso {
+    DSM_FALLO_LECTURA,
+    DSM_FALLO_ESCRITURA
+} dsm_acceso_t;
+
 typedef struct dsm_solicitud {
     atomic_int estado;
     uintptr_t base;
     size_t bytes;
     size_t page_size;
     size_t pagina;
+    dsm_acceso_t acceso;
     sem_t *aviso;
     int usr1_bloqueada;
 } dsm_solicitud_t;

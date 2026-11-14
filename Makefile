@@ -11,7 +11,7 @@ examples: bin/examples/demo_creator bin/examples/demo_reader
 tests: bin/tests/test_protocol bin/tests/test_memory bin/tests/test_signals
 
 aceptacion: bin/tests/aceptacion_red bin/tests/aceptacion_memoria bin/tests/aceptacion_directorio \
-	bin/tests/aceptacion_paginador bin/tests/aceptacion_paginacion_remota
+	bin/tests/aceptacion_paginador bin/tests/aceptacion_paginacion_remota bin/tests/aceptacion_escritura_local
 
 PASO_SRC = src/config.c src/protocol.c src/network.c src/memory.c src/directory.c
 
@@ -40,13 +40,18 @@ bin/tests/aceptacion_directorio: tests/aceptacion_directorio.c $(PASO_SRC) $(wil
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/aceptacion_directorio.c $(PASO_SRC) $(LDLIBS)
 
 bin/tests/aceptacion_paginador: tests/aceptacion_paginador.c src/pager.c src/signals.c src/memory.c \
-	include/pager.h include/signals.h include/memory.h
+	include/pager.h include/signals.h include/memory.h include/protocol.h
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 bin/tests/aceptacion_paginacion_remota: tests/aceptacion_paginacion_remota.c bin/dsm_node
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+bin/tests/aceptacion_escritura_local: tests/aceptacion_escritura_local.c src/pager.c src/signals.c src/memory.c \
+	include/pager.h include/signals.h include/memory.h include/protocol.h
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 clean:
 	rm -rf bin
