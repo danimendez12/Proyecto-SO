@@ -14,7 +14,7 @@ bajo demanda por TCP.
 | --- | --- |
 | `include/` | Cabeceras de los módulos. |
 | `src/` | Módulos en C y punto de entrada del nodo (`main.c`). |
-| `examples/` | Programas base para los ejemplos de creación y lectura. |
+| `examples/` | Ejemplo del API local y programa base para el lector. |
 | `tests/` | Pruebas de aceptación de red, memoria, directorio y paginación. |
 | `config/` | Configuración de dos nodos en loopback y plantilla para ocho nodos. |
 | `docs/` | Documentación técnica y evidencias del laboratorio. |
@@ -44,7 +44,7 @@ los ejecutables correspondientes.
 | `make` | Genera `bin/dsm_node`. |
 | `make examples` | Genera los ejemplos en `bin/examples/`. |
 | `make tests` | Genera los programas de prueba en `bin/tests/`. |
-| `make aceptacion` | Compila los seis binarios de aceptación. |
+| `make aceptacion` | Compila los siete binarios de aceptación. |
 | `make clean` | Elimina el directorio de salida `bin/`. |
 
 ## Demostración de paginación remota
@@ -143,6 +143,45 @@ comprobar S en ambos nodos, invalidación de `Ar` del nodo 0 antes de conceder
 M al nodo 1, escritura directa de `Adios TEC`, lectura posterior del nodo 0
 con los datos actualizados, versiones coherentes y un único poseedor M.
 
+## API local del Prototipo 2
+
+`make examples` compila el ejemplo de aplicación. Ejecutalo desde la raíz
+del proyecto. El argumento del INI es opcional.
+
+```bash
+./bin/examples/demo_creator config/lab.ini
+```
+
+La aplicación llama a `dsm_iniciar` con el INI y el ID de nodo, y abre su
+identidad con `dsm_proc_abrir`. La inicialización prepara una página local
+en M e inicia el paginador y sus señales en el mismo proceso. Hay un
+contexto activo por proceso. `dsm_reservar` publica esa página, redondea
+el tamaño solicitado a una página y devuelve su ID y la dirección de
+`Ar`. Las escrituras sobre esa vista se realizan directamente.
+
+Registrá cada trabajador desde su propio hilo con `dsm_hilo_registrar`
+antes de acceder a `Ar` y llamá a `dsm_hilo_desregistrar` cuando termine.
+El desregistro amplía el API del Entregable 1 para devolver la ranura y
+restaurar la máscara del hilo. `dsm_liberar` y `dsm_cerrar` devuelven
+`DSM_ERR_OCUPADA` si todavía hay hilos registrados. Un cierre exitoso
+invalida el puntero al contexto y los punteros prestados. Inicializá otro
+contexto para volver a reservar después del cierre.
+
+`dsm_abrir_reserva` devuelve la misma vista para una reserva propia ya
+publicada. `dsm_traducir` devuelve la dirección local de un desplazamiento.
+`dsm_leer` y `dsm_escribir` copian a través de `Ar` con validación de
+límites. La aplicación sincroniza sus accesos concurrentes al contenido.
+La liberación local desmonta la única reserva del contexto. Las consultas
+públicas de nodos y páginas y la impresión de estado quedan pendientes.
+
+La apertura remota y `dsm_desvincular_reserva` de una vista remota devuelven
+`DSM_ERR_NODO` en esta entrada local. Para integrarlas se necesita extraer
+de la CLI el despacho y la correlación de RPC, con un único lector por
+conexión, y exponer la apertura `REGION_LOOKUP/INFO` y el cierre
+`REGION_CLOSE`. Las escrituras distribuidas requieren el adaptador MSI
+real, sus plazos y la coordinación de revocaciones y versiones descrita
+en el Paso 10.
+
 ## Pruebas de aceptación
 
 ```bash
@@ -154,7 +193,8 @@ timeout -k 1s 10s ./bin/tests/aceptacion_memoria
 timeout -k 1s 25s ./bin/tests/aceptacion_directorio
 timeout -k 1s 15s ./bin/tests/aceptacion_paginador
 timeout -k 1s 30s ./bin/tests/aceptacion_paginacion_remota
-timeout -k 1s 15s ./bin/tests/aceptacion_escritura_local
+timeout -k 1s 20s ./bin/tests/aceptacion_escritura_local
+timeout -k 1s 20s ./bin/tests/aceptacion_api
 ```
 
 La aceptación de paginación remota ejecuta dos procesos en loopback y después tres procesos

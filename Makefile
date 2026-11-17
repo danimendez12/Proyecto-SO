@@ -12,9 +12,11 @@ tests: bin/tests/test_protocol bin/tests/test_memory bin/tests/test_signals
 
 aceptacion: bin/tests/aceptacion_red bin/tests/aceptacion_memoria bin/tests/aceptacion_directorio \
 	bin/tests/aceptacion_paginador bin/tests/aceptacion_paginacion_remota bin/tests/aceptacion_escritura_local \
-	bin/tests/aceptacion_coherencia
+	bin/tests/aceptacion_coherencia \
+	bin/tests/aceptacion_api
 
 PASO_SRC = src/config.c src/protocol.c src/network.c src/memory.c src/directory.c
+API_SRC = $(PASO_SRC) src/dsm.c src/pager.c src/signals.c
 
 bin/dsm_node: $(wildcard src/*.c) $(wildcard include/*.h)
 	mkdir -p $(@D)
@@ -23,6 +25,10 @@ bin/dsm_node: $(wildcard src/*.c) $(wildcard include/*.h)
 bin/examples/%: examples/%.c include/dsm.h
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+bin/examples/demo_creator: examples/demo_creator.c $(API_SRC) $(wildcard include/*.h)
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 bin/tests/test_%: tests/test_%.c include/%.h
 	mkdir -p $(@D)
@@ -57,6 +63,10 @@ bin/tests/aceptacion_escritura_local: tests/aceptacion_escritura_local.c src/pag
 bin/tests/aceptacion_coherencia: tests/aceptacion_coherencia.c $(PASO_SRC) $(wildcard include/*.h)
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/aceptacion_coherencia.c $(PASO_SRC) $(LDLIBS)
+
+bin/tests/aceptacion_api: tests/aceptacion_api.c $(API_SRC) $(wildcard include/*.h)
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 clean:
 	rm -rf bin
