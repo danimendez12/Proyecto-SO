@@ -11,7 +11,8 @@ examples: bin/examples/demo_creator bin/examples/demo_reader
 tests: bin/tests/test_protocol bin/tests/test_memory bin/tests/test_signals
 
 aceptacion: bin/tests/aceptacion_red bin/tests/aceptacion_memoria bin/tests/aceptacion_directorio \
-	bin/tests/aceptacion_paginador bin/tests/aceptacion_paginacion_remota bin/tests/aceptacion_escritura_local
+	bin/tests/aceptacion_paginador bin/tests/aceptacion_paginacion_remota bin/tests/aceptacion_escritura_local \
+	bin/tests/aceptacion_coherencia
 
 PASO_SRC = src/config.c src/protocol.c src/network.c src/memory.c src/directory.c
 
@@ -52,6 +53,10 @@ bin/tests/aceptacion_escritura_local: tests/aceptacion_escritura_local.c src/pag
 	include/pager.h include/signals.h include/memory.h include/protocol.h
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+bin/tests/aceptacion_coherencia: tests/aceptacion_coherencia.c $(PASO_SRC) $(wildcard include/*.h)
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/aceptacion_coherencia.c $(PASO_SRC) $(LDLIBS)
 
 clean:
 	rm -rf bin

@@ -62,4 +62,8 @@ int dsm_red_enviar(dsm_red_t *red, uint16_t peer, const uint8_t *buf, size_t n);
 uint32_t dsm_red_id(dsm_red_t *red);
 int dsm_red_esperar(dsm_red_t *red, uint16_t peer);
 
+typedef void (*dsm_red_estado_t)(void *ctx, uint16_t par, uint8_t estado);
+void dsm_red_observar(dsm_red_t *red, dsm_red_estado_t fn, void *ctx);
+int dsm_red_estado(dsm_red_t *red, uint16_t par, uint8_t *estado);
+
 #endif

@@ -22,16 +22,33 @@ enum {
 enum {
     DSM_TIPO_NODE_HELLO = 0x01,
     DSM_TIPO_NODE_WELCOME = 0x02,
+    DSM_TIPO_NODE_BYE = 0x03,
+    DSM_TIPO_NODE_DOWN_HINT = 0x04,
     DSM_TIPO_HEARTBEAT = 0x05,
     DSM_TIPO_HEARTBEAT_ACK = 0x06,
     DSM_TIPO_PAGE_REQUEST = 0x10,
     DSM_TIPO_PAGE_DATA = 0x11,
+    DSM_TIPO_PAGE_DOWNGRADE = 0x12,
+    DSM_TIPO_PAGE_DOWNGRADE_ACK = 0x13,
+    DSM_TIPO_INVALIDATE = 0x14,
+    DSM_TIPO_INVALIDATE_ACK = 0x15,
     DSM_TIPO_REGION_LOOKUP = 0x32,
     DSM_TIPO_REGION_INFO = 0x33
 };
 
 enum {
     DSM_ESTADO_OK = 0,
+    DSM_ESTADO_TRAMA = 1,
+    DSM_ESTADO_VERSION = 2,
+    DSM_ESTADO_TIPO = 3,
+    DSM_ESTADO_NO_HOGAR = 4,
+    DSM_ESTADO_NO_POSEEDOR = 5,
+    DSM_ESTADO_PLAZO = 6,
+    DSM_ESTADO_FUERA = 7,
+    DSM_ESTADO_SIN_TRAMO = 8,
+    DSM_ESTADO_CONFLICTO = 9,
+    DSM_ESTADO_COLA = 10,
+    DSM_ESTADO_CIERRE = 11,
     DSM_ESTADO_RANGO = 12
 };
 
@@ -43,7 +60,15 @@ enum {
     DSM_ACCESO_ESCRITURA = 1,
     DSM_PAGE_PERMISO_LEER = 1,
     DSM_PAGE_PERMISO_ESCRIBIR = 3,
-    DSM_PAGE_DATA_SIN_CARGA = 0x01
+    DSM_PAGE_DATA_SIN_CARGA = 0x01,
+    DSM_MOTIVO_A_S = 0,
+    DSM_MOTIVO_A_I = 1,
+    DSM_DOWNGRADE_HECHO = 0,
+    DSM_DOWNGRADE_NO_M = 1,
+    DSM_INVALIDA_HECHO = 0,
+    DSM_INVALIDA_YA_I = 1,
+    DSM_AVISO_BYTES = 40,
+    DSM_CONTROL_BYTES = 48
 };
 
 enum {
@@ -124,6 +149,36 @@ typedef struct dsm_page_data {
     const uint8_t *datos;
 } dsm_page_data_t;
 
+typedef struct dsm_aviso {
+    uint16_t node_id;
+    uint16_t razon;
+} dsm_aviso_t;
+
+typedef struct dsm_downgrade {
+    uint64_t gpn;
+    uint32_t id_solicitud;
+    uint16_t solicitante;
+    uint8_t motivo;
+} dsm_downgrade_t;
+
+typedef struct dsm_downgrade_ack {
+    uint64_t gpn;
+    uint32_t id_solicitud;
+    uint16_t resultado;
+} dsm_downgrade_ack_t;
+
+typedef struct dsm_invalidate {
+    uint64_t gpn;
+    uint32_t id_solicitud;
+    uint16_t escritor;
+} dsm_invalidate_t;
+
+typedef struct dsm_invalidate_ack {
+    uint64_t gpn;
+    uint32_t id_solicitud;
+    uint16_t resultado;
+} dsm_invalidate_ack_t;
+
 typedef struct dsm_region_lookup {
     uint32_t reserva_id;
     uint32_t primer_tramo;
@@ -171,6 +226,28 @@ int dsm_page_data_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                              const dsm_page_data_t *msg, size_t *out);
 int dsm_page_data_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
                                dsm_page_data_t *msg);
+
+int dsm_aviso_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                       const dsm_aviso_t *msg, size_t *out);
+int dsm_aviso_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, dsm_aviso_t *msg);
+
+int dsm_downgrade_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                            const dsm_downgrade_t *msg, size_t *out);
+int dsm_downgrade_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                              dsm_downgrade_t *msg);
+int dsm_downgrade_ack_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                const dsm_downgrade_ack_t *msg, size_t *out);
+int dsm_downgrade_ack_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                  dsm_downgrade_ack_t *msg);
+
+int dsm_invalidate_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                             const dsm_invalidate_t *msg, size_t *out);
+int dsm_invalidate_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                               dsm_invalidate_t *msg);
+int dsm_invalidate_ack_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                 const dsm_invalidate_ack_t *msg, size_t *out);
+int dsm_invalidate_ack_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                   dsm_invalidate_ack_t *msg);
 
 int dsm_region_lookup_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                                 const dsm_region_lookup_t *msg, size_t *out);

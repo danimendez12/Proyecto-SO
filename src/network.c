@@ -733,6 +733,7 @@ struct red_par {
     int fd;
     int activo;
     int enviando;
+    uint8_t estado;
 };
 
 struct red_trabajador {
@@ -757,6 +758,8 @@ struct dsm_red {
     int iniciado;
     int cerrando;
     uint32_t siguiente;
+    dsm_red_estado_t al_estado;
+    void *estado_ctx;
     struct red_par pares[DSM_CONFIG_MAX_NODOS];
     struct red_trabajador trabajadores[DSM_CONFIG_MAX_NODOS];
 };
@@ -871,11 +874,16 @@ int dsm_red_enviar(dsm_red_t *red, uint16_t par, const uint8_t *buf, size_t n)
 static int registrar_conexion(dsm_red_t *red, int fd, const dsm_alta_resultado_t *alta)
 {
     struct red_par *enlace = &red->pares[alta->par.id];
+    dsm_red_estado_t fn = NULL;
+    void *ctx = NULL;
     pthread_mutex_lock(&red->mutex);
     int registrar = !red->cerrando && enlace->fd < 0;
     if (registrar) {
         enlace->fd = fd;
         enlace->activo = 1;
+        enlace->estado = DSM_NODO_EN_LINEA;
+        fn = red->al_estado;
+        ctx = red->estado_ctx;
         if (red->siguiente < alta->siguiente_msg) {
             red->siguiente = alta->siguiente_msg;
         }
@@ -885,25 +893,218 @@ static int registrar_conexion(dsm_red_t *red, int fd, const dsm_alta_resultado_t
     if (registrar) {
         printf("nodo %u par %u hello %d welcome %d estado %u\n",
                red->self, alta->par.id, alta->hello, alta->welcome, alta->par.estado);
+        if (fn != NULL) {
+            fn(ctx, alta->par.id, DSM_NODO_EN_LINEA);
+        }
     }
     return registrar;
+}
+
+static void notificar_estado(dsm_red_t *red, uint16_t par, uint8_t estado)
+{
+    dsm_red_estado_t fn = NULL;
+    void *ctx = NULL;
+    int cambio = 0;
+    pthread_mutex_lock(&red->mutex);
+    if (red->pares[par].estado != estado) {
+        red->pares[par].estado = estado;
+        cambio = 1;
+        fn = red->al_estado;
+        ctx = red->estado_ctx;
+    }
+    int cerrando = red->cerrando;
+    pthread_mutex_unlock(&red->mutex);
+    if (cambio && fn != NULL && !cerrando) {
+        fn(ctx, par, estado);
+    }
+}
+
+static int latido_enviar(dsm_red_t *red, uint16_t par, dsm_heartbeat_t *msg, uint32_t *id_msg)
+{
+    dsm_cabecera_t cab;
+    memset(&cab, 0, sizeof cab);
+    cab.version = DSM_PROTO_VERSION;
+    cab.tipo = DSM_TIPO_HEARTBEAT;
+    cab.origen = red->self;
+    cab.destino = par;
+    cab.id_msg = dsm_red_id(red);
+    cab.estado = DSM_ESTADO_OK;
+    msg->marca = ((uint64_t)red->self << 32) | cab.id_msg;
+    msg->instante_ms = ahora_ms();
+    *id_msg = cab.id_msg;
+    uint8_t buf[48];
+    size_t n = 0;
+    if (dsm_heartbeat_codificar(buf, sizeof buf, &cab, msg, &n) != 0) {
+        return -1;
+    }
+    return dsm_red_enviar(red, par, buf, n);
+}
+
+static int latido_reconocer(dsm_red_t *red, uint16_t par, const dsm_cabecera_t *pedido,
+                            const dsm_heartbeat_t *eco)
+{
+    dsm_cabecera_t cab;
+    memset(&cab, 0, sizeof cab);
+    cab.version = DSM_PROTO_VERSION;
+    cab.tipo = DSM_TIPO_HEARTBEAT_ACK;
+    cab.banderas = DSM_FLAG_RESPUESTA;
+    cab.origen = red->self;
+    cab.destino = par;
+    cab.id_msg = dsm_red_id(red);
+    cab.id_corr = pedido->id_msg;
+    cab.estado = DSM_ESTADO_OK;
+    uint8_t buf[48];
+    size_t n = 0;
+    if (dsm_heartbeat_codificar(buf, sizeof buf, &cab, eco, &n) != 0) {
+        return -1;
+    }
+    return dsm_red_enviar(red, par, buf, n);
+}
+
+static int enviar_bye(dsm_red_t *red, uint16_t par, int fd, uint16_t razon)
+{
+    dsm_cabecera_t cab;
+    memset(&cab, 0, sizeof cab);
+    cab.version = DSM_PROTO_VERSION;
+    cab.tipo = DSM_TIPO_NODE_BYE;
+    cab.origen = red->self;
+    cab.destino = par;
+    pthread_mutex_lock(&red->mutex);
+    if (red->siguiente == 0) {
+        red->siguiente = 1;
+    }
+    cab.id_msg = red->siguiente++;
+    pthread_mutex_unlock(&red->mutex);
+    cab.estado = DSM_ESTADO_OK;
+    dsm_aviso_t aviso = {.node_id = red->self, .razon = razon};
+    uint8_t buf[DSM_AVISO_BYTES];
+    size_t n = 0;
+    if (dsm_aviso_codificar(buf, sizeof buf, &cab, &aviso, &n) != 0) {
+        return -1;
+    }
+    return dsm_enviar_trama(fd, buf, n, red->cfg->rpc_timeout_ms);
 }
 
 static void atender_conexion(struct red_trabajador *trabajador, uint16_t par)
 {
     dsm_red_t *red = trabajador->red;
     int fd = trabajador->fd;
-    while (esperar(fd, POLLIN, 0) == 0) {
+    uint32_t intervalo = red->cfg->heartbeat_intervalo_ms;
+    uint32_t fallos = 0;
+    uint32_t tope = red->cfg->heartbeat_fallos;
+    int espera_ack = 0;
+    uint64_t marca = 0;
+    uint64_t instante = 0;
+    uint32_t id_latido = 0;
+    uint64_t ahora = 0;
+    if (monotono_ms(&ahora) != 0) {
+        return;
+    }
+    uint64_t proximo = ahora + intervalo;
+    uint64_t silencio = ahora + intervalo + intervalo / 2u;
+    int sonda = 0;
+
+    for (;;) {
+        pthread_mutex_lock(&red->mutex);
+        int cerrando = red->cerrando;
+        pthread_mutex_unlock(&red->mutex);
+        if (cerrando || monotono_ms(&ahora) != 0) {
+            break;
+        }
+        if (sonda || (red->self < par && ahora >= proximo)) {
+            if (espera_ack) {
+                fallos++;
+                if (fallos >= tope) {
+                    break;
+                }
+                notificar_estado(red, par, DSM_NODO_SOSPECHA);
+            }
+            dsm_heartbeat_t msg;
+            if (latido_enviar(red, par, &msg, &id_latido) != 0) {
+                break;
+            }
+            marca = msg.marca;
+            instante = msg.instante_ms;
+            espera_ack = 1;
+            proximo = ahora + intervalo;
+            sonda = 0;
+            continue;
+        }
+        if (red->self > par && ahora >= silencio) {
+            fallos++;
+            if (fallos >= tope) {
+                break;
+            }
+            notificar_estado(red, par, DSM_NODO_SOSPECHA);
+            silencio = ahora + intervalo;
+            continue;
+        }
+        uint64_t limite = red->self < par ? proximo : silencio;
+        int espera = limite > ahora ? (int)(limite - ahora) : 0;
+        if (espera > 60000) {
+            espera = 60000;
+        }
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        int rc = poll(&pfd, 1, espera);
+        if (rc < 0 && errno == EINTR) {
+            continue;
+        }
+        if (rc < 0 || (rc > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)) {
+            break;
+        }
+        if (rc == 0) {
+            continue;
+        }
         dsm_cabecera_t cab;
-        size_t n;
+        size_t n = 0;
         if (dsm_recibir_trama_plazo(fd, trabajador->buf, DSM_LONGITUD_MAX, &n,
                                    red->cfg->rpc_timeout_ms) != 0 ||
-            dsm_cabecera_decodificar(trabajador->buf, n, &cab) != 0 ||
-            cab.origen != par || cab.destino != red->self ||
-            red->atender(red->ctx, par, &cab, trabajador->buf, n) != 0) {
+            dsm_cabecera_decodificar(trabajador->buf, n, &cab) != 0 || cab.origen != par ||
+            cab.destino != red->self) {
+            break;
+        }
+        if (cab.tipo == DSM_TIPO_HEARTBEAT && cab.banderas == 0 && cab.id_corr == 0) {
+            dsm_heartbeat_t msg;
+            dsm_cabecera_t copia;
+            if (dsm_heartbeat_decodificar(trabajador->buf, n, &copia, &msg) != 0 ||
+                latido_reconocer(red, par, &cab, &msg) != 0) {
+                break;
+            }
+            fallos = 0;
+            silencio = 0;
+            if (monotono_ms(&silencio) == 0) {
+                silencio += intervalo;
+            }
+            notificar_estado(red, par, DSM_NODO_EN_LINEA);
+            continue;
+        }
+        if (cab.tipo == DSM_TIPO_HEARTBEAT_ACK && cab.banderas == DSM_FLAG_RESPUESTA) {
+            dsm_heartbeat_t msg;
+            dsm_cabecera_t copia;
+            if (dsm_heartbeat_decodificar(trabajador->buf, n, &copia, &msg) != 0) {
+                break;
+            }
+            if (espera_ack && cab.id_corr == id_latido && msg.marca == marca &&
+                msg.instante_ms == instante && cab.estado == DSM_ESTADO_OK) {
+                espera_ack = 0;
+                fallos = 0;
+                notificar_estado(red, par, DSM_NODO_EN_LINEA);
+            }
+            continue;
+        }
+        if (cab.tipo == DSM_TIPO_NODE_BYE) {
+            notificar_estado(red, par, DSM_NODO_FUERA);
+            break;
+        }
+        if (cab.tipo == DSM_TIPO_NODE_DOWN_HINT) {
+            sonda = 1;
+            continue;
+        }
+        if (red->atender(red->ctx, par, &cab, trabajador->buf, n) != 0) {
             break;
         }
     }
+    notificar_estado(red, par, DSM_NODO_FUERA);
 }
 
 static int procesar_conexion(struct red_trabajador *trabajador, int saliente)
@@ -1054,12 +1255,50 @@ static void *escuchar_pares(void *arg)
     }
 }
 
+void dsm_red_observar(dsm_red_t *red, dsm_red_estado_t fn, void *ctx)
+{
+    if (red == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&red->mutex);
+    red->al_estado = fn;
+    red->estado_ctx = ctx;
+    pthread_mutex_unlock(&red->mutex);
+}
+
+int dsm_red_estado(dsm_red_t *red, uint16_t par, uint8_t *estado)
+{
+    if (!par_valido(red, par) || estado == NULL) {
+        return error_red(EINVAL);
+    }
+    pthread_mutex_lock(&red->mutex);
+    *estado = red->pares[par].activo ? red->pares[par].estado : DSM_NODO_FUERA;
+    if (!red->pares[par].activo && red->pares[par].estado == 0) {
+        *estado = DSM_NODO_VACIO;
+    }
+    pthread_mutex_unlock(&red->mutex);
+    return 0;
+}
+
 void dsm_red_cerrar(dsm_red_t *red)
 {
     if (red == NULL) {
         return;
     }
     pthread_mutex_lock(&red->mutex);
+    for (uint16_t i = 0; i < red->cfg->cantidad_nodos && !red->cerrando; i++) {
+        struct red_par *enlace = &red->pares[i];
+        if (i == red->self || !enlace->activo || enlace->enviando || enlace->fd < 0) {
+            continue;
+        }
+        int fd = enlace->fd;
+        enlace->enviando = 1;
+        pthread_mutex_unlock(&red->mutex);
+        enviar_bye(red, i, fd, 1);
+        pthread_mutex_lock(&red->mutex);
+        enlace->enviando = 0;
+        pthread_cond_broadcast(&red->cambio);
+    }
     red->cerrando = 1;
     for (uint16_t i = 0; i < red->cfg->cantidad_nodos; i++) {
         if (red->trabajadores[i].fd >= 0) {

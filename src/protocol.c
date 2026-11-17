@@ -274,6 +274,174 @@ int dsm_heartbeat_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
     return 0;
 }
 
+static int cabecera_pedido(const dsm_cabecera_t *cab, uint8_t tipo)
+{
+    return cab != NULL && cab->tipo == tipo && cab->banderas == 0 && cab->id_corr == 0 &&
+           cab->estado == DSM_ESTADO_OK;
+}
+
+static int cabecera_respuesta(const dsm_cabecera_t *cab, uint8_t tipo)
+{
+    return cab != NULL && cab->tipo == tipo && cab->banderas == DSM_FLAG_RESPUESTA &&
+           cab->id_corr != 0;
+}
+
+int dsm_aviso_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab, const dsm_aviso_t *msg,
+                        size_t *out)
+{
+    if (msg == NULL || out == NULL || cab == NULL ||
+        (cab->tipo != DSM_TIPO_NODE_BYE && cab->tipo != DSM_TIPO_NODE_DOWN_HINT) ||
+        cab->banderas != 0 || cab->id_corr != 0) {
+        return -1;
+    }
+    if (preparar(dst, cap, cab, DSM_AVISO_BYTES) != 0) {
+        return -1;
+    }
+    put_u16(dst + 32, msg->node_id);
+    put_u16(dst + 34, msg->razon);
+    *out = DSM_AVISO_BYTES;
+    return 0;
+}
+
+int dsm_aviso_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, dsm_aviso_t *msg)
+{
+    if (msg == NULL || n != DSM_AVISO_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0) {
+        return -1;
+    }
+    if ((cab->tipo != DSM_TIPO_NODE_BYE && cab->tipo != DSM_TIPO_NODE_DOWN_HINT) ||
+        cab->banderas != 0 || cab->id_corr != 0 || cab->longitud != DSM_AVISO_BYTES) {
+        return -1;
+    }
+    msg->node_id = get_u16(src + 32);
+    msg->razon = get_u16(src + 34);
+    return 0;
+}
+
+int dsm_downgrade_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                            const dsm_downgrade_t *msg, size_t *out)
+{
+    if (!cabecera_pedido(cab, DSM_TIPO_PAGE_DOWNGRADE) || msg == NULL ||
+        out == NULL || msg->id_solicitud == 0 || msg->motivo > DSM_MOTIVO_A_I ||
+        preparar(dst, cap, cab, DSM_CONTROL_BYTES) != 0) {
+        return -1;
+    }
+    put_u64(dst + 32, msg->gpn);
+    put_u32(dst + 40, msg->id_solicitud);
+    put_u16(dst + 44, msg->solicitante);
+    dst[46] = msg->motivo;
+    *out = DSM_CONTROL_BYTES;
+    return 0;
+}
+
+int dsm_downgrade_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                              dsm_downgrade_t *msg)
+{
+    if (msg == NULL || n != DSM_CONTROL_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        !cabecera_pedido(cab, DSM_TIPO_PAGE_DOWNGRADE) || cab->longitud != DSM_CONTROL_BYTES ||
+        get_u32(src + 40) == 0 || src[46] > DSM_MOTIVO_A_I) {
+        return -1;
+    }
+    *msg = (dsm_downgrade_t){
+        .gpn = get_u64(src + 32),
+        .id_solicitud = get_u32(src + 40),
+        .solicitante = get_u16(src + 44),
+        .motivo = src[46],
+    };
+    return 0;
+}
+
+int dsm_downgrade_ack_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                const dsm_downgrade_ack_t *msg, size_t *out)
+{
+    if (!cabecera_respuesta(cab, DSM_TIPO_PAGE_DOWNGRADE_ACK) || msg == NULL ||
+        out == NULL || msg->id_solicitud == 0 || msg->resultado > DSM_DOWNGRADE_NO_M ||
+        preparar(dst, cap, cab, DSM_CONTROL_BYTES) != 0) {
+        return -1;
+    }
+    put_u64(dst + 32, msg->gpn);
+    put_u32(dst + 40, msg->id_solicitud);
+    put_u16(dst + 44, msg->resultado);
+    *out = DSM_CONTROL_BYTES;
+    return 0;
+}
+
+int dsm_downgrade_ack_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                  dsm_downgrade_ack_t *msg)
+{
+    if (msg == NULL || n != DSM_CONTROL_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        !cabecera_respuesta(cab, DSM_TIPO_PAGE_DOWNGRADE_ACK) || cab->longitud != DSM_CONTROL_BYTES ||
+        get_u32(src + 40) == 0 || get_u16(src + 44) > DSM_DOWNGRADE_NO_M) {
+        return -1;
+    }
+    *msg = (dsm_downgrade_ack_t){
+        .gpn = get_u64(src + 32),
+        .id_solicitud = get_u32(src + 40),
+        .resultado = get_u16(src + 44),
+    };
+    return 0;
+}
+
+int dsm_invalidate_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                             const dsm_invalidate_t *msg, size_t *out)
+{
+    if (!cabecera_pedido(cab, DSM_TIPO_INVALIDATE) || msg == NULL ||
+        out == NULL || msg->id_solicitud == 0 || preparar(dst, cap, cab, DSM_CONTROL_BYTES) != 0) {
+        return -1;
+    }
+    put_u64(dst + 32, msg->gpn);
+    put_u32(dst + 40, msg->id_solicitud);
+    put_u16(dst + 44, msg->escritor);
+    *out = DSM_CONTROL_BYTES;
+    return 0;
+}
+
+int dsm_invalidate_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                               dsm_invalidate_t *msg)
+{
+    if (msg == NULL || n != DSM_CONTROL_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        !cabecera_pedido(cab, DSM_TIPO_INVALIDATE) || cab->longitud != DSM_CONTROL_BYTES ||
+        get_u32(src + 40) == 0) {
+        return -1;
+    }
+    *msg = (dsm_invalidate_t){
+        .gpn = get_u64(src + 32),
+        .id_solicitud = get_u32(src + 40),
+        .escritor = get_u16(src + 44),
+    };
+    return 0;
+}
+
+int dsm_invalidate_ack_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                 const dsm_invalidate_ack_t *msg, size_t *out)
+{
+    if (!cabecera_respuesta(cab, DSM_TIPO_INVALIDATE_ACK) || msg == NULL ||
+        out == NULL || msg->id_solicitud == 0 || msg->resultado > DSM_INVALIDA_YA_I ||
+        preparar(dst, cap, cab, DSM_CONTROL_BYTES) != 0) {
+        return -1;
+    }
+    put_u64(dst + 32, msg->gpn);
+    put_u32(dst + 40, msg->id_solicitud);
+    put_u16(dst + 44, msg->resultado);
+    *out = DSM_CONTROL_BYTES;
+    return 0;
+}
+
+int dsm_invalidate_ack_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                   dsm_invalidate_ack_t *msg)
+{
+    if (msg == NULL || n != DSM_CONTROL_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        !cabecera_respuesta(cab, DSM_TIPO_INVALIDATE_ACK) || cab->longitud != DSM_CONTROL_BYTES ||
+        get_u32(src + 40) == 0 || get_u16(src + 44) > DSM_INVALIDA_YA_I) {
+        return -1;
+    }
+    *msg = (dsm_invalidate_ack_t){
+        .gpn = get_u64(src + 32),
+        .id_solicitud = get_u32(src + 40),
+        .resultado = get_u16(src + 44),
+    };
+    return 0;
+}
+
 static int cabecera_page_request_valida(const dsm_cabecera_t *cab)
 {
     return cab != NULL && cab->tipo == DSM_TIPO_PAGE_REQUEST && cab->banderas == 0 &&
