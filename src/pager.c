@@ -15,6 +15,11 @@ struct trabajador {
     int registrado;
 };
 
+struct ventana {
+    dsm_ventana_senal_t senal;
+    dsm_pager_pagina_t *paginas;
+};
+
 struct dsm_pager {
     dsm_vistas_t *vistas;
     size_t page_size;
@@ -32,6 +37,7 @@ struct dsm_pager {
     sem_t aviso;
     pthread_t hilo;
     pthread_mutex_t mutex;
+    _Atomic(dsm_ventana_senal_t *) ventanas;
     int cerrando;
 };
 
@@ -119,16 +125,17 @@ static int resolver_msi(dsm_pager_t *pager, size_t indice, dsm_acceso_t acceso,
     return rc == 0 ? DSM_SOLICITUD_LISTA : DSM_SOLICITUD_ERROR;
 }
 
-static int cargar_pagina(dsm_pager_t *pager, size_t indice, dsm_acceso_t acceso)
+static int cargar_pagina(dsm_pager_t *pager, const dsm_solicitud_t *solicitud)
 {
-    if (indice >= pager->vistas->bytes / pager->page_size) {
-        return DSM_SOLICITUD_ERROR;
-    }
-
-    dsm_pager_pagina_t *pagina = &pager->paginas[indice];
+    size_t indice = solicitud->pagina;
+    dsm_acceso_t acceso = solicitud->acceso;
     if (pager->resolver_directorio != NULL) {
+        const struct ventana *ventana = (const struct ventana *)solicitud->ventana;
+        if (ventana == NULL || indice >= ventana->senal.bytes / pager->page_size) {
+            return DSM_SOLICITUD_ERROR;
+        }
         dsm_pager_peticion_t peticion = {
-            .pagina = *pagina,
+            .pagina = ventana->paginas[indice],
             .solicitante = pager->solicitante,
             .acceso = acceso,
         };
@@ -138,6 +145,10 @@ static int cargar_pagina(dsm_pager_t *pager, size_t indice, dsm_acceso_t acceso)
         }
         return DSM_SOLICITUD_LISTA;
     }
+    if (indice >= pager->vistas->bytes / pager->page_size) {
+        return DSM_SOLICITUD_ERROR;
+    }
+    dsm_pager_pagina_t *pagina = &pager->paginas[indice];
     if (pagina->msi == DSM_MSI_M ||
         (pagina->msi == DSM_MSI_S && acceso == DSM_FALLO_LECTURA)) {
         return DSM_SOLICITUD_LISTA;
@@ -195,7 +206,7 @@ static void *paginar(void *arg)
         }
 
         dsm_solicitud_t *solicitud = &trabajador->solicitud;
-        int estado = cargar_pagina(pager, solicitud->pagina, solicitud->acceso);
+        int estado = cargar_pagina(pager, solicitud);
 
         /* El trabajador puede observar el resultado antes de que llegue la
          * senal. El mutex conserva su registro hasta terminar pthread_kill.
@@ -220,6 +231,14 @@ static void solicitar_cierre(dsm_pager_t *pager)
 
 static void liberar(dsm_pager_t *pager)
 {
+    dsm_ventana_senal_t *actual = atomic_load_explicit(&pager->ventanas, memory_order_relaxed);
+    while (actual != NULL) {
+        dsm_ventana_senal_t *siguiente = actual->siguiente;
+        struct ventana *ventana = (struct ventana *)actual;
+        free(ventana->paginas);
+        free(ventana);
+        actual = siguiente;
+    }
     free(pager->trabajadores);
     free(pager->imagen);
     free(pager->paginas);
@@ -236,16 +255,18 @@ static int iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
     }
     *salida = NULL;
     long pagina_so = sysconf(_SC_PAGESIZE);
-    if (vistas == NULL || vistas->a_r == NULL || vistas->c_r == NULL || vistas->bytes == 0 ||
-        pagina_so <= 0 || page_size == 0 || page_size % (size_t)pagina_so != 0 ||
-        vistas->bytes % page_size != 0 || (uintptr_t)vistas->a_r % (size_t)pagina_so != 0 ||
+    if (pagina_so <= 0 || page_size == 0 || page_size % (size_t)pagina_so != 0 ||
+        (vistas == NULL && resolver_directorio == NULL) ||
+        (vistas != NULL && (vistas->a_r == NULL || vistas->c_r == NULL || vistas->bytes == 0 ||
+                           vistas->bytes % page_size != 0 ||
+                           (uintptr_t)vistas->a_r % (size_t)pagina_so != 0)) ||
         max_trabajadores == 0 || max_trabajadores > DSM_PAGER_MAX_TRABAJADORES ||
         (preparar == NULL && ((resolver == NULL && resolver_directorio == NULL) ||
-                             paginas == NULL || timeout_ms == 0))) {
+                             (vistas != NULL && paginas == NULL) || timeout_ms == 0))) {
         return error_con(EINVAL);
     }
 
-    size_t cantidad = vistas->bytes / page_size;
+    size_t cantidad = vistas == NULL ? 0 : vistas->bytes / page_size;
     if (paginas != NULL) {
         for (size_t i = 0; i < cantidad; i++) {
             if (permisos(paginas[i].msi) < 0) {
@@ -258,13 +279,16 @@ static int iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
     if (pager == NULL) {
         return -1;
     }
+    atomic_init(&pager->ventanas, NULL);
     int error = ENOMEM;
-    pager->paginas = calloc(cantidad, sizeof *pager->paginas);
+    if (resolver_directorio == NULL) {
+        pager->paginas = calloc(cantidad, sizeof *pager->paginas);
+    }
     pager->trabajadores = calloc(max_trabajadores, sizeof *pager->trabajadores);
-    if (pager->paginas == NULL || pager->trabajadores == NULL) {
+    if ((resolver_directorio == NULL && pager->paginas == NULL) || pager->trabajadores == NULL) {
         goto fallo;
     }
-    if (paginas != NULL) {
+    if (paginas != NULL && resolver_directorio == NULL) {
         memcpy(pager->paginas, paginas, cantidad * sizeof *paginas);
     }
     if (resolver != NULL) {
@@ -285,8 +309,12 @@ static int iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
     for (size_t i = 0; i < max_trabajadores; i++) {
         dsm_solicitud_t *solicitud = &pager->trabajadores[i].solicitud;
         atomic_init(&solicitud->estado, DSM_SOLICITUD_QUIETA);
-        solicitud->base = (uintptr_t)vistas->a_r;
-        solicitud->bytes = vistas->bytes;
+        if (resolver_directorio != NULL) {
+            solicitud->ventanas = &pager->ventanas;
+        } else {
+            solicitud->base = (uintptr_t)vistas->a_r;
+            solicitud->bytes = vistas->bytes;
+        }
         solicitud->page_size = page_size;
         solicitud->aviso = &pager->aviso;
     }
@@ -321,6 +349,12 @@ static int iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
                 return error_con(error);
             }
         }
+    }
+    if (vistas != NULL && resolver_directorio != NULL &&
+        dsm_pager_agregar_vista(pager, vistas, paginas) != 0) {
+        error = errno;
+        dsm_pager_cerrar(pager);
+        return error_con(error);
     }
     *salida = pager;
     return 0;
@@ -359,13 +393,132 @@ int dsm_pager_iniciar_directorio(dsm_pager_t **salida, dsm_vistas_t *vistas, siz
                    paginas, solicitante, timeout_ms, NULL, resolver);
 }
 
+int dsm_pager_iniciar_vacio(dsm_pager_t **salida, size_t page_size, size_t max_trabajadores,
+                            uint16_t solicitante, uint32_t timeout_ms,
+                            dsm_pager_fallo_t resolver, void *contexto)
+{
+    return iniciar(salida, NULL, page_size, max_trabajadores, NULL, contexto,
+                   NULL, solicitante, timeout_ms, NULL, resolver);
+}
+
+int dsm_pager_agregar_vista(dsm_pager_t *pager, dsm_vistas_t *vistas,
+                            const dsm_pager_pagina_t *paginas)
+{
+    long pagina_so = sysconf(_SC_PAGESIZE);
+    if (pager == NULL || pager->resolver_directorio == NULL || vistas == NULL ||
+        vistas->a_r == NULL || vistas->c_r == NULL || vistas->bytes == 0 || paginas == NULL ||
+        pagina_so <= 0 || vistas->bytes % pager->page_size != 0 ||
+        (uintptr_t)vistas->a_r % (size_t)pagina_so != 0 ||
+        vistas->bytes - 1 > UINTPTR_MAX - (uintptr_t)vistas->a_r) {
+        return error_con(EINVAL);
+    }
+    size_t cantidad = vistas->bytes / pager->page_size;
+    if (cantidad > SIZE_MAX / sizeof *paginas || paginas[0].reserva_id == 0) {
+        return error_con(EINVAL);
+    }
+    for (size_t i = 0; i < cantidad; i++) {
+        if (paginas[i].reserva_id != paginas[0].reserva_id || permisos(paginas[i].msi) < 0) {
+            return error_con(EINVAL);
+        }
+    }
+    struct ventana *ventana = calloc(1, sizeof *ventana);
+    if (ventana == NULL) {
+        return -1;
+    }
+    ventana->paginas = malloc(cantidad * sizeof *paginas);
+    if (ventana->paginas == NULL) {
+        free(ventana);
+        return -1;
+    }
+    memcpy(ventana->paginas, paginas, cantidad * sizeof *paginas);
+    ventana->senal = (dsm_ventana_senal_t){
+        .base = (uintptr_t)vistas->a_r,
+        .bytes = vistas->bytes,
+        .page_size = pager->page_size,
+    };
+
+    int error = 0;
+    int repetida = 0;
+    pthread_mutex_lock(&pager->mutex);
+    dsm_ventana_senal_t *primera = atomic_load_explicit(&pager->ventanas, memory_order_relaxed);
+    if (pager->cerrando) {
+        error = EBUSY;
+    }
+    for (dsm_ventana_senal_t *actual = primera; actual != NULL && error == 0;
+         actual = actual->siguiente) {
+        const struct ventana *existente = (const struct ventana *)actual;
+        if (existente->paginas[0].reserva_id == paginas[0].reserva_id) {
+            repetida = actual->base == ventana->senal.base && actual->bytes == vistas->bytes;
+            for (size_t i = 0; repetida && i < cantidad; i++) {
+                repetida = existente->paginas[i].gpn == paginas[i].gpn;
+            }
+            error = repetida ? 0 : EEXIST;
+            break;
+        }
+        uintptr_t base = ventana->senal.base;
+        int solapada = base >= actual->base ? base - actual->base < actual->bytes :
+                                             actual->base - base < vistas->bytes;
+        if (solapada) {
+            error = EEXIST;
+        }
+    }
+    if (error == 0 && !repetida) {
+        ventana->senal.siguiente = primera;
+        atomic_store_explicit(&pager->ventanas, &ventana->senal, memory_order_release);
+    }
+    pthread_mutex_unlock(&pager->mutex);
+    if (error != 0 || repetida) {
+        free(ventana->paginas);
+        free(ventana);
+    }
+    return error == 0 ? 0 : error_con(error);
+}
+
+int dsm_pager_retirar_vista(dsm_pager_t *pager, uint32_t reserva_id)
+{
+    if (pager == NULL || pager->resolver_directorio == NULL || reserva_id == 0) {
+        return error_con(EINVAL);
+    }
+    pthread_mutex_lock(&pager->mutex);
+    for (size_t i = 0; i < pager->max_trabajadores; i++) {
+        if (pager->trabajadores[i].registrado) {
+            pthread_mutex_unlock(&pager->mutex);
+            return error_con(EBUSY);
+        }
+    }
+    dsm_ventana_senal_t *actual = atomic_load_explicit(&pager->ventanas, memory_order_relaxed);
+    dsm_ventana_senal_t *anterior = NULL;
+    while (actual != NULL && ((struct ventana *)actual)->paginas[0].reserva_id != reserva_id) {
+        anterior = actual;
+        actual = actual->siguiente;
+    }
+    if (actual == NULL) {
+        pthread_mutex_unlock(&pager->mutex);
+        return error_con(ENOENT);
+    }
+    /* No hay manejadores que puedan conservar un nodo retirado. */
+    if (anterior == NULL) {
+        atomic_store_explicit(&pager->ventanas, actual->siguiente, memory_order_release);
+    } else {
+        anterior->siguiente = actual->siguiente;
+    }
+    struct ventana *ventana = (struct ventana *)actual;
+    free(ventana->paginas);
+    free(ventana);
+    pthread_mutex_unlock(&pager->mutex);
+    return 0;
+}
+
 int dsm_pager_consultar_pagina(dsm_pager_t *pager, size_t indice, dsm_pager_pagina_t *pagina)
 {
-    if (pager == NULL || pagina == NULL || indice >= pager->vistas->bytes / pager->page_size) {
+    if (pager == NULL || pagina == NULL) {
         return error_con(EINVAL);
     }
     if (pager->resolver_directorio != NULL) {
         return error_con(ENOTSUP);
+    }
+    if (indice >= pager->vistas->bytes / pager->page_size) {
+        return error_con(EINVAL);
     }
     pthread_mutex_lock(&pager->mutex);
     *pagina = pager->paginas[indice];

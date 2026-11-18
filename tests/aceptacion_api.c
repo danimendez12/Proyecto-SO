@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
-enum { TAMANO_PAGINA = 4096 };
+enum { TAMANO_PAGINA = 4096, TAMANO_LOGICO = TAMANO_PAGINA - 7 };
 
 static const char configuracion[] = "config/lab.ini";
 static const uint8_t directo[] = {0x13, 0x57, 0x9b};
@@ -79,22 +79,25 @@ static int probar_reserva(void)
 
     VERIFICAR(dsm_reservar(ctx, proc, 0, &reserva, &base) == DSM_ERR_INVAL);
     VERIFICAR(dsm_reservar(ctx, proc, sizeof directo, NULL, &base) == DSM_ERR_INVAL);
-    VERIFICAR(dsm_reservar(ctx, proc, TAMANO_PAGINA + 1, &reserva, &base) == DSM_ERR_NOMEM);
-    VERIFICAR(dsm_reservar(ctx, proc, sizeof directo, &reserva, &base) == DSM_OK && base != NULL);
+    /* 11B admite varias paginas y rechaza tamanos que desbordan la capacidad. */
+    VERIFICAR(dsm_reservar(ctx, proc, SIZE_MAX, &reserva, &base) == DSM_ERR_NOMEM);
+    VERIFICAR(dsm_reservar(ctx, proc, TAMANO_LOGICO, &reserva, &base) == DSM_OK && base != NULL);
     dsm_reserva_id_t otra_reserva;
     void *otra_base;
-    VERIFICAR(dsm_reservar(ctx, proc, 1, &otra_reserva, &otra_base) == DSM_ERR_NOMEM);
+    VERIFICAR(dsm_reservar(ctx, proc, 1, &otra_reserva, &otra_base) == DSM_OK &&
+              otra_reserva != reserva && otra_base != NULL && otra_base != base);
+    ((volatile uint8_t *)otra_base)[0] = 0x7a;
 
     void *abierta;
     size_t bytes;
     VERIFICAR(dsm_abrir_reserva(ctx, reserva, &abierta, &bytes) == DSM_OK &&
-              abierta == base && bytes == TAMANO_PAGINA);
+              abierta == base && bytes == TAMANO_LOGICO);
     dsm_reserva_id_t remota = (UINT32_C(1) << 16) | 1u;
     VERIFICAR(dsm_abrir_reserva(ctx, remota, &abierta, &bytes) == DSM_ERR_NODO);
     VERIFICAR(dsm_desvincular_reserva(ctx, reserva) == DSM_ERR_ESTADO);
 
     volatile uint8_t *ar = base;
-    VERIFICAR(ar[0] == 0 && ar[TAMANO_PAGINA - 1] == 0);
+    VERIFICAR(ar[0] == 0 && ar[TAMANO_LOGICO - 1] == 0);
     for (size_t i = 0; i < sizeof directo; i++) {
         ar[i] = directo[i];
     }
@@ -111,13 +114,13 @@ static int probar_reserva(void)
         VERIFICAR(lectura[i] == controlado[i]);
     }
 
-    VERIFICAR(dsm_traducir(ctx, reserva, TAMANO_PAGINA, &traducida) == DSM_ERR_INVAL);
+    VERIFICAR(dsm_traducir(ctx, reserva, TAMANO_LOGICO, &traducida) == DSM_ERR_INVAL);
     VERIFICAR(dsm_leer(ctx, reserva, 0, NULL, sizeof leido) == DSM_ERR_INVAL);
     VERIFICAR(dsm_leer(ctx, reserva, SIZE_MAX, leido, sizeof leido) == DSM_ERR_INVAL);
-    VERIFICAR(dsm_escribir(ctx, reserva, TAMANO_PAGINA - 1, controlado, sizeof controlado) == DSM_ERR_INVAL);
-    VERIFICAR(dsm_leer(ctx, reserva, TAMANO_PAGINA, NULL, 0) == DSM_OK);
-    VERIFICAR(dsm_escribir(ctx, reserva, TAMANO_PAGINA, NULL, 0) == DSM_OK);
-    VERIFICAR(ar[TAMANO_PAGINA - 1] == 0);
+    VERIFICAR(dsm_escribir(ctx, reserva, TAMANO_LOGICO - 1, controlado, sizeof controlado) == DSM_ERR_INVAL);
+    VERIFICAR(dsm_leer(ctx, reserva, TAMANO_LOGICO, NULL, 0) == DSM_OK);
+    VERIFICAR(dsm_escribir(ctx, reserva, TAMANO_LOGICO, NULL, 0) == DSM_OK);
+    VERIFICAR(ar[TAMANO_LOGICO - 1] == 0);
 
     struct intento_cierre intento = {.ctx = ctx, .reserva = reserva};
     pthread_t hilo;
@@ -135,10 +138,20 @@ static int probar_reserva(void)
     VERIFICAR(pthread_sigmask(SIG_SETMASK, NULL, &mascara) == 0 &&
               sigismember(&mascara, SIGUSR1) == usr1_original);
     VERIFICAR(dsm_liberar(ctx, reserva) == DSM_OK);
-    VERIFICAR(segv_restaurada(&anterior));
+    /* El contexto conserva otras reservas y su manejador hasta dsm_cerrar. */
+    VERIFICAR(sigaction(SIGSEGV, NULL, &instalada) == 0 &&
+              (instalada.sa_flags & SA_SIGINFO) != 0 && !segv_restaurada(&anterior));
     VERIFICAR(dsm_liberar(ctx, reserva) == DSM_ERR_INVAL);
     VERIFICAR(dsm_abrir_reserva(ctx, reserva, &abierta, &bytes) == DSM_ERR_INVAL);
-    VERIFICAR(dsm_reservar(ctx, proc, 1, &otra_reserva, &otra_base) == DSM_ERR_NOMEM);
+    VERIFICAR(dsm_hilo_registrar(ctx, proc) == DSM_OK);
+    registrado = 1;
+    uint8_t conservado;
+    VERIFICAR(dsm_leer(ctx, otra_reserva, 0, &conservado, 1) == DSM_OK && conservado == 0x7a);
+    VERIFICAR(dsm_hilo_desregistrar(ctx) == DSM_OK);
+    registrado = 0;
+    VERIFICAR(dsm_liberar(ctx, otra_reserva) == DSM_OK);
+    VERIFICAR(dsm_reservar(ctx, proc, 1, &otra_reserva, &otra_base) == DSM_OK &&
+              otra_reserva != reserva);
     resultado = 0;
 
 terminar:
@@ -151,6 +164,10 @@ terminar:
             fprintf(stderr, "aceptacion_api: no se pudo cerrar el contexto\n");
             resultado = 1;
         }
+    }
+    if (resultado == 0 && !segv_restaurada(&anterior)) {
+        fprintf(stderr, "aceptacion_api: no se restauro SIGSEGV al cerrar\n");
+        resultado = 1;
     }
     return resultado;
 }

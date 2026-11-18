@@ -33,7 +33,9 @@ enum {
     DSM_TIPO_INVALIDATE = 0x14,
     DSM_TIPO_INVALIDATE_ACK = 0x15,
     DSM_TIPO_REGION_LOOKUP = 0x32,
-    DSM_TIPO_REGION_INFO = 0x33
+    DSM_TIPO_REGION_INFO = 0x33,
+    DSM_TIPO_REGION_CLOSE = 0x34,
+    DSM_TIPO_REGION_CLOSE_ACK = 0x35
 };
 
 enum {
@@ -68,7 +70,8 @@ enum {
     DSM_INVALIDA_HECHO = 0,
     DSM_INVALIDA_YA_I = 1,
     DSM_AVISO_BYTES = 40,
-    DSM_CONTROL_BYTES = 48
+    DSM_CONTROL_BYTES = 48,
+    DSM_REGION_CIERRE_BYTES = 40
 };
 
 enum {
@@ -183,6 +186,11 @@ typedef struct dsm_region_lookup {
     uint32_t reserva_id;
     uint32_t primer_tramo;
 } dsm_region_lookup_t;
+
+int dsm_region_cierre_codificar(uint8_t *buf, size_t cap, dsm_cabecera_t *cab,
+                                uint32_t reserva, size_t *out);
+int dsm_region_cierre_decodificar(const uint8_t *buf, size_t n, dsm_cabecera_t *cab,
+                                  uint32_t *reserva);
 
 typedef struct dsm_tramo {
     uint32_t orden_inicial;

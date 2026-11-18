@@ -16,7 +16,17 @@ void dsm_coherencia_cerrar(dsm_coherencia_t *coherencia);
 int dsm_coherencia_esperar(dsm_coherencia_t *coherencia, uint16_t par);
 int dsm_coherencia_abrir(dsm_coherencia_t *coherencia, uint32_t reserva,
                          dsm_pagina_desc_t *pagina, dsm_vistas_t **vista);
+/* Espera la retirada de las copias y la confirmacion del creador. */
+int dsm_coherencia_desvincular(dsm_coherencia_t *coherencia, uint32_t reserva);
+int dsm_coherencia_asociar(dsm_coherencia_t *coherencia, dsm_pager_t *pager, uint32_t id,
+                          dsm_vistas_t *vista, size_t *bytes_logicos);
 /* Adaptador de dsm_pager_iniciar_directorio. El contexto es dsm_coherencia_t*. */
 int dsm_coherencia_resolver(const dsm_pager_peticion_t *peticion, void *contexto);
+/* Reutiliza la resolucion de permisos y copia solo un trozo de una pagina.
+ * El buffer scratch no pertenece a una vista de aplicacion.
+ */
+int dsm_coherencia_copiar_controlado(dsm_coherencia_t *coherencia, uint32_t reserva,
+                                     uint64_t gpn, size_t offset, void *scratch, size_t bytes,
+                                     int escritura, const struct timespec *plazo);
 
 #endif

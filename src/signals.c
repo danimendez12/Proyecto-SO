@@ -53,7 +53,24 @@ static void atender_fallo(int signo, siginfo_t *info, void *contexto)
     const greg_t escritura = 1u << 1;
     const greg_t ejecucion = 1u << 4;
     greg_t error_pagina = uc->uc_mcontext.gregs[REG_ERR];
-    if (direccion < solicitud->base || direccion - solicitud->base >= solicitud->bytes ||
+    uintptr_t base = solicitud->base;
+    size_t bytes = solicitud->bytes;
+    size_t page_size = solicitud->page_size;
+    dsm_ventana_senal_t *ventana = NULL;
+    if (solicitud->ventanas != NULL) {
+        ventana = atomic_load_explicit(solicitud->ventanas, memory_order_acquire);
+        while (ventana != NULL &&
+               (direccion < ventana->base || direccion - ventana->base >= ventana->bytes)) {
+            ventana = ventana->siguiente;
+        }
+        if (ventana == NULL) {
+            fallo_fatal();
+        }
+        base = ventana->base;
+        bytes = ventana->bytes;
+        page_size = ventana->page_size;
+    }
+    if (direccion < base || direccion - base >= bytes ||
         (error_pagina & ejecucion) != 0 ||
         atomic_load_explicit(&solicitud->estado, memory_order_acquire) != DSM_SOLICITUD_QUIETA) {
         fallo_fatal();
@@ -62,7 +79,8 @@ static void atender_fallo(int signo, siginfo_t *info, void *contexto)
     sigset_t espera = uc->uc_sigmask;
     sigdelset(&espera, SIGUSR1);
     sigaddset(&espera, SIGSEGV);
-    solicitud->pagina = (direccion - solicitud->base) / solicitud->page_size;
+    solicitud->ventana = ventana;
+    solicitud->pagina = (direccion - base) / page_size;
     solicitud->acceso = (error_pagina & escritura) ? DSM_FALLO_ESCRITURA : DSM_FALLO_LECTURA;
     atomic_store_explicit(&solicitud->estado, DSM_SOLICITUD_PENDIENTE, memory_order_release);
     if (sem_post(solicitud->aviso) != 0) {
@@ -168,9 +186,11 @@ static void conjunto_usr1(sigset_t *usr1)
 
 int dsm_senales_registrar(dsm_solicitud_t *solicitud)
 {
-    if (solicitud == NULL || solicitud->aviso == NULL || solicitud->bytes == 0 ||
-        solicitud->page_size == 0 || solicitud->bytes % solicitud->page_size != 0 ||
-        solicitud->bytes - 1 > UINTPTR_MAX - solicitud->base ||
+    if (solicitud == NULL || solicitud->aviso == NULL ||
+        (solicitud->ventanas == NULL &&
+         (solicitud->bytes == 0 || solicitud->page_size == 0 ||
+          solicitud->bytes % solicitud->page_size != 0 ||
+          solicitud->bytes - 1 > UINTPTR_MAX - solicitud->base)) ||
         atomic_load_explicit(&solicitud->estado, memory_order_relaxed) != DSM_SOLICITUD_QUIETA) {
         return fallo(EINVAL);
     }

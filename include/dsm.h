@@ -32,11 +32,16 @@ int dsm_proc_abrir(dsm_context_t *ctx, dsm_proc_id_t *salida);
 int dsm_hilo_registrar(dsm_context_t *ctx, dsm_proc_id_t proceso);
 int dsm_hilo_desregistrar(dsm_context_t *ctx);
 
-/* Una reserva local por contexto. El tamano se redondea a una pagina. */
+/* La reserva conserva bytes logicos y tiene una vista contigua redondeada a paginas. */
 int dsm_reservar(dsm_context_t *ctx, dsm_proc_id_t proceso, size_t bytes,
                  dsm_reserva_id_t *id, void **base);
-/* Para el ID local devuelve la misma Ar. Un ID remoto valido devuelve DSM_ERR_NODO. */
+/* Abre la reserva del creador por TCP o devuelve la vista ya abierta en este
+ * contexto. bytes recibe el tamano logico original. Una apertura repetida
+ * conserva una sola vinculacion por nodo y reserva. */
 int dsm_abrir_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, void **base, size_t *bytes);
+/* Desregistrar los trabajadores antes de desmontar. El cliente desvincula su
+ * vista y entrega las paginas modificadas. El creador solo puede liberar
+ * cuando todos los clientes han confirmado la desvinculacion. */
 int dsm_desvincular_reserva(dsm_context_t *ctx, dsm_reserva_id_t id);
 int dsm_liberar(dsm_context_t *ctx, dsm_reserva_id_t id);
 

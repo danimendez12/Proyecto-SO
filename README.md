@@ -5,8 +5,8 @@ El objetivo es implementar en C para Linux un sistema de Memoria Compartida
 Distribuida (DSM) que permita a procesos en distintos nodos acceder a una región
 de memoria compartida.
 
-El Prototipo 2 permite leer y escribir una página compartida desde procesos Linux
-x86-64 independientes. Un fallo sobre la vista de aplicación activa al paginador
+El Prototipo 2 permite compartir reservas de una o varias páginas desde
+aplicaciones C independientes en Linux x86-64. Un fallo sobre la vista de aplicación activa al paginador
 y el hogar coordina por TCP los permisos MSI de esa página.
 
 ## Organización
@@ -15,7 +15,7 @@ y el hogar coordina por TCP los permisos MSI de esa página.
 | --- | --- |
 | `include/` | Cabeceras de los módulos. |
 | `src/` | Módulos en C y punto de entrada del nodo (`main.c`). |
-| `examples/` | Ejemplo del API local y programa base para el lector. |
+| `examples/` | Aplicaciones creadora y lectora que usan el API público. |
 | `tests/` | Pruebas de aceptación de red, memoria, directorio y paginación. |
 | `config/` | Configuración de dos nodos en loopback y plantilla para ocho nodos. |
 | `docs/` | Documentación técnica y evidencias del laboratorio. |
@@ -46,7 +46,7 @@ los ejecutables correspondientes.
 | `make` | Genera `bin/dsm_node`. |
 | `make examples` | Genera los ejemplos en `bin/examples/`. |
 | `make tests` | Genera los programas de prueba en `bin/tests/`. |
-| `make aceptacion` | Compila los nueve binarios de aceptación. |
+| `make aceptacion` | Compila los trece binarios de aceptación. |
 | `make clean` | Elimina el directorio de salida `bin/`. |
 
 ## Demostración de paginación remota
@@ -162,68 +162,111 @@ como hogar de las revocaciones que debe atender como réplica. Una página
 con poseedor perdido queda indisponible. Una copia compartida desconectada
 sigue contando hasta que el hogar obtiene una confirmación de invalidación.
 
-## API local del Prototipo 2
+## API público del Prototipo 2
 
-`make examples` compila el ejemplo de aplicación. Ejecutalo desde la raíz
-del proyecto. El argumento del INI es opcional.
+Cada aplicación incluye `dsm.h` e inicia su nodo con `dsm_iniciar`. El mismo
+proceso escucha por TCP, administra sus propias vistas y atiende sus fallos
+de página. Hay un contexto por proceso. Cada contexto admite varias reservas.
+
+| Operación | Semántica |
+| --- | --- |
+| Crear | `dsm_proc_abrir` obtiene el ID de proceso. `dsm_reservar` devuelve un ID global y una Ar contigua. El creador aporta las páginas, inicialmente en M. |
+| Abrir | `dsm_abrir_reserva` consulta al creador por TCP, recibe el manifiesto y crea vistas locales. Las páginas remotas comienzan en I. Reabrir el mismo ID devuelve la misma Ar y el tamaño lógico. Basta una desvinculación por nodo. |
+| Acceder | Registrá el hilo antes de usar directamente Ar o el puntero de `dsm_traducir`. Cada fallo resuelve el GPN de esa página. La aplicación sincroniza los accesos directos concurrentes a los mismos datos. |
+| Copiar | `dsm_leer` y `dsm_escribir` validan el rango lógico y adquieren los permisos MSI por página. Admiten cruces y solapamiento. Un error de comunicación se devuelve al llamador. Una copia de varias páginas puede haberse completado parcialmente si falla una página posterior. |
+| Desvincular | El cliente llama a `dsm_desvincular_reserva`. El hogar revoca las copias de ese nodo y recupera el contenido de cada página en M antes de confirmar el cierre. Si se pierde la confirmación, se puede reintentar el cierre con el mismo ID. |
+| Liberar | Solo el creador puede llamar a `dsm_liberar`. Una apertura remota vigente devuelve `DSM_ERR_OCUPADA`. Las demás reservas conservan sus vistas. |
+| Cerrar | Desregistrá los trabajadores antes de desmontar una reserva o cerrar. `dsm_cerrar` desvincula las aperturas remotas, comprueba las propias, detiene los hilos, restaura las señales y libera recursos. Un cierre fallido puede haber desvinculado otras reservas. Tras un cierre exitoso, el contexto y sus punteros dejan de ser válidos. |
+
+El tamaño lógico es el solicitado, aunque el respaldo use páginas completas.
+Los punteros directos deben mantenerse dentro del rango lógico. Linux solo
+puede proteger páginas completas, incluido el relleno de la última. Si un
+fallo directo sobre Ar resulta irresoluble, el proceso recibe SIGSEGV. Para
+obtener un código de error de la operación, usá las funciones de copia.
+
+| Código del API | Situación |
+| --- | --- |
+| `DSM_ERR_INVAL` | Tamaño cero al reservar, ID inexistente o rango lógico inválido. |
+| `DSM_ERR_NOMEM` | Faltan capacidad local, tramos representables o recursos para las vistas. |
+| `DSM_ERR_NODO` | El par está desconectado o la página quedó aislada al perder el hogar. |
+| `DSM_ERR_TIEMPO` | Una solicitud enviada quedó sin respuesta dentro del plazo. |
+| `DSM_ERR_OCUPADA` | Hay trabajadores o aperturas que impiden retirar la reserva. |
+
+Después de perder el hogar, una vista antigua permanece protegida aunque se
+restablezca TCP. El ID de nodo carece de una época persistente que identifique
+la misma instancia del creador. Una página cuyo último poseedor M se perdió
+puede quedar indisponible.
+
+El manifiesto admite hasta 16 tramos. Cada reserva actual cabe íntegramente
+en el aporte de su creador. Dos reservas distintas sí pueden tener hogares
+distintos. La distribución de una sola reserva entre hogares queda pendiente.
+
+### Dos aplicaciones desde terminales independientes
+
+En Ubuntu, desde la raíz del proyecto, compilá con `make examples` y ejecutá
+`DSM_INI=config/lab.ini` en cada terminal para usar los dos nodos en loopback.
+
+En **dos computadoras Linux Mint**, compilá la misma revisión en ambas y
+ejecutá este bloque en cada equipo. Ingresá las mismas dos direcciones en el
+mismo orden. Cada terminal genera su propia copia del INI. Se conservan los
+puertos TCP 27200 y 27201 y el tamaño de página de 4096.
 
 ```bash
-./bin/examples/demo_creator config/lab.ini
+make examples
+read -rp 'IPv4 real del nodo 0: ' DSM_IP0
+read -rp 'IPv4 real del nodo 1: ' DSM_IP1
+DSM_INI=$(mktemp)
+awk -v a="$DSM_IP0" -v b="$DSM_IP1" \
+  '$1 == "nodo" && $3 == 0 {$5=a} $1 == "nodo" && $3 == 1 {$5=b} {print}' \
+  config/lab.ini > "$DSM_INI"
 ```
 
-La aplicación llama a `dsm_iniciar` con el INI y el ID de nodo, y abre su
-identidad con `dsm_proc_abrir`. La inicialización prepara una página local
-en M e inicia el paginador y sus señales en el mismo proceso. Hay un
-contexto activo por proceso. `dsm_reservar` publica esa página, redondea
-el tamaño solicitado a una página y devuelve su ID y la dirección de
-`Ar`. Las escrituras sobre esa vista se realizan directamente.
+| Escenario | Terminal del creador, nodo 0 | Terminal del cliente, nodo 1 |
+| --- | --- | --- |
+| Una página | `./bin/examples/demo_creator "$DSM_INI" compartir 0 1 4096` | `./bin/examples/demo_reader "$DSM_INI" 1 1 4096` |
+| Tres páginas | `./bin/examples/demo_creator "$DSM_INI" compartir 0 3 4096` | `./bin/examples/demo_reader "$DSM_INI" 1 1 4096` |
 
-Registrá cada trabajador desde su propio hilo con `dsm_hilo_registrar`
-antes de acceder a `Ar` y llamá a `dsm_hilo_desregistrar` cuando termine.
-El desregistro amplía el API del Entregable 1 para devolver la ranura y
-restaurar la máscara del hilo. `dsm_liberar` y `dsm_cerrar` devuelven
-`DSM_ERR_OCUPADA` si todavía hay hilos registrados. Un cierre exitoso
-invalida el puntero al contexto y los punteros prestados. Inicializá otro
-contexto para volver a reservar después del cierre.
+Arrancá el creador primero y esperá que anuncie el ID de reserva. El segundo
+`1` del cliente es ese ID, que vale 1 para la primera reserva del nodo 0 en
+un contexto nuevo. El último argumento de ambos comandos debe coincidir con
+`page_size` del INI. Ejecutá un escenario completo antes de iniciar el otro.
 
-`dsm_abrir_reserva` devuelve la misma vista para una reserva propia ya
-publicada. `dsm_traducir` devuelve la dirección local de un desplazamiento.
-`dsm_leer` y `dsm_escribir` copian a través de `Ar` con validación de
-límites. La aplicación sincroniza sus accesos concurrentes al contenido.
-La liberación local desmonta la única reserva del contexto. Las consultas
-públicas de nodos y páginas y la impresión de estado quedan pendientes.
+1. El cliente muestra los datos iniciales. Ingresá `escribir` en su terminal.
+2. Ingresá `leer` en el creador. Con una página debe leer `Adios TEC` donde
+   antes tenía `Hola TEC`. Con tres páginas debe mostrar, en orden,
+   `Hola TEC`, `Adios TEC` y `Pagina 2 original`.
+3. Ingresá `salir` en el cliente y esperá su terminación. Luego ingresá
+   `salir` en el creador para liberar la reserva.
 
-La apertura remota y `dsm_desvincular_reserva` de una vista remota devuelven
-`DSM_ERR_NODO` en esta entrada local. El servicio interno ya expone el intercambio
-`REGION_LOOKUP/INFO`. El API público prepara y registra trabajadores sobre
-su única vista local antes de publicar la reserva. Permitir abrir y cerrar
-también una vista remota requiere gestionar la vida de las demás ventanas,
-sus trabajadores y la desvinculación de las copias en el hogar.
+El ejemplo local breve también se ejecuta con
+`./bin/examples/demo_creator config/lab.ini`.
 
 ## Pruebas de aceptación
 
+Desde la raíz del proyecto en Linux x86-64, con los puertos del INI libres:
+
 ```bash
+set -e
 make clean
 make
 make examples tests aceptacion
-timeout -k 1s 25s ./bin/tests/aceptacion_red
-timeout -k 1s 10s ./bin/tests/aceptacion_memoria
-timeout -k 1s 25s ./bin/tests/aceptacion_directorio
-timeout -k 1s 15s ./bin/tests/aceptacion_paginador
-timeout -k 1s 30s ./bin/tests/aceptacion_paginacion_remota
-timeout -k 1s 20s ./bin/tests/aceptacion_escritura_local
-timeout -k 1s 20s ./bin/tests/aceptacion_api
-timeout -k 1s 30s ./bin/tests/aceptacion_coherencia
-timeout -k 1s 45s ./bin/tests/aceptacion_escritura_remota
+for prueba in red memoria directorio paginador paginacion_remota escritura_local \
+              api coherencia escritura_remota api_remoto multipagina multipagina_remota api_errores
+do
+    timeout -k 1s 45s "./bin/tests/aceptacion_$prueba"
+done
+for repeticion in 1 2 3 4 5
+do
+    for prueba in api_remoto multipagina_remota api_errores
+    do
+        timeout -k 1s 45s "./bin/tests/aceptacion_$prueba"
+    done
+done
 ```
 
-La aceptación de paginación remota ejecuta dos procesos en loopback y después tres procesos
-activos en orden 2, 0, 3. En ese segundo escenario el nodo 2 lee del hogar 3
-mientras el nodo 1 permanece apagado. Usa aportes distintos para comprobar
-el GPN calculado por suma acumulada.
-
-La aceptación de escritura remota lanza procesos independientes, verifica los
-permisos de cada Ar en `/proc/<pid>/maps` y recupera las escrituras mediante
-lecturas reales. El segundo escenario enfrenta dos escritores sobre bytes
-distintos de la misma página con el hogar en el nodo 3. `demo_reader` y los
-programas `test_*` son plantillas compilables.
+La aceptación de escritura remota incluye dos escritores con hogar en el nodo
+3. Las aceptaciones del API usan procesos independientes, el transporte TCP
+del DSM y permisos observados en `/proc`. La prueba local inyecta además un
+fallo al crear la vista interna y comprueba que el nodo recupera la capacidad.
+El informe de la ejecución y las limitaciones se guarda en
+[la documentación técnica](docs/README.md).

@@ -80,6 +80,18 @@ int dsm_pager_iniciar_directorio(dsm_pager_t **salida, dsm_vistas_t *vistas, siz
                                  uint16_t solicitante, uint32_t timeout_ms,
                                  dsm_pager_fallo_t resolver, void *contexto);
 
+/* Crea el paginador antes de publicar reservas o registrar trabajadores. */
+int dsm_pager_iniciar_vacio(dsm_pager_t **salida, size_t page_size, size_t max_trabajadores,
+                            uint16_t solicitante, uint32_t timeout_ms,
+                            dsm_pager_fallo_t resolver, void *contexto);
+/* Publica una ventana de directorio y copia una identidad por pagina. Puede
+ * agregarse con trabajadores registrados. Las vistas viven hasta retirarlas.
+ */
+int dsm_pager_agregar_vista(dsm_pager_t *pager, dsm_vistas_t *vistas,
+                            const dsm_pager_pagina_t *paginas);
+/* Exige cero registrados. Retira metadatos, sin desmontar las vistas del caller. */
+int dsm_pager_retirar_vista(dsm_pager_t *pager, uint32_t reserva_id);
+
 /* En modo directorio se consulta el estado en el propio directorio (ENOTSUP). */
 int dsm_pager_consultar_pagina(dsm_pager_t *pager, size_t indice, dsm_pager_pagina_t *pagina);
 

@@ -59,16 +59,10 @@ static int preparar_vista(struct servicio *s, uint32_t reserva)
     if (dsm_coherencia_abrir(s->coherencia, reserva, &s->pagina, &s->vista) != 0) {
         return -1;
     }
-    const dsm_pager_pagina_t pagina = {
-        .reserva_id = s->pagina.reserva,
-        .gpn = s->pagina.gpn,
-        .version = s->pagina.version,
-        .msi = s->pagina.msi,
-    };
-    if (dsm_pager_iniciar_directorio(&s->pager, s->vista, s->cfg->page_size,
-                                     s->cfg->max_hilos, &pagina, s->id,
-                                     s->cfg->rpc_timeout_ms, dsm_coherencia_resolver,
-                                     s->coherencia) != 0) {
+    if (dsm_pager_iniciar_vacio(&s->pager, s->cfg->page_size, s->cfg->max_hilos,
+                                s->id, s->cfg->rpc_timeout_ms, dsm_coherencia_resolver,
+                                s->coherencia) != 0 ||
+        dsm_coherencia_asociar(s->coherencia, s->pager, reserva, s->vista, NULL) != 0) {
         return -1;
     }
     if (dsm_pager_registrar(s->pager) != 0) {
@@ -293,6 +287,10 @@ cerrar_paginador:
         return 1;
     }
 cerrar_coherencia:
+    if (reserva != 0 && s.vista != NULL &&
+        dsm_coherencia_desvincular(s.coherencia, reserva) != 0) {
+        perror("cierre de la vista remota al detener el nodo");
+    }
     dsm_coherencia_cerrar(s.coherencia);
     printf("nodo %u servicio detenido\n", nodo->id);
 cerrar_directorio:

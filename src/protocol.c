@@ -604,6 +604,38 @@ int dsm_region_lookup_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *
     return 0;
 }
 
+static int cabecera_cierre_valida(const dsm_cabecera_t *cab)
+{
+    return cabecera_pedido(cab, DSM_TIPO_REGION_CLOSE) ||
+           cabecera_respuesta(cab, DSM_TIPO_REGION_CLOSE_ACK);
+}
+
+int dsm_region_cierre_codificar(uint8_t *buf, size_t cap, dsm_cabecera_t *cab,
+                                uint32_t reserva, size_t *out)
+{
+    if (!cabecera_cierre_valida(cab) || (uint16_t)reserva == 0 || out == NULL ||
+        preparar(buf, cap, cab, DSM_REGION_CIERRE_BYTES) != 0) {
+        return -1;
+    }
+    put_u32(buf + 32, reserva);
+    put_u16(buf + 36, cab->estado);
+    *out = DSM_REGION_CIERRE_BYTES;
+    return 0;
+}
+
+int dsm_region_cierre_decodificar(const uint8_t *buf, size_t n, dsm_cabecera_t *cab,
+                                  uint32_t *reserva)
+{
+    if (reserva == NULL || n != DSM_REGION_CIERRE_BYTES ||
+        dsm_cabecera_decodificar(buf, n, cab) != 0 || !cabecera_cierre_valida(cab) ||
+        get_u16(buf + 36) != cab->estado || get_u16(buf + 38) != 0 ||
+        (uint16_t)get_u32(buf + 32) == 0) {
+        return -1;
+    }
+    *reserva = get_u32(buf + 32);
+    return 0;
+}
+
 int dsm_region_info_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                               const dsm_region_info_t *msg, size_t *out)
 {

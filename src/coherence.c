@@ -10,6 +10,8 @@
 #include <string.h>
 
 struct pendiente {
+    struct pendiente *siguiente;
+    uint16_t par;
     uint32_t id;
     uint8_t tipo;
     struct timespec plazo;
@@ -23,6 +25,11 @@ struct pendiente {
     int error;
 };
 
+struct resolucion_local {
+    uint64_t gpn;
+    struct resolucion_local *siguiente;
+};
+
 struct dsm_coherencia {
     const dsm_config_t *cfg;
     uint16_t nodo;
@@ -30,7 +37,8 @@ struct dsm_coherencia {
     dsm_red_t *red;
     pthread_mutex_t mutex;
     pthread_cond_t respuesta;
-    struct pendiente pendientes[DSM_CONFIG_MAX_NODOS];
+    struct pendiente *pendientes;
+    struct resolucion_local *resolviendo;
     int cerrando;
 };
 
@@ -76,6 +84,8 @@ static int error_estado(uint16_t estado)
         return EBUSY;
     case DSM_ESTADO_RANGO:
         return ENOENT;
+    case DSM_ESTADO_SIN_TRAMO:
+        return ENOSPC;
     default:
         return EPROTO;
     }
@@ -167,8 +177,11 @@ static int recibir_respuesta(dsm_coherencia_t *c, uint16_t par,
                              const dsm_cabecera_t *cab, const uint8_t *buf, size_t n)
 {
     pthread_mutex_lock(&c->mutex);
-    struct pendiente *p = &c->pendientes[par];
-    if (p->id == 0 || p->id != cab->id_corr || p->lista) {
+    struct pendiente *p = c->pendientes;
+    while (p != NULL && (p->par != par || p->id != cab->id_corr)) {
+        p = p->siguiente;
+    }
+    if (p == NULL || p->lista) {
         pthread_mutex_unlock(&c->mutex);
         /* Una concesion abandonada no puede convertirse en permiso local. */
         return cab->tipo == DSM_TIPO_PAGE_DATA ? fallo(EPROTO) : 0;
@@ -203,11 +216,13 @@ static void estado_par(void *ctx, uint16_t par, uint8_t estado)
     if (estado == DSM_NODO_FUERA) {
         dsm_directorio_par_fuera(c->directorio, par);
         pthread_mutex_lock(&c->mutex);
-        if (c->pendientes[par].id != 0 && !c->pendientes[par].lista) {
-            c->pendientes[par].error = ENOTCONN;
-            c->pendientes[par].lista = 1;
-            pthread_cond_broadcast(&c->respuesta);
+        for (struct pendiente *p = c->pendientes; p != NULL; p = p->siguiente) {
+            if (p->par == par && !p->lista) {
+                p->error = ENOTCONN;
+                p->lista = 1;
+            }
         }
+        pthread_cond_broadcast(&c->respuesta);
         pthread_mutex_unlock(&c->mutex);
     } else if (estado == DSM_NODO_EN_LINEA) {
         dsm_directorio_par_linea(c->directorio, par);
@@ -231,20 +246,9 @@ static int despachar(void *ctx, uint16_t par, const dsm_cabecera_t *cab,
         return fallo(EPROTO);
     }
     if (cab->tipo == DSM_TIPO_PAGE_REQUEST || cab->tipo == DSM_TIPO_INVALIDATE ||
-        cab->tipo == DSM_TIPO_PAGE_DOWNGRADE) {
+        cab->tipo == DSM_TIPO_PAGE_DOWNGRADE || cab->tipo == DSM_TIPO_REGION_CLOSE ||
+        cab->tipo == DSM_TIPO_REGION_LOOKUP) {
         return dsm_directorio_ofrecer(c->directorio, par, buf, n);
-    }
-    if (cab->tipo == DSM_TIPO_REGION_LOOKUP) {
-        dsm_cabecera_t pedido;
-        dsm_region_lookup_t consulta;
-        uint8_t respuesta[512];
-        size_t bytes;
-        if (dsm_region_lookup_decodificar(buf, n, &pedido, &consulta) != 0 ||
-            dsm_directorio_codificar_info(c->directorio, &pedido, &consulta, nuevo_id(c),
-                                         respuesta, sizeof respuesta, &bytes) != 0) {
-            return fallo(EPROTO);
-        }
-        return enviar(c, par, respuesta, bytes);
     }
     return fallo(EPROTO);
 }
@@ -256,13 +260,14 @@ static int intercambiar(dsm_coherencia_t *c, uint16_t par, const uint8_t *buf, s
         return fallo(ETIMEDOUT);
     }
     pthread_mutex_lock(&c->mutex);
-    struct pendiente *p = &c->pendientes[par];
-    if (c->cerrando || p->id != 0) {
-        int error = c->cerrando ? ECANCELED : EBUSY;
+    if (c->cerrando) {
         pthread_mutex_unlock(&c->mutex);
-        return fallo(error);
+        return fallo(ECANCELED);
     }
-    *p = *peticion;
+    struct pendiente *p = peticion;
+    p->par = par;
+    p->siguiente = c->pendientes;
+    c->pendientes = p;
     pthread_mutex_unlock(&c->mutex);
 
     int error = 0;
@@ -287,9 +292,12 @@ static int intercambiar(dsm_coherencia_t *c, uint16_t par, const uint8_t *buf, s
     }
     if (error == 0) {
         error = p->error;
-        peticion->bytes = p->bytes;
     }
-    *p = (struct pendiente){0};
+    struct pendiente **pos = &c->pendientes;
+    while (*pos != p) {
+        pos = &(*pos)->siguiente;
+    }
+    *pos = p->siguiente;
     pthread_mutex_unlock(&c->mutex);
     return error == 0 ? 0 : fallo(error);
 }
@@ -334,6 +342,64 @@ int dsm_coherencia_abrir(dsm_coherencia_t *c, uint32_t reserva,
     return 0;
 }
 
+int dsm_coherencia_asociar(dsm_coherencia_t *c, dsm_pager_t *pager, uint32_t id,
+                          dsm_vistas_t *vista, size_t *bytes_logicos)
+{
+    dsm_region_info_t info;
+    if (dsm_directorio_info(c->directorio, id, &info) != 0) {
+        return -1;
+    }
+    if (vista->bytes / c->cfg->page_size != info.total_paginas) {
+        return fallo(EPROTO);
+    }
+    dsm_pager_pagina_t *paginas = calloc(info.total_paginas, sizeof *paginas);
+    if (paginas == NULL) {
+        return -1;
+    }
+    /* El directorio ya valido la cobertura del manifiesto. */
+    for (size_t t = 0; t < info.cantidad_tramos; t++) {
+        const dsm_tramo_t *tramo = &info.tramos[t];
+        for (uint32_t j = 0; j < tramo->cantidad; j++) {
+            paginas[tramo->orden_inicial + j] = (dsm_pager_pagina_t){
+                .reserva_id = id, .gpn = tramo->gpn_inicial + j,
+            };
+        }
+    }
+    int rc = dsm_pager_agregar_vista(pager, vista, paginas);
+    free(paginas);
+    if (rc == 0 && bytes_logicos != NULL) {
+        *bytes_logicos = (size_t)info.tamano_bytes;
+    }
+    return rc;
+}
+
+int dsm_coherencia_desvincular(dsm_coherencia_t *c, uint32_t reserva)
+{
+    uint16_t creador = (uint16_t)(reserva >> 16);
+    if (c == NULL || (uint16_t)reserva == 0 || creador == c->nodo ||
+        creador >= c->cfg->cantidad_nodos) {
+        return fallo(EINVAL);
+    }
+    dsm_cabecera_t cab = cabecera(c, DSM_TIPO_REGION_CLOSE, creador);
+    uint8_t envio[DSM_REGION_CIERRE_BYTES], respuesta[DSM_REGION_CIERRE_BYTES];
+    struct pendiente p = {
+        .id = cab.id_msg, .tipo = DSM_TIPO_REGION_CLOSE_ACK,
+        .respuesta = respuesta, .capacidad = sizeof respuesta,
+    };
+    size_t n;
+    if (plazo_nuevo(c, &p.plazo) != 0 ||
+        dsm_region_cierre_codificar(envio, sizeof envio, &cab, reserva, &n) != 0 ||
+        intercambiar(c, creador, envio, n, &p) != 0) {
+        return -1;
+    }
+    uint32_t confirmada;
+    if (dsm_region_cierre_decodificar(respuesta, p.bytes, &cab, &confirmada) != 0 ||
+        confirmada != reserva) {
+        return fallo(EPROTO);
+    }
+    return cab.estado == DSM_ESTADO_OK ? 0 : fallo(error_estado(cab.estado));
+}
+
 static int invalidar_hogar(dsm_coherencia_t *c, const dsm_cabecera_t *peticion,
                            const dsm_pagina_desc_t *pagina, const struct timespec *plazo)
 {
@@ -365,19 +431,20 @@ static int invalidar_hogar(dsm_coherencia_t *c, const dsm_cabecera_t *peticion,
            0 : fallo(error_estado(recibida.estado));
 }
 
-int dsm_coherencia_resolver(const dsm_pager_peticion_t *peticion, void *contexto)
+static int resolver_sin_espera_local(const dsm_pager_peticion_t *peticion, void *contexto)
 {
     dsm_coherencia_t *c = contexto;
     if (c == NULL || peticion == NULL || peticion->solicitante != c->nodo ||
         (peticion->acceso != DSM_FALLO_LECTURA && peticion->acceso != DSM_FALLO_ESCRITURA)) {
         return fallo(EINVAL);
     }
-    printf("nodo %u fallo SIGSEGV %s\n", c->nodo,
-           peticion->acceso == DSM_FALLO_ESCRITURA ? "escritura" : "lectura");
     dsm_pagina_desc_t pagina;
     if (dsm_directorio_describir(c->directorio, peticion->pagina.gpn, &pagina) != 0 ||
-        pagina.reserva != peticion->pagina.reserva_id || pagina.perdida) {
+        pagina.reserva != peticion->pagina.reserva_id) {
         return fallo(EPROTO);
+    }
+    if (pagina.perdida) {
+        return fallo(ENOTCONN);
     }
     pagina.msi = estado_local(c, &pagina);
     if (pagina.msi == DSM_MSI_M ||
@@ -406,6 +473,97 @@ int dsm_coherencia_resolver(const dsm_pager_peticion_t *peticion, void *contexto
         return fallo(EPROTO);
     }
     return intercambiar(c, pagina.hogar, envio, n, &p);
+}
+
+static int resolviendo_pagina(const dsm_coherencia_t *c, uint64_t gpn)
+{
+    for (const struct resolucion_local *r = c->resolviendo; r != NULL; r = r->siguiente) {
+        if (r->gpn == gpn) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Directos y controlados comparten esta exclusion por GPN. El mutex solo
+ * protege la lista y la espera local. Ningun mutex se conserva durante RPCs.
+ */
+static int resolver_peticion(const dsm_pager_peticion_t *peticion, void *contexto)
+{
+    dsm_coherencia_t *c = contexto;
+    if (c == NULL || peticion == NULL) {
+        return fallo(EINVAL);
+    }
+    pthread_mutex_lock(&c->mutex);
+    int error = 0;
+    while (!c->cerrando && error == 0 && resolviendo_pagina(c, peticion->pagina.gpn)) {
+        error = pthread_cond_timedwait(&c->respuesta, &c->mutex, &peticion->plazo);
+    }
+    if (c->cerrando) {
+        error = ECANCELED;
+    } else if (!vigente(&peticion->plazo)) {
+        error = ETIMEDOUT;
+    }
+    if (error != 0) {
+        pthread_mutex_unlock(&c->mutex);
+        return fallo(error);
+    }
+    struct resolucion_local r = {.gpn = peticion->pagina.gpn, .siguiente = c->resolviendo};
+    c->resolviendo = &r;
+    pthread_mutex_unlock(&c->mutex);
+
+    int rc = resolver_sin_espera_local(peticion, c);
+    error = errno;
+    pthread_mutex_lock(&c->mutex);
+    struct resolucion_local **pos = &c->resolviendo;
+    while (*pos != &r) {
+        pos = &(*pos)->siguiente;
+    }
+    *pos = r.siguiente;
+    pthread_cond_broadcast(&c->respuesta);
+    pthread_mutex_unlock(&c->mutex);
+    return rc == 0 ? 0 : fallo(error);
+}
+
+int dsm_coherencia_resolver(const dsm_pager_peticion_t *peticion, void *contexto)
+{
+    dsm_coherencia_t *c = contexto;
+    if (c == NULL || peticion == NULL) {
+        return fallo(EINVAL);
+    }
+    printf("nodo %u fallo SIGSEGV %s\n", c->nodo,
+           peticion->acceso == DSM_FALLO_ESCRITURA ? "escritura" : "lectura");
+    return resolver_peticion(peticion, contexto);
+}
+
+int dsm_coherencia_copiar_controlado(dsm_coherencia_t *c, uint32_t reserva,
+                                     uint64_t gpn, size_t offset, void *scratch, size_t bytes,
+                                     int escritura, const struct timespec *plazo)
+{
+    if (c == NULL || plazo == NULL || scratch == NULL || (escritura != 0 && escritura != 1)) {
+        return fallo(EINVAL);
+    }
+    dsm_pager_peticion_t peticion = {
+        .pagina = {.reserva_id = reserva, .gpn = gpn},
+        .solicitante = c->nodo,
+        .acceso = escritura ? DSM_FALLO_ESCRITURA : DSM_FALLO_LECTURA,
+        .plazo = *plazo,
+    };
+    for (;;) {
+        if (dsm_directorio_copiar_controlado(c->directorio, reserva, gpn, offset,
+                                             scratch, bytes, escritura) == 0) {
+            return 0;
+        }
+        if (errno != EAGAIN) {
+            return -1;
+        }
+        if (!vigente(plazo)) {
+            return fallo(ETIMEDOUT);
+        }
+        if (resolver_peticion(&peticion, c) != 0) {
+            return -1;
+        }
+    }
 }
 
 int dsm_coherencia_iniciar(dsm_coherencia_t **salida, const dsm_config_t *cfg,
@@ -472,11 +630,9 @@ void dsm_coherencia_cerrar(dsm_coherencia_t *c)
     }
     pthread_mutex_lock(&c->mutex);
     c->cerrando = 1;
-    for (size_t i = 0; i < DSM_CONFIG_MAX_NODOS; i++) {
-        if (c->pendientes[i].id != 0) {
-            c->pendientes[i].error = ECANCELED;
-            c->pendientes[i].lista = 1;
-        }
+    for (struct pendiente *p = c->pendientes; p != NULL; p = p->siguiente) {
+        p->error = ECANCELED;
+        p->lista = 1;
     }
     pthread_cond_broadcast(&c->respuesta);
     pthread_mutex_unlock(&c->mutex);
