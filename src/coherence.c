@@ -763,6 +763,12 @@ static int resolver_sin_espera_local(const dsm_pager_peticion_t *peticion, void 
         (pagina.msi == DSM_MSI_S && peticion->acceso == DSM_FALLO_LECTURA)) {
         return 0;
     }
+    /* REGION_LOOKUP solo establece que el creador está accesible.
+     * El enlace con el hogar de esta página puede seguir en el alta. */
+    if (pagina.hogar != c->nodo &&
+        dsm_red_esperar_hasta(c->red, pagina.hogar, &peticion->plazo) != 0) {
+        return -1;
+    }
     dsm_cabecera_t cab = cabecera(c, DSM_TIPO_PAGE_REQUEST, pagina.hogar);
     dsm_page_request_t pedido = {
         .gpn = pagina.gpn, .proc_id = ((uint32_t)c->nodo << 16) | 1u,

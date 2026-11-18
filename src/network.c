@@ -808,25 +808,34 @@ uint32_t dsm_red_id(dsm_red_t *red)
     return id;
 }
 
-int dsm_red_esperar(dsm_red_t *red, uint16_t par)
+int dsm_red_esperar_hasta(dsm_red_t *red, uint16_t par, const struct timespec *plazo)
 {
-    if (!par_valido(red, par)) {
+    if (!par_valido(red, par) || plazo == NULL) {
         return error_red(EINVAL);
-    }
-    uint64_t plazo;
-    if (iniciar_plazo(red->cfg->rpc_timeout_ms, &plazo) != 0) {
-        return -1;
     }
     pthread_mutex_lock(&red->mutex);
     int error = 0;
     while (!red->cerrando && !red->pares[par].activo && error == 0) {
-        error = esperar_cambio(red, plazo);
+        error = pthread_cond_timedwait(&red->cambio, &red->mutex, plazo);
     }
     if (red->cerrando) {
         error = ECANCELED;
     }
     pthread_mutex_unlock(&red->mutex);
     return error == 0 ? 0 : error_red(error);
+}
+
+int dsm_red_esperar(dsm_red_t *red, uint16_t par)
+{
+    if (!par_valido(red, par)) {
+        return error_red(EINVAL);
+    }
+    uint64_t ms;
+    if (iniciar_plazo(red->cfg->rpc_timeout_ms, &ms) != 0) {
+        return -1;
+    }
+    struct timespec plazo = {.tv_sec = ms / 1000, .tv_nsec = (long)(ms % 1000) * 1000000L};
+    return dsm_red_esperar_hasta(red, par, &plazo);
 }
 
 int dsm_red_enviar(dsm_red_t *red, uint16_t par, const uint8_t *buf, size_t n)

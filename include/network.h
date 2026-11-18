@@ -8,6 +8,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 int send_all(int fd, const void *buf, size_t len);
 int recv_all(int fd, void *buf, size_t len);
@@ -61,6 +62,8 @@ void dsm_red_cerrar(dsm_red_t *red);
 int dsm_red_enviar(dsm_red_t *red, uint16_t peer, const uint8_t *buf, size_t n);
 uint32_t dsm_red_id(dsm_red_t *red);
 int dsm_red_esperar(dsm_red_t *red, uint16_t peer);
+/* Espera el alta usando el vencimiento CLOCK_MONOTONIC de la operación. */
+int dsm_red_esperar_hasta(dsm_red_t *red, uint16_t peer, const struct timespec *plazo);
 
 typedef void (*dsm_red_estado_t)(void *ctx, uint16_t par, uint8_t estado);
 void dsm_red_observar(dsm_red_t *red, dsm_red_estado_t fn, void *ctx);

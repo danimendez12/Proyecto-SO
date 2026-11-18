@@ -18,41 +18,48 @@ static int numero(const char *texto, uint64_t maximo, uint64_t *salida)
     return 0;
 }
 
-static void mostrar(const void *base, size_t paginas, size_t pagina)
+static int mostrar(dsm_context_t *ctx, dsm_reserva_id_t reserva, size_t paginas, size_t pagina)
 {
-    const volatile unsigned char *ar = base;
     for (size_t p = 0; p < paginas; p++) {
         char texto[64] = {0};
-        for (size_t i = 0; i < sizeof texto - 1; i++) {
-            texto[i] = (char)ar[p * pagina + i];
-            if (texto[i] == '\0') {
-                break;
-            }
+        int rc = dsm_leer(ctx, reserva, p * pagina, texto, sizeof texto - 1);
+        if (rc != DSM_OK) {
+            fprintf(stderr, "dsm_leer: pagina %zu, error DSM %d\n", p, rc);
+            return rc;
         }
         printf("pagina %zu [%s]\n", p, texto);
     }
+    return DSM_OK;
 }
 
-static void escribir(void *base, size_t pagina, const char *texto)
+static int escribir(dsm_context_t *ctx, dsm_reserva_id_t reserva, size_t ordinal,
+                    size_t pagina, const char *texto)
 {
-    volatile unsigned char *ar = base;
-    for (size_t i = 0; i <= strlen(texto); i++) {
-        ar[pagina + i] = (unsigned char)texto[i];
+    int rc = dsm_escribir(ctx, reserva, ordinal * pagina, texto, strlen(texto) + 1);
+    if (rc != DSM_OK) {
+        fprintf(stderr, "dsm_escribir: pagina %zu, error DSM %d\n", ordinal, rc);
     }
+    return rc;
 }
 
 static int compartir(dsm_context_t *ctx, dsm_proc_id_t proceso, dsm_reserva_id_t reserva,
-                     void *ar, size_t paginas, size_t pagina, int *registrado, int *liberada)
+                     size_t paginas, size_t pagina, int *registrado, int *liberada)
 {
     puts("Comandos: leer, escribir, salir. El cliente debe salir antes de liberar.");
     char linea[80];
     while (fgets(linea, sizeof linea, stdin) != NULL) {
         linea[strcspn(linea, "\r\n")] = '\0';
-        if (strcmp(linea, "leer") == 0) {
-            mostrar(ar, paginas, pagina);
-        } else if (strcmp(linea, "escribir") == 0) {
-            escribir(ar, (paginas / 2) * pagina, "Adios TEC");
-            mostrar(ar, paginas, pagina);
+        if (strcmp(linea, "leer") == 0 || strcmp(linea, "escribir") == 0) {
+            int rc = DSM_OK;
+            if (strcmp(linea, "escribir") == 0) {
+                rc = escribir(ctx, reserva, paginas / 2, pagina, "Adios TEC");
+            }
+            if (rc == DSM_OK) {
+                rc = mostrar(ctx, reserva, paginas, pagina);
+            }
+            if (rc != DSM_OK) {
+                return rc;
+            }
         } else if (strcmp(linea, "salir") == 0) {
             int rc = dsm_hilo_desregistrar(ctx);
             if (rc != DSM_OK) {
@@ -159,13 +166,18 @@ int main(int argc, char **argv)
                 } else {
                     snprintf(texto, sizeof texto, "Pagina %zu original", p);
                 }
-                escribir(ar, p * (size_t)pagina, texto);
+                rc = escribir(ctx, reserva, p, (size_t)pagina, texto);
+                if (rc != DSM_OK) {
+                    break;
+                }
             }
             printf("nodo %" PRIu64 " reserva %" PRIu32 " bytes %" PRIu64 " Ar %p\n",
                    id, reserva, paginas * pagina, ar);
             if (rc == DSM_OK) {
-                mostrar(ar, (size_t)paginas, (size_t)pagina);
-                rc = compartir(ctx, proceso, reserva, ar, (size_t)paginas, (size_t)pagina,
+                rc = mostrar(ctx, reserva, (size_t)paginas, (size_t)pagina);
+            }
+            if (rc == DSM_OK) {
+                rc = compartir(ctx, proceso, reserva, (size_t)paginas, (size_t)pagina,
                                &registrado, &liberada);
             }
         } else {

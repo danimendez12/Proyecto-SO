@@ -18,29 +18,62 @@ static int numero(const char *texto, uint64_t maximo, uint64_t *salida)
     return 0;
 }
 
-static void mostrar(const void *base, size_t bytes, size_t pagina)
+static const char comandos[] = "Comandos: leer, escribir (otro hogar; central si hay uno), salir.";
+
+static int error_pagina(dsm_context_t *ctx, dsm_reserva_id_t reserva,
+                         const char *operacion, size_t ordinal, int rc)
 {
-    const volatile unsigned char *ar = base;
+    dsm_node_id_t hogar;
+    uint64_t gpn;
+    if (dsm_ubicacion_pagina(ctx, reserva, ordinal, &hogar, &gpn) == DSM_OK) {
+        fprintf(stderr, "%s: pagina %zu hogar %u, error DSM %d\n",
+                operacion, ordinal, (unsigned)hogar, rc);
+    } else {
+        fprintf(stderr, "%s: pagina %zu hogar desconocido, error DSM %d\n",
+                operacion, ordinal, rc);
+    }
+    return rc;
+}
+
+static int mostrar(dsm_context_t *ctx, dsm_reserva_id_t reserva,
+                     size_t bytes, size_t pagina)
+{
     for (size_t p = 0; p < bytes / pagina; p++) {
         char texto[64] = {0};
-        for (size_t i = 0; i < sizeof texto - 1; i++) {
-            texto[i] = (char)ar[p * pagina + i];
-            if (texto[i] == '\0') {
-                break;
-            }
+        int rc = dsm_leer(ctx, reserva, p * pagina, texto, sizeof texto - 1);
+        if (rc != DSM_OK) {
+            return error_pagina(ctx, reserva, "dsm_leer", p, rc);
         }
         printf("pagina %zu [%s]\n", p, texto);
     }
+    return DSM_OK;
 }
 
-static void escribir(void *base, size_t bytes, size_t pagina)
+static int escribir(dsm_context_t *ctx, dsm_reserva_id_t reserva,
+                      size_t bytes, size_t pagina)
 {
     const char texto[] = "Adios TEC";
-    volatile unsigned char *ar = base;
-    size_t inicio = (bytes / pagina / 2) * pagina;
-    for (size_t i = 0; i < sizeof texto; i++) {
-        ar[inicio + i] = (unsigned char)texto[i];
+    size_t paginas = bytes / pagina;
+    size_t ordinal = paginas / 2;
+    dsm_node_id_t creador = (dsm_node_id_t)(reserva >> 16);
+    dsm_node_id_t hogar = creador;
+    uint64_t gpn;
+    for (size_t p = ordinal, vistas = 0; vistas < paginas; vistas++, p = (p + 1) % paginas) {
+        int rc = dsm_ubicacion_pagina(ctx, reserva, p, &hogar, &gpn);
+        if (rc != DSM_OK) {
+            return error_pagina(ctx, reserva, "dsm_ubicacion_pagina", p, rc);
+        }
+        if (hogar != creador) {
+            ordinal = p;
+            break;
+        }
     }
+    int rc = dsm_escribir(ctx, reserva, ordinal * pagina, texto, sizeof texto);
+    if (rc != DSM_OK) {
+        return error_pagina(ctx, reserva, "dsm_escribir", ordinal, rc);
+    }
+    printf("escritura pagina %zu hogar %u [%s]\n", ordinal, (unsigned)hogar, texto);
+    return DSM_OK;
 }
 
 int main(int argc, char **argv)
@@ -78,24 +111,28 @@ int main(int argc, char **argv)
     }
     if (rc == DSM_OK) {
         printf("nodo %" PRIu64 " reserva %" PRIu64 " bytes %zu Ar %p\n", nodo, reserva, bytes, ar);
-        mostrar(ar, bytes, (size_t)pagina);
-        puts("Comandos: leer, escribir (pagina central), salir.");
+        rc = mostrar(ctx, (dsm_reserva_id_t)reserva, bytes, (size_t)pagina);
+        if (rc == DSM_OK) {
+            puts(comandos);
+        }
         char linea[80];
-        while (fgets(linea, sizeof linea, stdin) != NULL) {
+        while (rc == DSM_OK && fgets(linea, sizeof linea, stdin) != NULL) {
             linea[strcspn(linea, "\r\n")] = '\0';
             if (strcmp(linea, "salir") == 0) {
                 break;
             }
             if (strcmp(linea, "escribir") == 0) {
-                escribir(ar, bytes, (size_t)pagina);
-                mostrar(ar, bytes, (size_t)pagina);
+                rc = escribir(ctx, (dsm_reserva_id_t)reserva, bytes, (size_t)pagina);
+                if (rc == DSM_OK) {
+                    rc = mostrar(ctx, (dsm_reserva_id_t)reserva, bytes, (size_t)pagina);
+                }
             } else if (strcmp(linea, "leer") == 0) {
-                mostrar(ar, bytes, (size_t)pagina);
+                rc = mostrar(ctx, (dsm_reserva_id_t)reserva, bytes, (size_t)pagina);
             } else if (*linea != '\0') {
-                puts("Comandos: leer, escribir, salir.");
+                puts(comandos);
             }
         }
-        if (ferror(stdin)) {
+        if (rc == DSM_OK && ferror(stdin)) {
             rc = DSM_ERR_ESTADO;
         }
     }
