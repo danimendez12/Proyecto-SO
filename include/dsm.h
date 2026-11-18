@@ -39,6 +39,9 @@ int dsm_reservar(dsm_context_t *ctx, dsm_proc_id_t proceso, size_t bytes,
  * contexto. bytes recibe el tamano logico original. Una apertura repetida
  * conserva una sola vinculacion por nodo y reserva. */
 int dsm_abrir_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, void **base, size_t *bytes);
+/* Consulta el hogar y el numero global de una pagina logica de la vista abierta. */
+int dsm_ubicacion_pagina(dsm_context_t *ctx, dsm_reserva_id_t id, size_t orden,
+                         dsm_node_id_t *hogar, uint64_t *gpn);
 /* Desregistrar los trabajadores antes de desmontar. El cliente desvincula su
  * vista y entrega las paginas modificadas. El creador solo puede liberar
  * cuando todos los clientes han confirmado la desvinculacion. */

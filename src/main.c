@@ -288,8 +288,13 @@ cerrar_paginador:
     }
 cerrar_coherencia:
     if (reserva != 0 && s.vista != NULL &&
-        dsm_coherencia_desvincular(s.coherencia, reserva) != 0) {
+        (dsm_coherencia_desvincular(s.coherencia, reserva) != 0 ||
+         (dsm_directorio_desvincular(&s.directorio, reserva) != 0 && errno != ENOENT))) {
         perror("cierre de la vista remota al detener el nodo");
+    }
+    if (dsm_directorio_esperar_fin_aportes(&s.directorio) != 0) {
+        perror("espera de los aportes al detener el nodo");
+        rc = 1;
     }
     dsm_coherencia_cerrar(s.coherencia);
     printf("nodo %u servicio detenido\n", nodo->id);

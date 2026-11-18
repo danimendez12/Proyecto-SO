@@ -13,13 +13,62 @@
 
 struct dsm_reserva_dir {
     dsm_region_info_t info;
+    dsm_region_info_t aporte;
     dsm_vistas_t vista;
+    uint64_t token;
     uint64_t abiertos;
+    uint32_t orden_preparado;
+    uint32_t max_preparado;
+    uint32_t tramos_preparados;
+    int confirmada;
+    int vinculada;
+    int contada;
     int publicada;
     struct dsm_reserva_dir *siguiente;
 };
 
-static struct dsm_reserva_dir *buscar_reserva(const dsm_directorio_t *dir, uint32_t id)
+struct dsm_tumba {
+    uint32_t id;
+    uint64_t token;
+    struct dsm_tumba *siguiente;
+};
+
+static struct dsm_tumba *buscar_tumba(const dsm_directorio_t *dir, uint32_t id)
+{
+    for (struct dsm_tumba *t = dir->tumbas; t != NULL; t = t->siguiente) {
+        if (t->id == id) {
+            return t;
+        }
+    }
+    return NULL;
+}
+
+static struct dsm_tumba *buscar_tumba_token(const dsm_directorio_t *dir,
+                                            uint32_t id, uint64_t token)
+{
+    for (struct dsm_tumba *t = dir->tumbas; t != NULL; t = t->siguiente) {
+        if (t->id == id && t->token == token) {
+            return t;
+        }
+    }
+    return NULL;
+}
+
+static int recordar_terminal(dsm_directorio_t *dir, uint32_t id, uint64_t token)
+{
+    if (buscar_tumba_token(dir, id, token) != NULL) {
+        return 0;
+    }
+    struct dsm_tumba *t = malloc(sizeof *t);
+    if (t == NULL) {
+        return -1;
+    }
+    *t = (struct dsm_tumba){.id = id, .token = token, .siguiente = dir->tumbas};
+    dir->tumbas = t;
+    return 0;
+}
+
+static struct dsm_reserva_dir *buscar_registro(const dsm_directorio_t *dir, uint32_t id)
 {
     for (struct dsm_reserva_dir *reserva = dir->reservas; reserva != NULL;
          reserva = reserva->siguiente) {
@@ -28,6 +77,11 @@ static struct dsm_reserva_dir *buscar_reserva(const dsm_directorio_t *dir, uint3
         }
     }
     return NULL;
+}
+
+static struct dsm_reserva_dir *buscar_reserva(const dsm_directorio_t *dir, uint32_t id)
+{
+    return buscar_registro(dir, id);
 }
 
 static dsm_vistas_t *vista_pagina(const dsm_directorio_t *dir, size_t indice)
@@ -39,6 +93,14 @@ static void *datos_pagina(const dsm_directorio_t *dir, size_t indice)
 {
     return (unsigned char *)vista_pagina(dir, indice)->c_r +
            (size_t)dir->paginas[indice].orden * dir->page_size;
+}
+
+/* Un donante conserva Cr autoritativa aunque su aplicacion retire la vista. */
+static int proteger(dsm_directorio_t *dir, size_t indice, int prot)
+{
+    struct dsm_reserva_dir *reserva = buscar_reserva(dir, dir->paginas[indice].reserva);
+    return dsm_vistas_proteger_pagina(&reserva->vista, dir->paginas[indice].orden,
+                                     dir->page_size, reserva->vinculada ? prot : PROT_NONE);
 }
 
 static int ampliar_paginas(dsm_directorio_t *dir, size_t cantidad)
@@ -71,35 +133,57 @@ static int ampliar_paginas(dsm_directorio_t *dir, size_t cantidad)
     return 0;
 }
 
-/* Con mutex tomado. El llamador excluye trabajadores que usen esta vista. */
-static void quitar_reserva(dsm_directorio_t *dir, struct dsm_reserva_dir *reserva)
+/* Con mutex tomado. El llamador excluye trabajadores y campanas activas. */
+static void desmontar_reserva(dsm_directorio_t *dir, struct dsm_reserva_dir *reserva)
 {
-    uint32_t id = reserva->info.reserva_id;
     size_t salida = 0;
-    int local = (id >> 16) == dir->nodo_id;
     for (size_t i = 0; i < dir->npaginas; i++) {
-        if (dir->paginas[i].reserva == id) {
-            if (local) {
-                size_t pagina = (size_t)(dir->paginas[i].gpn - dir->limites_gpn[dir->nodo_id]);
-                dir->ocupadas[pagina] = 0;
-                dir->paginas_libres++;
-            }
-        } else {
+        if (dir->paginas[i].reserva != reserva->info.reserva_id) {
             dir->paginas[salida++] = dir->paginas[i];
         }
     }
     dir->npaginas = salida;
+    for (uint32_t t = 0; t < reserva->aporte.cantidad_tramos; t++) {
+        const dsm_tramo_t *tramo = &reserva->aporte.tramos[t];
+        size_t inicial = (size_t)(tramo->gpn_inicial - dir->limites_gpn[dir->nodo_id]);
+        for (uint32_t j = 0; j < tramo->cantidad; j++) {
+            dir->ocupadas[inicial + j] = 0;
+            dir->paginas_libres++;
+        }
+    }
+    memset(&reserva->aporte, 0, sizeof reserva->aporte);
+    if (reserva->vista.a_r != NULL) {
+        dsm_vistas_cerrar(&reserva->vista);
+        dir->nvistas--;
+    }
+    if (reserva->contada) {
+        dir->reservas_globales--;
+        reserva->contada = 0;
+    }
+    reserva->confirmada = 0;
+    reserva->publicada = 0;
+    reserva->vinculada = 0;
+}
+
+static void quitar_reserva(dsm_directorio_t *dir, struct dsm_reserva_dir *reserva)
+{
+    desmontar_reserva(dir, reserva);
     struct dsm_reserva_dir **enlace = &dir->reservas;
     while (*enlace != reserva) {
         enlace = &(*enlace)->siguiente;
     }
     *enlace = reserva->siguiente;
-    dsm_vistas_cerrar(&reserva->vista);
     free(reserva);
-    dir->nvistas--;
-    if (local) {
-        dir->reservas_globales--;
+}
+
+static int terminar_reserva(dsm_directorio_t *dir, struct dsm_reserva_dir *reserva)
+{
+    if (recordar_terminal(dir, reserva->info.reserva_id, reserva->token) != 0) {
+        return -1;
     }
+    quitar_reserva(dir, reserva);
+    pthread_cond_broadcast(&dir->cola_cv);
+    return 0;
 }
 
 int dsm_directorio_init(dsm_directorio_t *dir, const dsm_config_t *cfg, uint16_t nodo_id)
@@ -187,6 +271,11 @@ void dsm_directorio_cerrar(dsm_directorio_t *dir)
     }
     free(dir->paginas);
     free(dir->ocupadas);
+    while (dir->tumbas != NULL) {
+        struct dsm_tumba *t = dir->tumbas;
+        dir->tumbas = t->siguiente;
+        free(t);
+    }
     pthread_cond_destroy(&dir->campana_cv);
     pthread_cond_destroy(&dir->cola_cv);
     pthread_mutex_destroy(&dir->coordinador);
@@ -235,7 +324,7 @@ static size_t indice_reserva(const dsm_directorio_t *dir, uint32_t reserva_id)
 /* Conserva first-fit cuando cabe en el manifiesto. Si hay demasiados huecos,
  * los tramos libres de mayor tamano permiten aprovechar hasta 16 fragmentos. */
 static int seleccionar_tramos(const dsm_directorio_t *dir, size_t cantidad,
-                               dsm_region_info_t *info)
+                               uint32_t limite, int parcial, dsm_region_info_t *info)
 {
     size_t asignadas = 0;
     for (size_t i = 0; i < dir->paginas_totales && asignadas < cantidad;) {
@@ -248,7 +337,7 @@ static int seleccionar_tramos(const dsm_directorio_t *dir, size_t cantidad,
                i - inicio < cantidad - asignadas) {
             i++;
         }
-        if (info->total_tramos == DSM_MAX_TRAMOS) {
+        if (info->total_tramos == limite) {
             break;
         }
         size_t paginas = i - inicio;
@@ -260,6 +349,7 @@ static int seleccionar_tramos(const dsm_directorio_t *dir, size_t cantidad,
     }
     if (asignadas == cantidad) {
         info->cantidad_tramos = info->total_tramos;
+        info->total_paginas = (uint32_t)cantidad;
         return 0;
     }
 
@@ -275,10 +365,10 @@ static int seleccionar_tramos(const dsm_directorio_t *dir, size_t cantidad,
             i++;
         }
         size_t puesto;
-        if (usados < DSM_MAX_TRAMOS) {
+        if (usados < limite) {
             puesto = usados++;
         } else {
-            puesto = DSM_MAX_TRAMOS - 1u;
+            puesto = limite - 1u;
             if (i - inicio <= mayores[puesto].cantidad) {
                 continue;
             }
@@ -299,8 +389,11 @@ static int seleccionar_tramos(const dsm_directorio_t *dir, size_t cantidad,
         disponibles += mayores[elegidos++].cantidad;
     }
     if (disponibles < cantidad) {
-        errno = ENOSPC;
-        return -1;
+        if (!parcial || disponibles == 0) {
+            errno = ENOSPC;
+            return -1;
+        }
+        cantidad = disponibles;
     }
     /* Publica en orden de GPN los tramos elegidos, con orden virtual continuo. */
     for (size_t i = 1; i < elegidos; i++) {
@@ -324,6 +417,7 @@ static int seleccionar_tramos(const dsm_directorio_t *dir, size_t cantidad,
         asignadas += paginas;
     }
     info->cantidad_tramos = info->total_tramos = (uint32_t)elegidos;
+    info->total_paginas = (uint32_t)cantidad;
     return 0;
 }
 
@@ -355,7 +449,7 @@ int dsm_directorio_reservar(dsm_directorio_t *dir, size_t bytes,
     dsm_region_info_t info = {
         .total_paginas = (uint32_t)cantidad, .tamano_bytes = bytes,
     };
-    if (seleccionar_tramos(dir, cantidad, &info) != 0 ||
+    if (seleccionar_tramos(dir, cantidad, DSM_TRAMOS_POR_HOGAR, 0, &info) != 0 ||
         ampliar_paginas(dir, cantidad) != 0) {
         goto salir;
     }
@@ -367,7 +461,8 @@ int dsm_directorio_reservar(dsm_directorio_t *dir, size_t bytes,
         free(reserva);
         goto salir;
     }
-    if (dsm_vistas_proteger(&reserva->vista, PROT_READ | PROT_WRITE) != 0) {
+    if (dsm_vistas_respaldar_tramo(&reserva->vista, 0, cantidad * dir->page_size) != 0 ||
+        dsm_vistas_proteger(&reserva->vista, PROT_READ | PROT_WRITE) != 0) {
         int error = errno;
         dsm_vistas_cerrar(&reserva->vista);
         free(reserva);
@@ -376,6 +471,10 @@ int dsm_directorio_reservar(dsm_directorio_t *dir, size_t bytes,
     }
     info.reserva_id = ((uint32_t)dir->nodo_id << 16) | dir->siguiente_local++;
     reserva->info = info;
+    reserva->aporte = info;
+    reserva->confirmada = 1;
+    reserva->vinculada = 1;
+    reserva->contada = 1;
     reserva->siguiente = dir->reservas;
     dir->reservas = reserva;
     size_t primera = dir->npaginas;
@@ -424,6 +523,8 @@ int dsm_directorio_publicar_reserva(dsm_directorio_t *dir, uint32_t id)
         error = EPERM;
     } else if (dir->cerrando) {
         error = ECANCELED;
+    } else if (!reserva->confirmada) {
+        error = EBUSY;
     } else {
         reserva->publicada = 1;
     }
@@ -455,12 +556,13 @@ int dsm_directorio_info(dsm_directorio_t *dir, uint32_t id, dsm_region_info_t *i
         return -1;
     }
     struct dsm_reserva_dir *reserva = buscar_reserva(dir, id);
-    if (reserva != NULL) {
+    int error = reserva == NULL ? ENOENT : !reserva->confirmada ? EBUSY : 0;
+    if (error == 0) {
         *info = reserva->info;
     }
     pthread_mutex_unlock(&dir->mutex);
-    if (reserva == NULL) {
-        errno = ENOENT;
+    if (error != 0) {
+        errno = error;
         return -1;
     }
     return 0;
@@ -492,8 +594,8 @@ int dsm_directorio_liberar(dsm_directorio_t *dir, uint32_t id)
                 break;
             }
         }
-        if (error == 0) {
-            quitar_reserva(dir, reserva);
+        if (error == 0 && terminar_reserva(dir, reserva) != 0) {
+            error = errno;
         }
     }
     pthread_mutex_unlock(&dir->mutex);
@@ -515,7 +617,13 @@ int dsm_directorio_desvincular(dsm_directorio_t *dir, uint32_t id)
     pthread_mutex_lock(&dir->mutex);
     struct dsm_reserva_dir *reserva = buscar_reserva(dir, id);
     int error = reserva == NULL ? ENOENT : (id >> 16) == dir->nodo_id ? EPERM : 0;
-    if (error == 0) {
+    if (error == 0 && reserva->aporte.total_paginas != 0) {
+        if (dsm_vistas_proteger(&reserva->vista, PROT_NONE) != 0) {
+            error = errno;
+        } else {
+            reserva->vinculada = 0;
+        }
+    } else if (error == 0) {
         quitar_reserva(dir, reserva);
     }
     pthread_mutex_unlock(&dir->mutex);
@@ -535,13 +643,53 @@ int dsm_directorio_preparar_cierre(dsm_directorio_t *dir)
     }
     int error = 0;
     for (struct dsm_reserva_dir *r = dir->reservas; r != NULL; r = r->siguiente) {
-        if ((r->info.reserva_id >> 16) == dir->nodo_id && r->abiertos != 0) {
+        if (((r->info.reserva_id >> 16) == dir->nodo_id && r->abiertos != 0) ||
+            ((r->info.reserva_id >> 16) != dir->nodo_id && r->aporte.total_paginas != 0)) {
             error = EBUSY;
             break;
         }
     }
     if (error == 0) {
         dir->cerrando = 1;
+    }
+    pthread_mutex_unlock(&dir->mutex);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    return 0;
+}
+
+/* La CLI mantiene red y MSI disponibles mientras devuelve capacidad prestada. */
+int dsm_directorio_esperar_fin_aportes(dsm_directorio_t *dir)
+{
+    if (!bloquear(dir)) {
+        errno = EINVAL;
+        return -1;
+    }
+    dir->cerrando = 1;
+    int anunciado = 0;
+    int error = 0;
+    for (;;) {
+        int pendientes = 0;
+        for (struct dsm_reserva_dir *r = dir->reservas; r != NULL; r = r->siguiente) {
+            if ((r->info.reserva_id >> 16) != dir->nodo_id && r->aporte.total_paginas != 0) {
+                pendientes = 1;
+                break;
+            }
+        }
+        if (!pendientes) {
+            break;
+        }
+        if (!anunciado) {
+            printf("nodo %u espera devolucion de aportes antes de cerrar\n", dir->nodo_id);
+            fflush(stdout);
+            anunciado = 1;
+        }
+        error = pthread_cond_wait(&dir->cola_cv, &dir->mutex);
+        if (error != 0) {
+            break;
+        }
     }
     pthread_mutex_unlock(&dir->mutex);
     if (error != 0) {
@@ -558,7 +706,7 @@ int dsm_directorio_consultar(const dsm_directorio_t *dir, uint32_t reserva_id,
         return -1;
     }
     struct dsm_reserva_dir *reserva = buscar_reserva(dir, reserva_id);
-    if (reserva == NULL || !reserva->publicada ||
+    if (reserva == NULL || !reserva->confirmada || !reserva->publicada ||
         (reserva_id >> 16) != dir->nodo_id || dir->cerrando || primer_tramo != 0) {
         *estado = DSM_ESTADO_RANGO;
         memset(info, 0, sizeof *info);
@@ -587,9 +735,10 @@ static int manifiesto_valido(const dsm_directorio_t *dir, const dsm_region_info_
     }
     for (uint32_t t = 0; t < info->cantidad_tramos; t++) {
         const dsm_tramo_t *tramo = &info->tramos[t];
+        uint16_t actual = hogar_del_gpn(dir, tramo->gpn_inicial);
         if (tramo->cantidad == 0 || tramo->orden_inicial != orden ||
-            hogar_del_gpn(dir, tramo->gpn_inicial) != primero ||
-            tramo->cantidad > dir->limites_gpn[primero + 1u] - tramo->gpn_inicial) {
+            actual >= dir->cantidad_nodos ||
+            tramo->cantidad > dir->limites_gpn[actual + 1u] - tramo->gpn_inicial) {
             return 0;
         }
         uint64_t fin = tramo->gpn_inicial + tramo->cantidad;
@@ -622,6 +771,370 @@ static int mismo_manifiesto(const dsm_region_info_t *a, const dsm_region_info_t 
     return 1;
 }
 
+int dsm_directorio_id_reserva(dsm_directorio_t *dir, uint32_t *id)
+{
+    if (id == NULL || !bloquear(dir)) {
+        errno = EINVAL;
+        return -1;
+    }
+    int error = 0;
+    if (dir->cerrando) {
+        error = ECANCELED;
+    } else if (dir->siguiente_local > UINT16_MAX) {
+        error = ENOSPC;
+    } else {
+        *id = ((uint32_t)dir->nodo_id << 16) | dir->siguiente_local++;
+    }
+    pthread_mutex_unlock(&dir->mutex);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    return 0;
+}
+
+int dsm_directorio_preparar(dsm_directorio_t *dir, uint32_t id, uint64_t token,
+                            uint32_t orden, uint32_t max_paginas, uint32_t max_tramos,
+                            dsm_region_info_t *parcial)
+{
+    if (parcial == NULL || token == 0 || max_paginas == 0 || max_tramos == 0 ||
+        max_tramos > DSM_TRAMOS_POR_HOGAR || !bloquear(dir)) {
+        errno = EINVAL;
+        return -1;
+    }
+    int resultado = -1;
+    if (!id_reserva_valido(dir, id) || max_paginas > UINT32_MAX - orden || dir->cerrando) {
+        errno = EINVAL;
+        goto salir;
+    }
+    struct dsm_tumba *tumba = buscar_tumba_token(dir, id, token);
+    if (tumba != NULL) {
+        errno = ECANCELED;
+        goto salir;
+    }
+    struct dsm_reserva_dir *reserva = buscar_reserva(dir, id);
+    if (reserva != NULL) {
+        if (reserva->token != token || reserva->orden_preparado != orden ||
+            reserva->max_preparado != max_paginas || reserva->tramos_preparados != max_tramos) {
+            errno = EPROTO;
+        } else {
+            *parcial = reserva->aporte;
+            resultado = 0;
+        }
+        goto salir;
+    }
+    size_t cantidad = max_paginas < dir->paginas_libres ? max_paginas : dir->paginas_libres;
+    dsm_region_info_t info = {.reserva_id = id};
+    if (cantidad == 0 || seleccionar_tramos(dir, cantidad, max_tramos, 1, &info) != 0) {
+        errno = ENOSPC;
+        goto salir;
+    }
+    reserva = calloc(1, sizeof *reserva);
+    if (reserva == NULL) {
+        goto salir;
+    }
+    info.tamano_bytes = (uint64_t)info.total_paginas * dir->page_size;
+    for (uint32_t t = 0; t < info.cantidad_tramos; t++) {
+        info.tramos[t].orden_inicial += orden;
+        size_t inicial = (size_t)(info.tramos[t].gpn_inicial - dir->limites_gpn[dir->nodo_id]);
+        for (uint32_t k = 0; k < info.tramos[t].cantidad; k++) {
+            dir->ocupadas[inicial + k] = 1;
+        }
+    }
+    reserva->info = reserva->aporte = info;
+    reserva->vista.fd = -1;
+    reserva->token = token;
+    reserva->orden_preparado = orden;
+    reserva->max_preparado = max_paginas;
+    reserva->tramos_preparados = max_tramos;
+    reserva->siguiente = dir->reservas;
+    dir->reservas = reserva;
+    dir->paginas_libres -= info.total_paginas;
+    *parcial = info;
+    resultado = 0;
+
+salir:
+    pthread_mutex_unlock(&dir->mutex);
+    return resultado;
+}
+
+static int aporte_coincide(const dsm_directorio_t *dir, const struct dsm_reserva_dir *reserva,
+                           const dsm_region_info_t *info)
+{
+    uint64_t locales = 0;
+    for (uint32_t t = 0; t < info->cantidad_tramos; t++) {
+        const dsm_tramo_t *tramo = &info->tramos[t];
+        if (hogar_del_gpn(dir, tramo->gpn_inicial) != dir->nodo_id) {
+            continue;
+        }
+        locales += tramo->cantidad;
+        for (uint32_t k = 0; k < tramo->cantidad; k++) {
+            int encontrada = 0;
+            for (uint32_t a = 0; a < reserva->aporte.cantidad_tramos; a++) {
+                const dsm_tramo_t *aporte = &reserva->aporte.tramos[a];
+                uint64_t gpn = tramo->gpn_inicial + k;
+                if (gpn >= aporte->gpn_inicial && gpn - aporte->gpn_inicial < aporte->cantidad &&
+                    tramo->orden_inicial + k == aporte->orden_inicial + gpn - aporte->gpn_inicial) {
+                    encontrada = 1;
+                    break;
+                }
+            }
+            if (!encontrada) {
+                return 0;
+            }
+        }
+    }
+    return locales == reserva->aporte.total_paginas;
+}
+
+int dsm_directorio_confirmar(dsm_directorio_t *dir, uint32_t id, uint64_t token,
+                              const dsm_region_info_t *info)
+{
+    if (info == NULL || token == 0 || info->reserva_id != id || !bloquear(dir)) {
+        errno = EINVAL;
+        return -1;
+    }
+    int resultado = -1;
+    uint16_t primero;
+    if (!manifiesto_valido(dir, info, &primero) || dir->cerrando) {
+        errno = EPROTO;
+        goto salir;
+    }
+    struct dsm_tumba *tumba = buscar_tumba_token(dir, id, token);
+    if (tumba != NULL) {
+        errno = ECANCELED;
+        goto salir;
+    }
+    struct dsm_reserva_dir *reserva = buscar_reserva(dir, id);
+    if (reserva != NULL && reserva->token != token) {
+        errno = EPROTO;
+        goto salir;
+    }
+    if (reserva != NULL && reserva->confirmada) {
+        if (mismo_manifiesto(&reserva->info, info)) {
+            resultado = 0;
+        } else {
+            errno = EPROTO;
+        }
+        goto salir;
+    }
+    int nueva = reserva == NULL;
+    if (nueva) {
+        if ((id >> 16) != dir->nodo_id) {
+            errno = EPROTO;
+            goto salir;
+        }
+        reserva = calloc(1, sizeof *reserva);
+        if (reserva == NULL) {
+            goto salir;
+        }
+        reserva->vista.fd = -1;
+        reserva->token = token;
+        reserva->info.reserva_id = id;
+    }
+    if (!aporte_coincide(dir, reserva, info)) {
+        errno = EPROTO;
+        goto fallo;
+    }
+    for (size_t i = 0; i < dir->npaginas; i++) {
+        for (uint32_t t = 0; t < info->cantidad_tramos; t++) {
+            const dsm_tramo_t *tramo = &info->tramos[t];
+            uint64_t gpn = dir->paginas[i].gpn;
+            if (gpn >= tramo->gpn_inicial && gpn - tramo->gpn_inicial < tramo->cantidad) {
+                errno = EPROTO;
+                goto fallo;
+            }
+        }
+    }
+    if (ampliar_paginas(dir, info->total_paginas) != 0 ||
+        dsm_vistas_crear((size_t)info->total_paginas * dir->page_size, &reserva->vista) != 0) {
+        goto fallo;
+    }
+    for (uint32_t t = 0; t < info->cantidad_tramos; t++) {
+        const dsm_tramo_t *tramo = &info->tramos[t];
+        if (hogar_del_gpn(dir, tramo->gpn_inicial) == dir->nodo_id &&
+            dsm_vistas_respaldar_tramo(&reserva->vista,
+                                      (size_t)tramo->orden_inicial * dir->page_size,
+                                      (size_t)tramo->cantidad * dir->page_size) != 0) {
+            int error = errno;
+            dsm_vistas_cerrar(&reserva->vista);
+            errno = error;
+            goto fallo;
+        }
+    }
+    reserva->vinculada = (id >> 16) == dir->nodo_id;
+    if (reserva->vinculada) {
+        for (uint32_t t = 0; t < info->cantidad_tramos; t++) {
+            const dsm_tramo_t *tramo = &info->tramos[t];
+            if (hogar_del_gpn(dir, tramo->gpn_inicial) == dir->nodo_id) {
+                for (uint32_t k = 0; k < tramo->cantidad; k++) {
+                    if (dsm_vistas_proteger_pagina(&reserva->vista, tramo->orden_inicial + k,
+                                                  dir->page_size, PROT_READ | PROT_WRITE) != 0) {
+                        dsm_vistas_cerrar(&reserva->vista);
+                        goto fallo;
+                    }
+                }
+            }
+        }
+    }
+    reserva->info = *info;
+    reserva->confirmada = 1;
+    if (nueva) {
+        reserva->siguiente = dir->reservas;
+        dir->reservas = reserva;
+    }
+    for (uint32_t t = 0; t < info->cantidad_tramos; t++) {
+        const dsm_tramo_t *tramo = &info->tramos[t];
+        uint16_t hogar = hogar_del_gpn(dir, tramo->gpn_inicial);
+        for (uint32_t k = 0; k < tramo->cantidad; k++) {
+            uint32_t orden = tramo->orden_inicial + k;
+            int local = hogar == dir->nodo_id;
+            dir->paginas[dir->npaginas++] = (dsm_pagina_desc_t){
+                .gpn = tramo->gpn_inicial + k, .hogar = hogar, .reserva = id,
+                .poseedor = local ? dir->nodo_id : DSM_POSEEDOR_NINGUNO,
+                .msi = local ? DSM_MSI_M : DSM_MSI_I, .orden = orden,
+                .mascara_copias = local ? UINT64_C(1) << dir->nodo_id : 0,
+                .ubicacion_local = (unsigned char *)reserva->vista.a_r +
+                                   (size_t)orden * dir->page_size,
+            };
+        }
+    }
+    dir->nvistas++;
+    if ((id >> 16) == dir->nodo_id) {
+        reserva->contada = 1;
+        dir->reservas_globales++;
+    }
+    resultado = 0;
+    goto salir;
+
+fallo:
+    if (nueva) {
+        free(reserva);
+    }
+salir:
+    pthread_mutex_unlock(&dir->mutex);
+    return resultado;
+}
+
+static int asignacion_ocupada(const dsm_directorio_t *dir, const struct dsm_reserva_dir *reserva)
+{
+    if (reserva->abiertos != 0 ||
+        ((reserva->info.reserva_id >> 16) != dir->nodo_id && reserva->vinculada)) {
+        return 1;
+    }
+    for (size_t i = 0; i < dir->npaginas; i++) {
+        const dsm_pagina_desc_t *p = &dir->paginas[i];
+        if (p->reserva != reserva->info.reserva_id) {
+            continue;
+        }
+        uint64_t bit = UINT64_C(1) << dir->nodo_id;
+        if (p->hogar == dir->nodo_id ?
+            ((p->mascara_copias & ~bit) || (p->msi == DSM_MSI_M && p->poseedor != dir->nodo_id)) :
+            (p->mascara_copias & bit)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int terminar_asignacion(dsm_directorio_t *dir, uint32_t id, uint64_t token, int cancelar)
+{
+    if (dir == NULL || !dir->inicializado || token == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&dir->coordinador);
+    pthread_mutex_lock(&dir->mutex);
+    int error = 0;
+    struct dsm_tumba *tumba = buscar_tumba_token(dir, id, token);
+    struct dsm_reserva_dir *reserva = buscar_reserva(dir, id);
+    if (!id_reserva_valido(dir, id)) {
+        error = EINVAL;
+    } else if (tumba != NULL) {
+        error = 0;
+    } else if (reserva == NULL) {
+        if (recordar_terminal(dir, id, token) != 0) {
+            error = errno;
+        }
+    } else if (reserva->token != token) {
+        error = cancelar ? 0 : EPROTO;
+    } else if ((cancelar && reserva->publicada) || asignacion_ocupada(dir, reserva)) {
+        error = EBUSY;
+    } else if (terminar_reserva(dir, reserva) != 0) {
+        error = errno;
+    }
+    pthread_mutex_unlock(&dir->mutex);
+    pthread_mutex_unlock(&dir->coordinador);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    return 0;
+}
+
+int dsm_directorio_cancelar(dsm_directorio_t *dir, uint32_t id, uint64_t token)
+{
+    return terminar_asignacion(dir, id, token, 1);
+}
+
+int dsm_directorio_soltar(dsm_directorio_t *dir, uint32_t id, uint64_t token)
+{
+    return terminar_asignacion(dir, id, token, 0);
+}
+
+int dsm_directorio_iniciar_retiro(dsm_directorio_t *dir, uint32_t id)
+{
+    if (!bloquear(dir)) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct dsm_reserva_dir *reserva = buscar_reserva(dir, id);
+    int error = reserva == NULL ? ENOENT :
+                (id >> 16) != dir->nodo_id ? EPERM :
+                reserva->abiertos != 0 ? EBUSY : 0;
+    if (error == 0) {
+        reserva->publicada = 0;
+    }
+    pthread_mutex_unlock(&dir->mutex);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    return 0;
+}
+
+/* Abrir una vista existente no cambia la autoridad MSI ni materializa replicas I. */
+static int vincular_vista(dsm_directorio_t *dir, struct dsm_reserva_dir *reserva)
+{
+    if (reserva->vinculada) {
+        return 0;
+    }
+    reserva->vinculada = 1;
+    uint64_t bit = UINT64_C(1) << dir->nodo_id;
+    for (size_t i = 0; i < dir->npaginas; i++) {
+        const dsm_pagina_desc_t *pagina = &dir->paginas[i];
+        if (pagina->reserva != reserva->info.reserva_id) {
+            continue;
+        }
+        int prot = PROT_NONE;
+        if (!pagina->perdida && (pagina->mascara_copias & bit) != 0) {
+            if (pagina->msi == DSM_MSI_M && pagina->poseedor == dir->nodo_id) {
+                prot = PROT_READ | PROT_WRITE;
+            } else if (pagina->msi == DSM_MSI_S) {
+                prot = PROT_READ;
+            }
+        }
+        if (proteger(dir, i, prot) != 0) {
+            int error = errno;
+            reserva->vinculada = 0;
+            (void)dsm_vistas_proteger(&reserva->vista, PROT_NONE);
+            errno = error;
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int dsm_directorio_instalar(dsm_directorio_t *dir, const dsm_region_info_t *info)
 {
     if (info == NULL || !bloquear(dir)) {
@@ -629,19 +1142,30 @@ int dsm_directorio_instalar(dsm_directorio_t *dir, const dsm_region_info_t *info
         return -1;
     }
     int resultado = -1;
-    uint16_t hogar;
-    if (!manifiesto_valido(dir, info, &hogar)) {
+    uint16_t primero;
+    if (!manifiesto_valido(dir, info, &primero) || dir->cerrando) {
         errno = EPROTO;
         goto salir;
     }
     struct dsm_reserva_dir *anterior = buscar_reserva(dir, info->reserva_id);
     if (anterior != NULL) {
-        if (!mismo_manifiesto(&anterior->info, info)) {
+        if (!anterior->confirmada || !mismo_manifiesto(&anterior->info, info)) {
             errno = EPROTO;
         } else {
-            resultado = 0;
+            resultado = vincular_vista(dir, anterior);
         }
         goto salir;
+    }
+    if ((info->reserva_id >> 16) == dir->nodo_id) {
+        errno = EPROTO;
+        goto salir;
+    }
+    for (uint32_t t = 0; t < info->cantidad_tramos; t++) {
+        if (hogar_del_gpn(dir, info->tramos[t].gpn_inicial) == dir->nodo_id) {
+            /* Un hogar solo puede montar capacidad que preparo y confirmo. */
+            errno = EPROTO;
+            goto salir;
+        }
     }
     for (size_t i = 0; i < dir->npaginas; i++) {
         uint64_t gpn = dir->paginas[i].gpn;
@@ -652,10 +1176,6 @@ int dsm_directorio_instalar(dsm_directorio_t *dir, const dsm_region_info_t *info
                 goto salir;
             }
         }
-    }
-    if ((info->reserva_id >> 16) == dir->nodo_id || hogar == dir->nodo_id || dir->cerrando) {
-        errno = EPROTO;
-        goto salir;
     }
     if (ampliar_paginas(dir, info->total_paginas) != 0) {
         goto salir;
@@ -670,10 +1190,13 @@ int dsm_directorio_instalar(dsm_directorio_t *dir, const dsm_region_info_t *info
         goto salir;
     }
     reserva->info = *info;
+    reserva->confirmada = 1;
+    reserva->vinculada = 1;
     reserva->siguiente = dir->reservas;
     dir->reservas = reserva;
     for (uint32_t t = 0; t < info->cantidad_tramos; t++) {
         const dsm_tramo_t *tramo = &info->tramos[t];
+        uint16_t hogar = hogar_del_gpn(dir, tramo->gpn_inicial);
         for (uint32_t k = 0; k < tramo->cantidad; k++) {
             uint32_t orden = tramo->orden_inicial + k;
             dir->paginas[dir->npaginas++] = (dsm_pagina_desc_t){
@@ -734,7 +1257,7 @@ int dsm_directorio_codificar_info(dsm_directorio_t *dir, const dsm_cabecera_t *p
     pthread_mutex_lock(&dir->mutex);
     struct dsm_reserva_dir *reserva = buscar_reserva(dir, consulta->reserva_id);
     uint16_t estado = DSM_ESTADO_RANGO;
-    if (reserva != NULL && reserva->publicada && !dir->cerrando &&
+    if (reserva != NULL && reserva->confirmada && reserva->publicada && !dir->cerrando &&
         (consulta->reserva_id >> 16) == dir->nodo_id && consulta->primer_tramo == 0) {
         estado = DSM_ESTADO_OK;
     }
@@ -772,7 +1295,7 @@ int dsm_directorio_responder(dsm_directorio_t *dir, int fd, uint16_t peer,
         errno = EPROTO;
         return -1;
     }
-    uint8_t buf[512];
+    uint8_t buf[DSM_REGION_INFO_MAX];
     size_t n;
     if (dsm_directorio_codificar_info(dir, pedido, consulta, *seq, buf, sizeof buf, &n) != 0) {
         return -1;
@@ -787,7 +1310,7 @@ int dsm_directorio_publicar(dsm_directorio_t *dir, int fd, uint32_t *seq)
         errno = EINVAL;
         return -1;
     }
-    uint8_t buf[512];
+    uint8_t buf[DSM_REGION_INFO_MAX];
     size_t n = 0;
     dsm_cabecera_t cab;
     dsm_region_lookup_t consulta;
@@ -878,7 +1401,7 @@ int dsm_directorio_traer(dsm_directorio_t *dir, int fd, uint32_t reserva_id, uin
                          dsm_cabecera_t *cab_out, dsm_region_info_t *info_out)
 {
     uint32_t id_lookup;
-    uint8_t buf[512];
+    uint8_t buf[DSM_REGION_INFO_MAX];
     size_t n;
     if (dsm_directorio_solicitar(dir, fd, reserva_id, seq, &id_lookup) != 0 ||
         dsm_recibir_trama_plazo(fd, buf, sizeof buf, &n, dir->rpc_timeout_ms) != 0) {
@@ -955,7 +1478,6 @@ int dsm_directorio_servir_pagina(dsm_directorio_t *dir, uint16_t solicitante,
         goto salir;
     }
     dsm_pagina_desc_t *pagina = &dir->paginas[i];
-    dsm_vistas_t *vista = vista_pagina(dir, i);
     if (pagina->perdida || (pagina->msi != DSM_MSI_S &&
         (pagina->msi != DSM_MSI_M || pagina->poseedor != dir->nodo_id))) {
         errno = EPROTO;
@@ -971,7 +1493,7 @@ int dsm_directorio_servir_pagina(dsm_directorio_t *dir, uint16_t solicitante,
             errno = EOVERFLOW;
             goto salir;
         }
-        if (dsm_vistas_proteger_pagina(vista, pagina->orden, dir->page_size, PROT_READ) != 0) {
+        if (proteger(dir, i, PROT_READ) != 0) {
             goto salir;
         }
         pagina->msi = DSM_MSI_S;
@@ -979,7 +1501,7 @@ int dsm_directorio_servir_pagina(dsm_directorio_t *dir, uint16_t solicitante,
         pagina->version++;
     }
     if (solicitante == dir->nodo_id &&
-        dsm_vistas_proteger_pagina(vista, pagina->orden, dir->page_size, PROT_READ) != 0) {
+        proteger(dir, i, PROT_READ) != 0) {
         goto salir;
     }
     pagina->mascara_copias |= UINT64_C(1) << solicitante;
@@ -1061,12 +1583,6 @@ static size_t indice_gpn(const dsm_directorio_t *dir, uint64_t gpn)
 static int bit_de(uint64_t mascara, uint16_t id)
 {
     return id < 64 && (mascara & (UINT64_C(1) << id)) != 0;
-}
-
-static int proteger(dsm_directorio_t *dir, size_t indice, int prot)
-{
-    return dsm_vistas_proteger_pagina(vista_pagina(dir, indice),
-                                     dir->paginas[indice].orden, dir->page_size, prot);
 }
 
 static dsm_cabecera_t cabecera_de(const dsm_directorio_t *dir, uint8_t tipo, uint16_t destino,
@@ -1534,7 +2050,8 @@ static int pedir_invalidacion(dsm_directorio_t *dir, uint16_t destino, uint64_t 
 }
 
 /* Serializado con las concesiones del hogar mediante coordinador. */
-static int cerrar_vinculo(dsm_directorio_t *dir, uint16_t par, uint32_t id)
+/* La cola del hogar conserva el orden entre PAGE_REQUEST y COPY_CLOSE. */
+static int cerrar_copia_serializada(dsm_directorio_t *dir, uint16_t par, uint32_t id)
 {
     struct timespec limite;
     if (plazo_operacion(dir, &limite) != 0) {
@@ -1542,50 +2059,71 @@ static int cerrar_vinculo(dsm_directorio_t *dir, uint16_t par, uint32_t id)
     }
     pthread_mutex_lock(&dir->mutex);
     struct dsm_reserva_dir *reserva = buscar_reserva(dir, id);
-    if ((id >> 16) != dir->nodo_id || (uint16_t)id == 0 ||
-        par >= dir->cantidad_nodos || par == dir->nodo_id) {
+    if (!id_reserva_valido(dir, id) || par >= dir->cantidad_nodos) {
         pthread_mutex_unlock(&dir->mutex);
         errno = EINVAL;
         return -1;
     }
     if (reserva == NULL) {
-        /* Los consecutivos se consumen una sola vez. Un cierre retransmitido
-         * despues de liberar no afecta ninguna reserva posterior. */
-        int conocida = (uint16_t)id < dir->siguiente_local;
+        int terminada = buscar_tumba(dir, id) != NULL;
         pthread_mutex_unlock(&dir->mutex);
-        if (!conocida) {
+        if (!terminada) {
             errno = ENOENT;
             return -1;
         }
         return 0;
     }
-    uint64_t bit = UINT64_C(1) << par;
-    if (!(reserva->abiertos & bit)) {
+    if (!reserva->confirmada) {
         pthread_mutex_unlock(&dir->mutex);
         return 0;
     }
-    /* El coordinador impide retirar descriptores durante el cierre. Las
-     * nuevas reservas se agregan al final, aun si realloc mueve la tabla. */
-    size_t i = indice_reserva(dir, id);
+    uint64_t bit = UINT64_C(1) << par;
+    size_t primera = indice_reserva(dir, id);
     pthread_mutex_unlock(&dir->mutex);
 
-    /* La API cliente excluye trabajadores hasta recibir este ACK. Las
-     * revocaciones siguen siendo reales y preceden a la liberacion del pin. */
     for (uint32_t orden = 0; orden < reserva->info.total_paginas; orden++) {
         if (!plazo_vigente(&limite)) {
             return -1;
         }
         pthread_mutex_lock(&dir->mutex);
+        size_t i = primera + orden;
         if (i >= dir->npaginas || dir->paginas[i].reserva != id ||
-            dir->paginas[i].orden != orden ||
-            (dir->paginas[i].perdida &&
-             ((dir->paginas[i].mascara_copias & bit) ||
-              (dir->paginas[i].msi == DSM_MSI_M && dir->paginas[i].poseedor == par)))) {
+            dir->paginas[i].orden != orden) {
+            pthread_mutex_unlock(&dir->mutex);
+            errno = EPROTO;
+            return -1;
+        }
+        dsm_pagina_desc_t *p = &dir->paginas[i];
+        if (p->hogar != dir->nodo_id) {
+            pthread_mutex_unlock(&dir->mutex);
+            continue;
+        }
+        if (p->perdida && ((p->mascara_copias & bit) ||
+                          (p->msi == DSM_MSI_M && p->poseedor == par))) {
             pthread_mutex_unlock(&dir->mutex);
             errno = ENOTCONN;
             return -1;
         }
-        dsm_pagina_desc_t pagina = dir->paginas[i];
+        if (par == dir->nodo_id) {
+            if (p->msi == DSM_MSI_M && p->poseedor == par && p->version == UINT32_MAX) {
+                pthread_mutex_unlock(&dir->mutex);
+                errno = EOVERFLOW;
+                return -1;
+            }
+            if (proteger(dir, i, PROT_NONE) != 0) {
+                pthread_mutex_unlock(&dir->mutex);
+                return -1;
+            }
+            if (p->msi == DSM_MSI_M && p->poseedor == par) {
+                p->msi = DSM_MSI_S;
+                p->poseedor = DSM_POSEEDOR_NINGUNO;
+                p->version++;
+            }
+            p->mascara_copias &= ~bit;
+            pthread_mutex_unlock(&dir->mutex);
+            continue;
+        }
+        dsm_pagina_desc_t pagina = *p;
         pthread_mutex_unlock(&dir->mutex);
 
         if (pagina.msi == DSM_MSI_M && pagina.poseedor == par) {
@@ -1604,7 +2142,7 @@ static int cerrar_vinculo(dsm_directorio_t *dir, uint16_t par, uint32_t id)
                 pagina.version, imagen, &version, &limite);
             if (rc == 0) {
                 pthread_mutex_lock(&dir->mutex);
-                dsm_pagina_desc_t *p = &dir->paginas[i];
+                p = &dir->paginas[i];
                 if (p->perdida || p->version != pagina.version ||
                     proteger(dir, i, PROT_NONE) != 0) {
                     rc = -1;
@@ -1638,12 +2176,68 @@ static int cerrar_vinculo(dsm_directorio_t *dir, uint16_t par, uint32_t id)
             dir->paginas[i].mascara_copias &= ~bit;
             pthread_mutex_unlock(&dir->mutex);
         }
-        i++;
     }
-    pthread_mutex_lock(&dir->mutex);
-    reserva->abiertos &= ~bit;
-    pthread_mutex_unlock(&dir->mutex);
     return 0;
+}
+
+static int cerrar_vinculo(dsm_directorio_t *dir, uint16_t par, uint32_t id)
+{
+    pthread_mutex_lock(&dir->mutex);
+    struct dsm_reserva_dir *reserva = buscar_reserva(dir, id);
+    int error = 0;
+    if ((id >> 16) != dir->nodo_id || (uint16_t)id == 0 ||
+        par >= dir->cantidad_nodos || par == dir->nodo_id) {
+        error = EINVAL;
+    } else if (reserva == NULL) {
+        if (buscar_tumba(dir, id) == NULL && (uint16_t)id >= dir->siguiente_local) {
+            error = ENOENT;
+        }
+    } else {
+        uint64_t bit = UINT64_C(1) << par;
+        for (size_t i = 0; i < dir->npaginas; i++) {
+            const dsm_pagina_desc_t *p = &dir->paginas[i];
+            if (p->reserva == id && p->hogar == dir->nodo_id &&
+                ((p->mascara_copias & bit) || (p->msi == DSM_MSI_M && p->poseedor == par))) {
+                error = EBUSY;
+                break;
+            }
+        }
+        if (error == 0) {
+            reserva->abiertos &= ~bit;
+        }
+    }
+    pthread_mutex_unlock(&dir->mutex);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    return 0;
+}
+
+static int atender_copia_cierre(dsm_directorio_t *dir, uint16_t par,
+                                const uint8_t *trama, size_t n)
+{
+    dsm_cabecera_t pedido;
+    uint32_t reserva;
+    if (dsm_region_cierre_decodificar(trama, n, &pedido, &reserva) != 0 ||
+        pedido.tipo != DSM_TIPO_REGION_COPY_CLOSE || pedido.origen != par ||
+        pedido.destino != dir->nodo_id) {
+        errno = EPROTO;
+        return -1;
+    }
+    int rc = cerrar_copia_serializada(dir, par, reserva);
+    dsm_cabecera_t cab = cabecera_de(dir, DSM_TIPO_REGION_COPY_CLOSE_ACK, par,
+                                     dir->nuevo_id(dir->envio_ctx));
+    cab.banderas = DSM_FLAG_RESPUESTA;
+    cab.id_corr = pedido.id_msg;
+    cab.estado = rc == 0 ? DSM_ESTADO_OK : estado_errno(errno);
+    uint8_t buf[DSM_REGION_CIERRE_BYTES];
+    size_t out;
+    if (dsm_region_cierre_codificar(buf, sizeof buf, &cab, reserva, &out) != 0) {
+        errno = EPROTO;
+        return -1;
+    }
+    return enviar_fuera(dir, par, buf, out);
 }
 
 static int atender_cierre(dsm_directorio_t *dir, uint16_t par,
@@ -1678,7 +2272,7 @@ static int atender_consulta(dsm_directorio_t *dir, uint16_t par,
 {
     dsm_cabecera_t pedido;
     dsm_region_lookup_t consulta;
-    uint8_t respuesta[512];
+    uint8_t respuesta[DSM_REGION_INFO_MAX];
     size_t out;
     if (dsm_region_lookup_decodificar(trama, n, &pedido, &consulta) != 0 ||
         pedido.origen != par ||
@@ -1694,7 +2288,7 @@ static int publicar_lectura_local(dsm_directorio_t *dir, uint16_t par, const dsm
                                   const dsm_page_request_t *pedido)
 {
     printf("nodo %u PAGE_REQUEST recibido par %u gpn %" PRIu64 " bytes %u id %" PRIu32 "\n",
-           dir->nodo_id, par, pedido->gpn, DSM_PAGE_REQUEST_BYTES, pedido_cab->id_msg);
+           dir->nodo_id, par, pedido->gpn, pedido_cab->longitud, pedido_cab->id_msg);
     dsm_page_data_t datos;
     int cambio = 0;
     uint8_t *imagen = malloc(dir->page_size);
@@ -1788,7 +2382,7 @@ static int atender_lectura(dsm_directorio_t *dir, uint16_t par, const dsm_cabece
     }
 
     printf("nodo %u PAGE_REQUEST recibido par %u gpn %" PRIu64 " bytes %u id %" PRIu32 "\n",
-           dir->nodo_id, par, pedido->gpn, DSM_PAGE_REQUEST_BYTES, pedido_cab->id_msg);
+           dir->nodo_id, par, pedido->gpn, pedido_cab->longitud, pedido_cab->id_msg);
     uint8_t *imagen = malloc(dir->page_size);
     uint32_t version_nueva = 0;
     if (imagen == NULL) {
@@ -1933,10 +2527,17 @@ static int atender_pedido(dsm_directorio_t *dir, uint16_t par, const uint8_t *tr
 {
     dsm_cabecera_t cab;
     dsm_page_request_t pedido;
-    if (n != DSM_PAGE_REQUEST_BYTES || dsm_page_request_decodificar(trama, n, &cab, &pedido) != 0 ||
+    if (dsm_page_request_decodificar(trama, n, &cab, &pedido) != 0 ||
         cab.origen != par || (pedido.proc_id >> 16) != par || (uint16_t)pedido.proc_id == 0) {
         errno = EPROTO;
         return -1;
+    }
+    if (pedido.reserva_id != 0) {
+        dsm_pagina_desc_t pagina;
+        if (dsm_directorio_describir(dir, pedido.gpn, &pagina) != 0 ||
+            pagina.reserva != pedido.reserva_id || pagina.orden != pedido.orden) {
+            return enviar_pagina(dir, par, cab.id_msg, DSM_ESTADO_RANGO, NULL);
+        }
     }
     if (pedido.acceso == DSM_ACCESO_ESCRITURA) {
         return conceder_escritura(dir, par, &cab, &pedido);
@@ -1956,6 +2557,9 @@ static int procesar_item(dsm_directorio_t *dir, uint16_t par, const uint8_t *tra
     }
     if (cab.tipo == DSM_TIPO_REGION_CLOSE) {
         return atender_cierre(dir, par, trama, n);
+    }
+    if (cab.tipo == DSM_TIPO_REGION_COPY_CLOSE) {
+        return atender_copia_cierre(dir, par, trama, n);
     }
     if (cab.tipo == DSM_TIPO_PAGE_REQUEST) {
         return atender_pedido(dir, par, trama, n);
@@ -2079,19 +2683,21 @@ static int rechazar_por_cola(dsm_directorio_t *dir, uint16_t par,
     if (pedido->tipo == DSM_TIPO_PAGE_REQUEST) {
         return enviar_pagina(dir, par, pedido->id_msg, DSM_ESTADO_COLA, NULL);
     }
-    if (pedido->tipo != DSM_TIPO_REGION_LOOKUP && pedido->tipo != DSM_TIPO_REGION_CLOSE) {
+    if (pedido->tipo != DSM_TIPO_REGION_LOOKUP && pedido->tipo != DSM_TIPO_REGION_CLOSE &&
+        pedido->tipo != DSM_TIPO_REGION_COPY_CLOSE) {
         errno = EAGAIN;
         return -1;
     }
     dsm_cabecera_t cab = cabecera_de(dir, pedido->tipo == DSM_TIPO_REGION_LOOKUP ?
-                                     DSM_TIPO_REGION_INFO : DSM_TIPO_REGION_CLOSE_ACK,
+                                     DSM_TIPO_REGION_INFO : pedido->tipo == DSM_TIPO_REGION_CLOSE ?
+                                     DSM_TIPO_REGION_CLOSE_ACK : DSM_TIPO_REGION_COPY_CLOSE_ACK,
                                      par, dir->nuevo_id(dir->envio_ctx));
     cab.banderas = DSM_FLAG_RESPUESTA;
     cab.id_corr = pedido->id_msg;
     cab.estado = DSM_ESTADO_COLA;
     uint8_t respuesta[DSM_REGION_CIERRE_BYTES];
     size_t bytes = DSM_CABECERA_BYTES;
-    if (pedido->tipo == DSM_TIPO_REGION_CLOSE) {
+    if (pedido->tipo == DSM_TIPO_REGION_CLOSE || pedido->tipo == DSM_TIPO_REGION_COPY_CLOSE) {
         dsm_cabecera_t copia;
         uint32_t reserva;
         if (dsm_region_cierre_decodificar(trama, n, &copia, &reserva) != 0 ||
@@ -2124,7 +2730,7 @@ int dsm_directorio_ofrecer(dsm_directorio_t *dir, uint16_t par, const uint8_t *t
     }
     if (cab.tipo != DSM_TIPO_PAGE_REQUEST && cab.tipo != DSM_TIPO_INVALIDATE &&
         cab.tipo != DSM_TIPO_PAGE_DOWNGRADE && cab.tipo != DSM_TIPO_REGION_LOOKUP &&
-        cab.tipo != DSM_TIPO_REGION_CLOSE) {
+        cab.tipo != DSM_TIPO_REGION_CLOSE && cab.tipo != DSM_TIPO_REGION_COPY_CLOSE) {
         errno = EPROTO;
         return -1;
     }

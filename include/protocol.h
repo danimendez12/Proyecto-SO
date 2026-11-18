@@ -13,10 +13,15 @@ enum {
     DSM_CABECERA_BYTES = 32,
     DSM_LONGITUD_MAX = 1048576,
     DSM_PAGE_REQUEST_BYTES = 48,
+    DSM_PAGE_REQUEST_MAP_BYTES = 56,
     DSM_PAGE_DATA_BASE = 80,
     DSM_NOMBRE_MAX = 64,
     DSM_MAX_FICHAS = 16,
-    DSM_MAX_TRAMOS = 16
+    DSM_TRAMOS_POR_HOGAR = 16,
+    DSM_MAX_TRAMOS = DSM_TRAMOS_POR_HOGAR * DSM_MAX_FICHAS,
+    DSM_REGION_INFO_MAX = 60 + 16 * DSM_MAX_TRAMOS,
+    DSM_CAPACIDAD_BASE_BYTES = 56,
+    DSM_CAPACIDAD_MAX = DSM_CAPACIDAD_BASE_BYTES + DSM_REGION_INFO_MAX - DSM_CABECERA_BYTES
 };
 
 enum {
@@ -35,7 +40,17 @@ enum {
     DSM_TIPO_REGION_LOOKUP = 0x32,
     DSM_TIPO_REGION_INFO = 0x33,
     DSM_TIPO_REGION_CLOSE = 0x34,
-    DSM_TIPO_REGION_CLOSE_ACK = 0x35
+    DSM_TIPO_REGION_CLOSE_ACK = 0x35,
+    DSM_TIPO_CAP_PREPARE = 0x40,
+    DSM_TIPO_CAP_PREPARE_ACK = 0x41,
+    DSM_TIPO_CAP_COMMIT = 0x42,
+    DSM_TIPO_CAP_COMMIT_ACK = 0x43,
+    DSM_TIPO_CAP_CANCEL = 0x44,
+    DSM_TIPO_CAP_CANCEL_ACK = 0x45,
+    DSM_TIPO_CAP_RELEASE = 0x46,
+    DSM_TIPO_CAP_RELEASE_ACK = 0x47,
+    DSM_TIPO_REGION_COPY_CLOSE = 0x48,
+    DSM_TIPO_REGION_COPY_CLOSE_ACK = 0x49
 };
 
 enum {
@@ -133,6 +148,10 @@ typedef struct dsm_page_request {
     uint32_t proc_id;
     uint8_t acceso;
     uint8_t msi;
+    /* Extension para mapas fragmentados/multihogar. Cero conserva la trama
+     * heredada de 48 bytes; la extendida identifica la asignacion del GPN. */
+    uint32_t reserva_id;
+    uint32_t orden;
 } dsm_page_request_t;
 
 typedef struct dsm_page_data {
@@ -207,6 +226,22 @@ typedef struct dsm_region_info {
     uint32_t total_paginas;
     dsm_tramo_t tramos[DSM_MAX_TRAMOS];
 } dsm_region_info_t;
+
+/* El token identifica la sesion del creador. Un ID no se puede recuperar ni
+ * cancelar desde otra sesion. Solo PREPARE_ACK y COMMIT llevan manifiesto. */
+typedef struct dsm_capacidad {
+    uint32_t reserva_id;
+    uint32_t orden;
+    uint32_t max_paginas;
+    uint32_t max_tramos;
+    uint64_t token;
+    dsm_region_info_t info;
+} dsm_capacidad_t;
+
+int dsm_capacidad_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                             const dsm_capacidad_t *msg, size_t *out);
+int dsm_capacidad_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                               dsm_capacidad_t *msg);
 
 int dsm_cabecera_codificar(uint8_t *dst, const dsm_cabecera_t *cab);
 int dsm_cabecera_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab);

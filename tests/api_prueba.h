@@ -18,7 +18,8 @@
 enum api_operacion {
     API_INICIAR, API_RESERVAR, API_ABRIR, API_REGISTRAR, API_DESREGISTRAR,
     API_LEER_AR, API_ESCRIBIR_AR, API_LEER, API_ESCRIBIR, API_PERMISOS,
-    API_DESVINCULAR, API_LIBERAR, API_CERRAR, API_CONCURRENCIA, API_TERMINAR
+    API_DESVINCULAR, API_LIBERAR, API_CERRAR, API_CONCURRENCIA, API_UBICACION,
+    API_TRADUCIR, API_TERMINAR
 };
 
 struct api_orden {
@@ -34,6 +35,9 @@ struct api_respuesta {
     dsm_reserva_id_t id;
     size_t bytes;
     uintptr_t ar;
+    uintptr_t traducida;
+    uint64_t gpn;
+    dsm_node_id_t hogar;
     unsigned char datos[64];
     char permisos[4][5];
 };
@@ -247,6 +251,17 @@ static void api_aplicacion(const char *config, uint16_t nodo, int entrada, int s
                                                        orden.bytes != 0);
             }
             break;
+        case API_UBICACION:
+            respuesta.resultado = dsm_ubicacion_pagina(ctx, reserva, orden.offset,
+                                                       &respuesta.hogar, &respuesta.gpn);
+            break;
+        case API_TRADUCIR:
+        {
+            void *direccion = NULL;
+            respuesta.resultado = dsm_traducir(ctx, reserva, orden.offset, &direccion);
+            respuesta.traducida = (uintptr_t)direccion;
+            break;
+        }
         case API_TERMINAR:
             if (registrado && dsm_hilo_desregistrar(ctx) != DSM_OK) {
                 _exit(1);

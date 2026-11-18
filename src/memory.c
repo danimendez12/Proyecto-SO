@@ -1,5 +1,7 @@
 #include "memory.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -35,12 +37,27 @@ int dsm_vistas_crear(size_t bytes, dsm_vistas_t *salida)
         close(fd);
         return -1;
     }
-    memset(gestor, 0, bytes);
+    /* ftruncate sobre un memfd nuevo proporciona ceros. Las paginas remotas
+     * solo consumen respaldo local cuando se instala una copia por Cr. */
     salida->fd = fd;
     salida->bytes = bytes;
     salida->a_r = app;
     salida->c_r = gestor;
     return 0;
+}
+
+int dsm_vistas_respaldar_tramo(dsm_vistas_t *vista, size_t offset, size_t bytes)
+{
+    if (vista == NULL || vista->fd < 0 || offset > vista->bytes ||
+        bytes == 0 || bytes > vista->bytes - offset) {
+        errno = EINVAL;
+        return -1;
+    }
+    int rc;
+    do {
+        rc = fallocate(vista->fd, 0, (off_t)offset, (off_t)bytes);
+    } while (rc != 0 && errno == EINTR);
+    return rc;
 }
 
 int dsm_vistas_proteger(dsm_vistas_t *vistas, int prot)

@@ -12,6 +12,9 @@ struct vinculacion {
     void *base;
     size_t bytes;
     int retirando;
+    int provisional;
+    uint32_t aportantes;
+    uint32_t copias_por_cerrar;
     struct vinculacion *siguiente;
 };
 
@@ -192,6 +195,122 @@ static int asociar(dsm_context_t *ctx, struct vinculacion *v, dsm_vistas_t *vist
     return DSM_OK;
 }
 
+/* Una respuesta perdida deja al participante en la lista hasta que confirme
+ * la cancelacion. Cada hogar puede devolver capacidad independientemente. */
+static int cancelar(dsm_context_t *ctx, struct vinculacion **pos)
+{
+    struct vinculacion *v = *pos;
+    int resultado = DSM_OK;
+    if (v->base != NULL) {
+        if (dsm_pager_retirar_vista(ctx->pager, v->id) != 0) {
+            return error_api(errno);
+        }
+        v->base = NULL;
+    }
+    for (uint16_t hogar = 0; hogar < ctx->cfg.cantidad_nodos; hogar++) {
+        uint32_t bit = UINT32_C(1) << hogar;
+        if (!(v->aportantes & bit)) {
+            continue;
+        }
+        if (dsm_coherencia_cancelar(ctx->coherencia, hogar, v->id) != 0) {
+            resultado = error_api(errno);
+        } else {
+            v->aportantes &= ~bit;
+        }
+    }
+    if (v->aportantes == 0) {
+        quitar(pos);
+    }
+    return resultado;
+}
+
+static void reintentar_cancelaciones(dsm_context_t *ctx)
+{
+    struct vinculacion **pos = &ctx->reservas;
+    while (*pos != NULL) {
+        if ((*pos)->provisional && cancelar(ctx, pos) == DSM_OK) {
+            continue;
+        }
+        pos = &(*pos)->siguiente;
+    }
+}
+
+static int preparar_mapa(dsm_context_t *ctx, struct vinculacion *v, dsm_region_info_t *mapa)
+{
+    uint32_t orden = 0;
+    int inalcanzable = 0;
+    /* Primero el creador, despues los demas IDs en orden ascendente. */
+    for (uint16_t paso = 0; paso < ctx->cfg.cantidad_nodos && orden < mapa->total_paginas; paso++) {
+        uint16_t hogar = paso == 0 ? ctx->nodo : paso - 1;
+        if (paso != 0 && hogar >= ctx->nodo) {
+            hogar++;
+        }
+        if (hogar != ctx->nodo && dsm_coherencia_esperar(ctx->coherencia, hogar) != 0) {
+            inalcanzable = 1;
+            continue;
+        }
+        uint32_t bit = UINT32_C(1) << hogar;
+        v->aportantes |= bit;
+        dsm_region_info_t parcial;
+        uint32_t max_tramos = DSM_MAX_TRAMOS - mapa->cantidad_tramos;
+        if (max_tramos > DSM_TRAMOS_POR_HOGAR) {
+            max_tramos = DSM_TRAMOS_POR_HOGAR;
+        }
+        if (dsm_coherencia_preparar(ctx->coherencia, hogar, v->id, orden,
+                                   mapa->total_paginas - orden, max_tramos, &parcial) != 0) {
+            if (errno == ENOSPC) {
+                if (hogar != ctx->nodo) {
+                    v->aportantes &= ~bit;
+                }
+                continue;
+            }
+            return error_api(errno);
+        }
+        if (parcial.reserva_id != v->id || parcial.cantidad_tramos == 0 ||
+            parcial.cantidad_tramos > max_tramos) {
+            return DSM_ERR_PROTO;
+        }
+        uint64_t base = ctx->directorio.limites_gpn[hogar];
+        uint64_t fin = ctx->directorio.limites_gpn[hogar + 1];
+        for (uint32_t i = 0; i < parcial.cantidad_tramos; i++) {
+            const dsm_tramo_t *tramo = &parcial.tramos[i];
+            if (tramo->orden_inicial != orden || tramo->cantidad == 0 ||
+                tramo->cantidad > mapa->total_paginas - orden ||
+                tramo->gpn_inicial < base || tramo->gpn_inicial >= fin ||
+                tramo->cantidad > fin - tramo->gpn_inicial) {
+                return DSM_ERR_PROTO;
+            }
+            mapa->tramos[mapa->cantidad_tramos++] = *tramo;
+            orden += tramo->cantidad;
+        }
+    }
+    mapa->total_tramos = mapa->cantidad_tramos;
+    if (orden != mapa->total_paginas) {
+        return inalcanzable ? DSM_ERR_NODO : DSM_ERR_NOMEM;
+    }
+    return DSM_OK;
+}
+
+static int confirmar(dsm_context_t *ctx, struct vinculacion *v, const dsm_region_info_t *mapa)
+{
+    for (uint16_t hogar = 0; hogar < ctx->cfg.cantidad_nodos; hogar++) {
+        if ((v->aportantes & (UINT32_C(1) << hogar)) &&
+            dsm_coherencia_confirmar(ctx->coherencia, hogar, v->id, mapa) != 0) {
+            return error_api(errno);
+        }
+    }
+    dsm_pagina_desc_t primera;
+    dsm_vistas_t *vista;
+    if (dsm_directorio_vista(&ctx->directorio, v->id, &primera, &vista) != 0) {
+        return error_api(errno);
+    }
+    int rc = asociar(ctx, v, vista);
+    if (rc == DSM_OK && dsm_directorio_publicar_reserva(&ctx->directorio, v->id) != 0) {
+        return error_api(errno);
+    }
+    return rc;
+}
+
 int dsm_reservar(dsm_context_t *ctx, dsm_proc_id_t proceso, size_t bytes,
                  dsm_reserva_id_t *id, void **base)
 {
@@ -202,37 +321,38 @@ int dsm_reservar(dsm_context_t *ctx, dsm_proc_id_t proceso, size_t bytes,
     if (proceso == 0 || proceso != ctx->proceso || bytes == 0 || id == NULL || base == NULL) {
         return salir(DSM_ERR_INVAL);
     }
+    if (bytes > dsm_config_base(&ctx->cfg, ctx->cfg.cantidad_nodos)) {
+        return salir(DSM_ERR_NOMEM);
+    }
+    reintentar_cancelaciones(ctx);
     struct vinculacion *v = calloc(1, sizeof *v);
     if (v == NULL) {
         return salir(DSM_ERR_NOMEM);
     }
-    dsm_vistas_t *vista;
-    dsm_pagina_desc_t primera;
-    if (dsm_directorio_reservar(&ctx->directorio, bytes, &primera, &vista) != 0) {
+    if (dsm_directorio_id_reserva(&ctx->directorio, &v->id) != 0) {
         rc = error_api(errno);
         free(v);
         return salir(rc);
     }
-    v->id = primera.reserva;
-    rc = asociar(ctx, v, vista);
-    if (rc != DSM_OK) {
-        dsm_directorio_liberar(&ctx->directorio, v->id);
-        free(v);
-        return salir(rc);
-    }
+    v->provisional = 1;
+    v->retirando = 1;
     v->siguiente = ctx->reservas;
     ctx->reservas = v;
-    if (dsm_directorio_publicar_reserva(&ctx->directorio, v->id) != 0) {
-        rc = error_api(errno);
-        /* Si hay trabajadores, el pager debe conservar la ventana hasta
-         * el cierre. Ningun llamador ha recibido su ID ni su direccion. */
-        v->retirando = 1;
-        if (dsm_pager_retirar_vista(ctx->pager, v->id) == 0 &&
-            dsm_directorio_liberar(&ctx->directorio, v->id) == 0) {
-            quitar(&ctx->reservas);
-        }
+    dsm_region_info_t mapa = {
+        .reserva_id = v->id, .tamano_bytes = bytes,
+        .total_paginas = (uint32_t)(1 + (bytes - 1) / ctx->cfg.page_size),
+    };
+    rc = preparar_mapa(ctx, v, &mapa);
+    if (rc == DSM_OK) {
+        rc = confirmar(ctx, v, &mapa);
+    }
+    if (rc != DSM_OK) {
+        cancelar(ctx, &ctx->reservas);
         return salir(rc);
     }
+    v->copias_por_cerrar = v->aportantes & ~(UINT32_C(1) << ctx->nodo);
+    v->provisional = 0;
+    v->retirando = 0;
     *base = v->base;
     *id = v->id;
     return salir(DSM_OK);
@@ -244,9 +364,7 @@ static int desvincular(dsm_context_t *ctx, struct vinculacion **pos)
 {
     struct vinculacion *v = *pos;
     v->retirando = 1;
-    /* El creador puede haber liberado la reserva tras un CLOSE cuyo ACK
-     * se perdio. Su respuesta de reserva inexistente confirma el retiro. */
-    if (dsm_coherencia_desvincular(ctx->coherencia, v->id) != 0 && errno != ENOENT) {
+    if (dsm_coherencia_desvincular(ctx->coherencia, v->id) != 0) {
         return error_api(errno);
     }
     if (v->base != NULL && dsm_pager_retirar_vista(ctx->pager, v->id) != 0) {
@@ -326,6 +444,51 @@ int dsm_desvincular_reserva(dsm_context_t *ctx, dsm_reserva_id_t id)
     return salir(ctx->trabajadores == 0 ? desvincular(ctx, pos) : DSM_ERR_OCUPADA);
 }
 
+/* El creador cierra LOOKUP bajo el mutex del directorio antes de devolver
+ * capacidad. Los bits se limpian tras cada ACK para poder reintentar. */
+static int liberar(dsm_context_t *ctx, struct vinculacion **pos)
+{
+    struct vinculacion *v = *pos;
+    if (v->provisional) {
+        return cancelar(ctx, pos);
+    }
+    if (!v->retirando) {
+        if (dsm_directorio_iniciar_retiro(&ctx->directorio, v->id) != 0) {
+            return error_api(errno);
+        }
+        v->retirando = 1;
+    }
+    for (uint16_t hogar = 0; hogar < ctx->cfg.cantidad_nodos; hogar++) {
+        uint32_t bit = UINT32_C(1) << hogar;
+        if (v->copias_por_cerrar & bit) {
+            if (dsm_coherencia_cerrar_copia(ctx->coherencia, hogar, v->id) != 0) {
+                return error_api(errno);
+            }
+            v->copias_por_cerrar &= ~bit;
+        }
+    }
+    if (v->base != NULL) {
+        if (dsm_pager_retirar_vista(ctx->pager, v->id) != 0) {
+            return error_api(errno);
+        }
+        v->base = NULL;
+    }
+    for (uint16_t hogar = 0; hogar < ctx->cfg.cantidad_nodos; hogar++) {
+        uint32_t bit = UINT32_C(1) << hogar;
+        if (hogar != ctx->nodo && (v->aportantes & bit)) {
+            if (dsm_coherencia_soltar(ctx->coherencia, hogar, v->id) != 0) {
+                return error_api(errno);
+            }
+            v->aportantes &= ~bit;
+        }
+    }
+    if (dsm_coherencia_soltar(ctx->coherencia, ctx->nodo, v->id) != 0) {
+        return error_api(errno);
+    }
+    quitar(pos);
+    return DSM_OK;
+}
+
 int dsm_liberar(dsm_context_t *ctx, dsm_reserva_id_t id)
 {
     int rc = entrar(ctx);
@@ -336,21 +499,7 @@ int dsm_liberar(dsm_context_t *ctx, dsm_reserva_id_t id)
     if (*pos == NULL || (id >> 16) != ctx->nodo) {
         return salir(*pos == NULL ? DSM_ERR_INVAL : DSM_ERR_ESTADO);
     }
-    if (ctx->trabajadores != 0) {
-        return salir(DSM_ERR_OCUPADA);
-    }
-    if (dsm_directorio_liberar(&ctx->directorio, id) != 0 &&
-        !((*pos)->retirando && errno == ENOENT)) {
-        return salir(error_api(errno));
-    }
-    /* El pager conserva identidades propias. No hay trabajadores registrados
-     * y el mutex impide publicar otro registro durante el desmontaje. */
-    if (dsm_pager_retirar_vista(ctx->pager, id) != 0 && errno != ENOENT) {
-        (*pos)->retirando = 1;
-        return salir(error_api(errno));
-    }
-    quitar(pos);
-    return salir(DSM_OK);
+    return salir(ctx->trabajadores == 0 ? liberar(ctx, pos) : DSM_ERR_OCUPADA);
 }
 
 int dsm_cerrar(dsm_context_t *ctx)
@@ -370,15 +519,18 @@ int dsm_cerrar(dsm_context_t *ctx)
             return salir(rc);
         }
     }
+    while (ctx->reservas != NULL) {
+        rc = liberar(ctx, &ctx->reservas);
+        if (rc != DSM_OK) {
+            return salir(rc);
+        }
+    }
     if (dsm_directorio_preparar_cierre(&ctx->directorio) != 0 ||
         dsm_pager_cerrar(ctx->pager) != 0) {
         return salir(error_api(errno));
     }
     dsm_coherencia_cerrar(ctx->coherencia);
     dsm_directorio_cerrar(&ctx->directorio);
-    while (ctx->reservas != NULL) {
-        quitar(&ctx->reservas);
-    }
     activo = NULL;
     free(ctx);
     return salir(DSM_OK);
@@ -390,6 +542,30 @@ static int validar_rango(struct vinculacion *v, size_t offset, size_t bytes)
         return DSM_ERR_INVAL;
     }
     return v->retirando ? DSM_ERR_OCUPADA : DSM_OK;
+}
+
+int dsm_ubicacion_pagina(dsm_context_t *ctx, dsm_reserva_id_t id, size_t orden,
+                         dsm_node_id_t *hogar, uint64_t *gpn)
+{
+    int rc = entrar(ctx);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+    struct vinculacion *v = *posicion(ctx, id);
+    if (v == NULL || hogar == NULL || gpn == NULL || v->bytes == 0 ||
+        orden > (v->bytes - 1) / ctx->cfg.page_size) {
+        return salir(DSM_ERR_INVAL);
+    }
+    if (v->retirando) {
+        return salir(DSM_ERR_OCUPADA);
+    }
+    dsm_pagina_desc_t pagina;
+    if (dsm_directorio_pagina_reserva(&ctx->directorio, id, orden, &pagina) != 0) {
+        return salir(error_api(errno));
+    }
+    *hogar = pagina.hogar;
+    *gpn = pagina.gpn;
+    return salir(DSM_OK);
 }
 
 static int hay_conflicto(const dsm_context_t *ctx, const struct copia *nueva)

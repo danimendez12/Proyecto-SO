@@ -2,6 +2,172 @@
 
 Este directorio reúne las decisiones de arquitectura y las evidencias de prueba.
 
+## Paso 11B-C · Reservas multihogar
+
+### Del diseño anterior a una sola reserva distribuida
+
+El punto de partida fue la rama limpia `prototipo-2` en `6d68c45`. Se
+revisaron API, directorio, memoria, paginador, protocolo, coherencia, red,
+configuración, ejemplos, Makefile y aceptaciones. El manejador ya entregaba
+un ordinal y el paginador ya podía resolver su GPN. El directorio rechazaba
+tramos de otro hogar, el asignador comprobaba solo la capacidad local y el
+cierre de la reserva suponía que el creador era su único hogar. Además, la
+inicialización de Cr escribía ceros en todas las páginas del respaldo.
+
+| Archivos | Cambio para el diseño de arquitectura |
+| --- | --- |
+| `src/dsm.c`, `include/dsm.h` | El proceso creador coordina una asignación puntual y conserva la lista de confirmaciones pendientes. La consulta aditiva `dsm_ubicacion_pagina` permite inspeccionar desde C la misma reserva en el creador y en sus clientes. |
+| `src/directory.c`, `include/directory.h` | Cada nodo usa su mapa de ocupación para todas las reservas. Distingue las páginas que aporta, las copias locales de otros hogares y su posible vinculación como aplicación. |
+| `src/memory.c`, `include/memory.h` | Las vistas siguen usando un memfd. `fallocate` respalda solo los tramos aportados por ese hogar. Los tramos remotos permanecen dispersos hasta que se instalan copias en Cr. |
+| `src/protocol.c`, `include/protocol.h` | Codificación de preparación, confirmación, cancelación, liberación y sus respuestas. El manifiesto admite hasta 16 tramos por hogar y 256 en total. Las solicitudes de página con identidad ampliada incluyen reserva y ordinal. |
+| `src/coherence.c`, `include/coherence.h` | Se conserva el lector único por conexión. Una cola de capacidad tramita asignaciones. Cada hogar procesa la devolución de copias en la misma cola que sus solicitudes de página. |
+| `src/main.c` | Al recibir SIGINT, la CLI que aportó memoria a otro creador mantiene TCP y MSI activos hasta la devolución de los tramos. |
+| `examples/demo_creator.c`, `config/lab-multihogar.ini` | Modo `aportar`, impresión del mapa y configuración reproducible de tres nodos. |
+| `Makefile`, `tests/api_prueba.h`, `tests/aceptacion_multihogar.c`, `tests/aceptacion_multihogar_errores.c` | Dos aceptaciones con procesos independientes. El auxiliar consulta el mapa y traduce direcciones. La prueba de errores descarta un `CAP_RELEASE_ACK` con `--wrap=send` en su propio ejecutable. |
+| `README.md`, `docs/README.md` | Comandos de laboratorio, decisiones y evidencia de esta revisión. |
+
+### Asignación, acceso y liberación
+
+1. **Preparar.** El creador combina su ID de nodo con un consecutivo de
+   16 bits. Calcula la cantidad de páginas con el tamaño configurado,
+   consulta primero su propio aporte y después a los otros nodos por ID.
+   `CAP_PREPARE` devuelve los tramos que el hogar pudo marcar en ese
+   instante bajo su mutex. Dos solicitudes concurrentes no pueden obtener
+   el mismo GPN. Las transacciones de capacidad se identifican por reserva
+   y por un token de sesión del creador.
+2. **Confirmar y publicar.** Una vez cubiertos todos los ordinales, cada
+   participante recibe el mismo mapa por `CAP_COMMIT` y respalda su parte.
+   El creador registra Ar en su paginador y habilita `REGION_LOOKUP`
+   después de recibir las confirmaciones. Si falla una etapa, envía
+   `CAP_CANCEL` también a los hogares que pudieron preparar antes de un
+   timeout. Conserva los pendientes y reintenta la cancelación en futuras
+   reservas o al cerrar. Una respuesta tardía se correlaciona por par y
+   por solicitud.
+3. **Enrutar.** Para un desplazamiento `d`, la página lógica es
+   `d / P` y la posición interna es `d % P`. El tramo proporciona
+   `GPN = gpn_inicial + ordinal - orden_inicial`. Su hogar es el nodo
+   cuyo intervalo de GPN contiene ese valor. Los límites se calculan
+   acumulando los aportes del INI y dividiendo por `P`. El tamaño lógico
+   conserva su valor original aunque el último tramo termine en una
+   página parcial. Se usa el mismo mapa en el acceso directo y las copias
+   que cruzan un límite.
+4. **Mantener MSI.** El hogar de cada GPN coordina versiones, lectores y
+   poseedor M. Un fallo en Ar solicita una sola página o su exclusividad.
+   El lector instala la respuesta por Cr y el directorio ajusta el permiso
+   de esa página. I usa `PROT_NONE`, S admite lectura y M admite
+   lectura y escritura. Una página vecina puede conservar cualquiera de
+   los otros estados.
+5. **Desvincular.** Antes de cerrar su apertura ante el creador, el
+   cliente obtiene una confirmación de cada hogar. Una copia M entrega
+   su imagen vigente y una copia S pierde su permiso. Un donante que
+   también usó la reserva como aplicación conserva su respaldo
+   autoritativo después de desvincularse.
+6. **Liberar.** Una apertura vigente impide despublicar y devuelve
+   `DSM_ERR_OCUPADA`. Sin clientes ni trabajadores activos, el creador
+   cierra sus copias en los demás hogares y pide `CAP_RELEASE`. Recuerda
+   qué hogares respondieron y termina después de todas las confirmaciones.
+   El registro terminal del participante permite reconocer las
+   retransmisiones. El donante puede cerrar su propio contexto después de
+   devolver todos sus aportes.
+
+### Resultados en Linux x86-64
+
+Se compiló una copia de las fuentes del árbol de trabajo en Debian 12.12,
+kernel 6.1.0-39-amd64, GCC 12.2.0, GNU Make 4.3 y páginas de 4096 bytes.
+`make clean`, `make` y `make examples tests aceptacion` terminaron con
+código 0. GCC compiló los objetivos del proyecto sin advertencias.
+
+| Aceptación anterior | Código | Aceptación anterior | Código |
+| --- | ---: | --- | ---: |
+| `aceptacion_red` | 0 | `aceptacion_memoria` | 0 |
+| `aceptacion_directorio` | 0 | `aceptacion_paginador` | 0 |
+| `aceptacion_paginacion_remota` | 0 | `aceptacion_escritura_local` | 0 |
+| `aceptacion_api` | 0 | `aceptacion_coherencia` | 0 |
+| `aceptacion_escritura_remota` | 0 | `aceptacion_api_remoto` | 0 |
+| `aceptacion_multipagina` | 0 | `aceptacion_multipagina_remota` | 0 |
+| `aceptacion_api_errores` | 0 | | |
+
+| Aceptación nueva | Primera ejecución | Cinco repeticiones adicionales | Plazo por ejecución |
+| --- | ---: | --- | ---: |
+| `aceptacion_multihogar` | 0 | 5/5 con código 0 | 60 s |
+| `aceptacion_multihogar_errores` | 0 | 5/5 con código 0 | 60 s |
+
+**Mapa y coherencia observados.** El creador publicó el ID 1 con 12 277 bytes.
+El cliente del nodo 2 abrió el mismo ID y obtuvo una sola Ar contigua en su
+proceso. El ensayo ocupó previamente el GPN 2 para obligar a atravesar un
+hueco en el espacio global.
+
+| Ordinal | Primer byte en Ar | Hogar | GPN |
+| ---: | ---: | ---: | ---: |
+| 0 | 0 | 0 | 0 |
+| 1 | 4096 | 0 | 1 |
+| 2 | 8192 | 1 | 3 |
+
+Los fallos SIGSEGV generaron solicitudes TCP a los hogares 0 y 1. La traza
+registró versión 2 para GPN 0 y versión 3 para GPN 3. Dos procesos
+escribieron simultáneamente bytes distintos del GPN 3. En las seis
+ejecuciones quedó un único permiso `rw-s` y el otro proceso mostró
+`---s`. Las dos páginas vecinas conservaron `r--s`. Las relecturas de
+los dos escritores y una apertura posterior en el hogar 1 recuperaron
+ambos bytes. Después de liberar se pudieron reservar de nuevo las dos
+páginas de cada hogar.
+
+**Errores y concurrencia.** Se solicitaron cinco páginas cuando solo quedaban
+cuatro libres. Ambos hogares cancelaron los tramos parciales y la siguiente
+reserva obtuvo las cuatro. Con un hogar detenido por `SIGSTOP`, el creador
+devolvió `DSM_ERR_TIEMPO`. Al reanudarlo, se completó la cancelación y se
+pudo reservar de nuevo. Perder un ACK de liberación también produjo
+`DSM_ERR_TIEMPO`. Repetir la operación con el mismo ID devolvió `DSM_OK`.
+Con un cliente abierto, liberar devolvió `DSM_ERR_OCUPADA`. Dos solicitudes
+competidoras de tres páginas con solo cuatro libres nunca obtuvieron ambas
+la concesión. Dos reservas concurrentes de dos páginas obtuvieron IDs y GPN
+disjuntos.
+
+**Medición del respaldo.** En un ensayo complementario, una reserva de
+48 MiB (12 288 páginas) ocupó 32 MiB en el memfd del hogar 0 y 16 MiB en el
+del hogar 1. La medición usó `st_blocks × 512` de cada memfd. El cliente
+tenía 48 MiB de tamaño lógico y cero bloques de datos asignados al abrir.
+Después de leer la primera página tenía 4096 bytes asignados y después de
+leer la última, 8192. Al cerrar se liberaron los memfd y los puertos.
+
+**Otras ejecuciones.** Se probaron tres procesos en dos espacios de nombres
+de red Linux conectados por un par veth, con INI independientes, IPv4
+192.0.2.1 y 192.0.2.2 y puertos 27200–27202. El lector modificó la tercera
+página de una reserva de cuatro y el creador verificó las cuatro antes de
+cerrar. En otra ejecución el creador había agotado su aporte y obtuvo una
+reserva exclusivamente de los hogares 1 y 2. Se recuperó una escritura
+que cruzaba esa frontera. También se verificaron un reinicio ordenado del
+creador con donante activo, mensajes duplicados de una sesión anterior y
+un `SIGINT` en la CLI donante. La CLI sirvió una lectura y escritura después
+de la señal y terminó con código 0 tras la devolución del aporte.
+
+### Límites y reproducción
+
+- La recuperación por reintento requiere que los participantes conserven su
+  estado. Si se pierde definitivamente un participante, pueden quedar páginas
+  retenidas o indisponibles. Las marcas de transacciones finalizadas se
+  conservan en memoria durante la sesión. El ID público tiene 16 bits de
+  consecutivo por creador y puede repetirse al reiniciar el contexto. El
+  token distingue las operaciones de capacidad entre sesiones. Después de
+  una caída, el ID por sí solo no identifica una apertura antigua.
+- Una reserva puede cubrir miles de páginas consecutivas por tramo. Con
+  más de 16 intervalos libres separados por hogar, la fragmentación puede
+  impedir una solicitud incluso si la suma de páginas libres es suficiente.
+  El procesamiento de las campañas MSI sigue siendo serial en cada hogar.
+- La validación de este paso se ejecutó en una VM Debian. Queda pendiente
+  repetirla con GCC 13.3 en los equipos físicos Linux Mint 22.3 del TEC.
+  Los ejemplos usan las IPv4 del INI y admiten varios nodos por equipo.
+
+Los comandos exactos de compilación y ejecución para Ubuntu y Mint están
+en la [guía de tres terminales](../README.md#demostración-multihogar-en-tres-terminales)
+y en la [lista de aceptaciones](../README.md#pruebas-de-aceptación).
+
+El trabajo quedó en el árbol de `prototipo-2`, sobre `6d68c45`, con
+16 archivos versionados modificados y 3 nuevos pendientes de agregar.
+El índice permaneció vacío de cambios y se conservó la referencia de la rama.
+
+---
+
 ## Paso 11B del Prototipo 2 · 18 de noviembre de 2026
 
 ### Auditoría de partida

@@ -14,6 +14,21 @@ int dsm_coherencia_iniciar(dsm_coherencia_t **salida, const dsm_config_t *cfg,
 /* Cerrar despues de terminar los trabajadores y las llamadas externas. */
 void dsm_coherencia_cerrar(dsm_coherencia_t *coherencia);
 int dsm_coherencia_esperar(dsm_coherencia_t *coherencia, uint16_t par);
+/* Cada operacion de capacidad conserva el token aleatorio de esta sesion.
+ * PREPARE retiene hasta max_pag paginas reales, sin publicar la reserva.
+ * Los cuatro metodos admiten hogar local sin una espera TCP.
+ */
+int dsm_coherencia_preparar(dsm_coherencia_t *coherencia, uint16_t hogar,
+                            uint32_t id, uint32_t orden, uint32_t max_pag,
+                            uint32_t max_tramos, dsm_region_info_t *parcial);
+int dsm_coherencia_confirmar(dsm_coherencia_t *coherencia, uint16_t hogar,
+                             uint32_t id, const dsm_region_info_t *manifiesto);
+int dsm_coherencia_cancelar(dsm_coherencia_t *coherencia, uint16_t hogar, uint32_t id);
+int dsm_coherencia_soltar(dsm_coherencia_t *coherencia, uint16_t hogar, uint32_t id);
+/* Barrera FIFO del hogar: devuelve M y revoca las copias de este nodo antes
+ * de reconocer. No quita el pin que mantiene el creador de la reserva.
+ */
+int dsm_coherencia_cerrar_copia(dsm_coherencia_t *coherencia, uint16_t hogar, uint32_t id);
 int dsm_coherencia_abrir(dsm_coherencia_t *coherencia, uint32_t reserva,
                          dsm_pagina_desc_t *pagina, dsm_vistas_t **vista);
 /* Espera la retirada de las copias y la confirmacion del creador. */

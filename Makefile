@@ -4,7 +4,8 @@ CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -pthread
 
 ACEPTACIONES_API = bin/tests/aceptacion_api bin/tests/aceptacion_api_remoto \
 	bin/tests/aceptacion_multipagina bin/tests/aceptacion_multipagina_remota \
-	bin/tests/aceptacion_api_errores
+	bin/tests/aceptacion_api_errores bin/tests/aceptacion_multihogar \
+	bin/tests/aceptacion_multihogar_errores
 
 .PHONY: all examples tests aceptacion clean
 
@@ -64,7 +65,9 @@ bin/tests/aceptacion_coherencia: tests/aceptacion_coherencia.c $(PASO_SRC) $(wil
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/aceptacion_coherencia.c $(PASO_SRC) $(LDLIBS)
 
 bin/tests/aceptacion_multipagina: override LDFLAGS += -Wl,--wrap=mmap
-bin/tests/aceptacion_api_remoto bin/tests/aceptacion_multipagina_remota bin/tests/aceptacion_api_errores: tests/api_prueba.h
+bin/tests/aceptacion_multihogar_errores: override LDFLAGS += -Wl,--wrap=send
+bin/tests/aceptacion_api_remoto bin/tests/aceptacion_multipagina_remota bin/tests/aceptacion_api_errores \
+bin/tests/aceptacion_multihogar bin/tests/aceptacion_multihogar_errores: tests/api_prueba.h
 
 $(ACEPTACIONES_API): bin/tests/%: tests/%.c $(API_SRC) $(wildcard include/*.h)
 	mkdir -p $(@D)

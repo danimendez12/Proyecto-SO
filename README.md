@@ -5,9 +5,10 @@ El objetivo es implementar en C para Linux un sistema de Memoria Compartida
 Distribuida (DSM) que permita a procesos en distintos nodos acceder a una región
 de memoria compartida.
 
-El Prototipo 2 permite compartir reservas de una o varias páginas desde
-aplicaciones C independientes en Linux x86-64. Un fallo sobre la vista de aplicación activa al paginador
-y el hogar coordina por TCP los permisos MSI de esa página.
+El Prototipo 2 permite compartir una reserva contigua entre aplicaciones C
+independientes en Linux x86-64. Varios nodos pueden aportar páginas a la
+misma reserva. Un fallo en la vista de aplicación activa al paginador y
+el hogar de la página coordina por TCP sus permisos MSI.
 
 ## Organización
 
@@ -17,7 +18,7 @@ y el hogar coordina por TCP los permisos MSI de esa página.
 | `src/` | Módulos en C y punto de entrada del nodo (`main.c`). |
 | `examples/` | Aplicaciones creadora y lectora que usan el API público. |
 | `tests/` | Pruebas de aceptación de red, memoria, directorio y paginación. |
-| `config/` | Configuración de dos nodos en loopback y plantilla para ocho nodos. |
+| `config/` | Configuraciones locales de dos y tres nodos y plantilla para ocho nodos. |
 | `docs/` | Documentación técnica y evidencias del laboratorio. |
 | `bin/` | Ejecutables generados durante la compilación. |
 
@@ -46,7 +47,7 @@ los ejecutables correspondientes.
 | `make` | Genera `bin/dsm_node`. |
 | `make examples` | Genera los ejemplos en `bin/examples/`. |
 | `make tests` | Genera los programas de prueba en `bin/tests/`. |
-| `make aceptacion` | Compila los trece binarios de aceptación. |
+| `make aceptacion` | Compila los quince binarios de aceptación. |
 | `make clean` | Elimina el directorio de salida `bin/`. |
 
 ## Demostración de paginación remota
@@ -170,13 +171,14 @@ de página. Hay un contexto por proceso. Cada contexto admite varias reservas.
 
 | Operación | Semántica |
 | --- | --- |
-| Crear | `dsm_proc_abrir` obtiene el ID de proceso. `dsm_reservar` devuelve un ID global y una Ar contigua. El creador aporta las páginas, inicialmente en M. |
+| Crear | `dsm_proc_abrir` obtiene el ID de proceso. `dsm_reservar` devuelve un ID global y una Ar contigua. El creador usa su capacidad libre y pide el resto a otros hogares. |
 | Abrir | `dsm_abrir_reserva` consulta al creador por TCP, recibe el manifiesto y crea vistas locales. Las páginas remotas comienzan en I. Reabrir el mismo ID devuelve la misma Ar y el tamaño lógico. Basta una desvinculación por nodo. |
 | Acceder | Registrá el hilo antes de usar directamente Ar o el puntero de `dsm_traducir`. Cada fallo resuelve el GPN de esa página. La aplicación sincroniza los accesos directos concurrentes a los mismos datos. |
+| Consultar el mapa | `dsm_ubicacion_pagina(ctx, id, orden, &hogar, &gpn)` devuelve el hogar y el GPN del ordinal lógico, empezando en cero. Está disponible al crear o abrir la reserva. |
 | Copiar | `dsm_leer` y `dsm_escribir` validan el rango lógico y adquieren los permisos MSI por página. Admiten cruces y solapamiento. Un error de comunicación se devuelve al llamador. Una copia de varias páginas puede haberse completado parcialmente si falla una página posterior. |
-| Desvincular | El cliente llama a `dsm_desvincular_reserva`. El hogar revoca las copias de ese nodo y recupera el contenido de cada página en M antes de confirmar el cierre. Si se pierde la confirmación, se puede reintentar el cierre con el mismo ID. |
-| Liberar | Solo el creador puede llamar a `dsm_liberar`. Una apertura remota vigente devuelve `DSM_ERR_OCUPADA`. Las demás reservas conservan sus vistas. |
-| Cerrar | Desregistrá los trabajadores antes de desmontar una reserva o cerrar. `dsm_cerrar` desvincula las aperturas remotas, comprueba las propias, detiene los hilos, restaura las señales y libera recursos. Un cierre fallido puede haber desvinculado otras reservas. Tras un cierre exitoso, el contexto y sus punteros dejan de ser válidos. |
+| Desvincular | `dsm_desvincular_reserva` devuelve las copias S o M a sus respectivos hogares y confirma el cierre con el creador. El nodo que también aportó páginas continúa sirviéndolas. |
+| Liberar | Solo el creador puede llamar a `dsm_liberar`. Una apertura remota vigente devuelve `DSM_ERR_OCUPADA`. Después de despublicar, el creador espera la devolución de capacidad en cada hogar. Ante un timeout, reintentá con el mismo ID. |
+| Cerrar | Desregistrá los trabajadores y llamá a `dsm_cerrar`. El contexto desvincula las vistas de cliente y libera las reservas propias. Si el nodo aún aporta páginas a otro creador, devuelve `DSM_ERR_OCUPADA`. Un cierre parcial puede haber retirado otras reservas. Al completar el cierre se detienen los hilos y se restauran las señales. |
 
 El tamaño lógico es el solicitado, aunque el respaldo use páginas completas.
 Los punteros directos deben mantenerse dentro del rango lógico. Linux solo
@@ -187,7 +189,7 @@ obtener un código de error de la operación, usá las funciones de copia.
 | Código del API | Situación |
 | --- | --- |
 | `DSM_ERR_INVAL` | Tamaño cero al reservar, ID inexistente o rango lógico inválido. |
-| `DSM_ERR_NOMEM` | Faltan capacidad local, tramos representables o recursos para las vistas. |
+| `DSM_ERR_NOMEM` | La capacidad o los tramos disponibles entre los participantes son insuficientes, o falla la creación de las vistas. |
 | `DSM_ERR_NODO` | El par está desconectado o la página quedó aislada al perder el hogar. |
 | `DSM_ERR_TIEMPO` | Una solicitud enviada quedó sin respuesta dentro del plazo. |
 | `DSM_ERR_OCUPADA` | Hay trabajadores o aperturas que impiden retirar la reserva. |
@@ -197,9 +199,11 @@ restablezca TCP. El ID de nodo carece de una época persistente que identifique
 la misma instancia del creador. Una página cuyo último poseedor M se perdió
 puede quedar indisponible.
 
-El manifiesto admite hasta 16 tramos. Cada reserva actual cabe íntegramente
-en el aporte de su creador. Dos reservas distintas sí pueden tener hogares
-distintos. La distribución de una sola reserva entre hogares queda pendiente.
+El manifiesto contiene tramos de GPN con su ordinal inicial. Cada tramo
+pertenece a un solo hogar y puede cubrir miles de páginas. Una reserva admite
+hasta 16 tramos por hogar y hasta 16 hogares según el INI. Cada hogar administra
+su capacidad y el MSI de sus páginas. El creador publica el mapa completo
+después de que todos hayan confirmado la asignación.
 
 ### Dos aplicaciones desde terminales independientes
 
@@ -241,6 +245,49 @@ un contexto nuevo. El último argumento de ambos comandos debe coincidir con
 El ejemplo local breve también se ejecuta con
 `./bin/examples/demo_creator config/lab.ini`.
 
+### Demostración multihogar en tres terminales
+
+En Ubuntu o Linux Mint x86-64, compilá con `make examples`. La configuración
+`config/lab-multihogar.ini` aporta dos páginas en el nodo 0, dos en el 1 y
+una en el 2. Una reserva de cuatro páginas necesita dos hogares.
+
+Para probar en una máquina, ejecutá `DSM_INI=config/lab-multihogar.ini` en
+cada terminal. Para usar dos o tres computadoras del laboratorio, ejecutá el
+siguiente bloque en cada terminal desde su propia copia del proyecto.
+Ingresá las mismas tres IPv4 en el mismo orden. Dos nodos lógicos pueden
+compartir una IPv4. Los puertos TCP son 27200, 27201 y 27202.
+
+```bash
+make examples
+read -rp 'IPv4 del creador (nodo 0): ' DSM_IP0
+read -rp 'IPv4 del segundo hogar (nodo 1): ' DSM_IP1
+read -rp 'IPv4 del lector (nodo 2): ' DSM_IP2
+DSM_INI=$(mktemp)
+awk -v a="$DSM_IP0" -v b="$DSM_IP1" -v c="$DSM_IP2" \
+  '$1=="nodo" {$5=($3==0 ? a : ($3==1 ? b : c))} {print}' \
+  config/lab-multihogar.ini > "$DSM_INI"
+```
+
+Ejecutá cada comando en su terminal y en este orden.
+
+```bash
+# Terminal del nodo 1 · dejar el hogar disponible
+./bin/examples/demo_creator "$DSM_INI" aportar 1
+
+# Terminal del nodo 0 · crear una sola reserva de 16 KiB
+./bin/examples/demo_creator "$DSM_INI" compartir 0 4 4096
+
+# Terminal del nodo 2 · abrir el ID anunciado por el creador (1 al inicio)
+./bin/examples/demo_reader "$DSM_INI" 2 1 4096
+```
+
+El creador muestra el mapa. Con el INI anterior y los hogares libres, los
+ordinales 0 y 1 pertenecen al nodo 0 y los ordinales 2 y 3 al nodo 1.
+Ingresá `escribir` en el lector y luego `leer` en el creador. Deben aparecer
+`Hola TEC`, `Pagina 1 original`, `Adios TEC` y `Pagina 3 original`.
+Para cerrar, ingresá `salir` en el lector, esperá que termine, hacé lo
+mismo en el creador y finalmente en el hogar 1.
+
 ## Pruebas de aceptación
 
 Desde la raíz del proyecto en Linux x86-64, con los puertos del INI libres:
@@ -261,6 +308,13 @@ do
     do
         timeout -k 1s 45s "./bin/tests/aceptacion_$prueba"
     done
+done
+timeout -k 1s 60s ./bin/tests/aceptacion_multihogar
+timeout -k 1s 60s ./bin/tests/aceptacion_multihogar_errores
+for repeticion in 1 2 3 4 5
+do
+    timeout -k 1s 60s ./bin/tests/aceptacion_multihogar
+    timeout -k 1s 60s ./bin/tests/aceptacion_multihogar_errores
 done
 ```
 

@@ -58,6 +58,7 @@ typedef struct dsm_directorio {
     uint32_t reservas_globales;
     uint32_t siguiente_local;
     struct dsm_reserva_dir *reservas;
+    struct dsm_tumba *tumbas;
     dsm_pagina_desc_t *paginas;
     size_t npaginas;
     size_t capacidad_paginas;
@@ -98,6 +99,15 @@ int dsm_directorio_init(dsm_directorio_t *dir, const dsm_config_t *cfg,
                         uint16_t nodo_id);
 /* Cerrar tras terminar las operaciones y el uso de los punteros prestados. */
 void dsm_directorio_cerrar(dsm_directorio_t *dir);
+int dsm_directorio_id_reserva(dsm_directorio_t *dir, uint32_t *id);
+int dsm_directorio_preparar(dsm_directorio_t *dir, uint32_t id, uint64_t token,
+                            uint32_t orden, uint32_t max_paginas, uint32_t max_tramos,
+                            dsm_region_info_t *parcial);
+int dsm_directorio_confirmar(dsm_directorio_t *dir, uint32_t id, uint64_t token,
+                              const dsm_region_info_t *info);
+int dsm_directorio_cancelar(dsm_directorio_t *dir, uint32_t id, uint64_t token);
+int dsm_directorio_soltar(dsm_directorio_t *dir, uint32_t id, uint64_t token);
+int dsm_directorio_iniciar_retiro(dsm_directorio_t *dir, uint32_t id);
 int dsm_directorio_reservar(dsm_directorio_t *dir, size_t bytes,
                              dsm_pagina_desc_t *salida, dsm_vistas_t **vista);
 int dsm_directorio_publicar_reserva(dsm_directorio_t *dir, uint32_t id);
@@ -108,6 +118,8 @@ int dsm_directorio_liberar(dsm_directorio_t *dir, uint32_t id);
 /* Desmontar despues del ACK de REGION_CLOSE y sin trabajadores que usen la vista. */
 int dsm_directorio_desvincular(dsm_directorio_t *dir, uint32_t id);
 int dsm_directorio_preparar_cierre(dsm_directorio_t *dir);
+/* Solo CLI: cerrar admision y esperar CANCEL/RELEASE con el servicio aun activo. */
+int dsm_directorio_esperar_fin_aportes(dsm_directorio_t *dir);
 int dsm_directorio_reservar_pagina(dsm_directorio_t *dir, dsm_pagina_desc_t *salida);
 int dsm_directorio_consultar(const dsm_directorio_t *dir, uint32_t reserva_id,
                              uint32_t primer_tramo, dsm_region_info_t *info,
