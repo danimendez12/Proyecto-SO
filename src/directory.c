@@ -37,8 +37,13 @@ int dsm_directorio_init(dsm_directorio_t *dir, const dsm_config_t *cfg, uint16_t
     if (paginas > UINT32_MAX || pthread_mutex_init(&dir->mutex, NULL) != 0) {
         return -1;
     }
+    if (pthread_mutex_init(&dir->coordinador, NULL) != 0) {
+        pthread_mutex_destroy(&dir->mutex);
+        return -1;
+    }
     pthread_condattr_t attr;
     if (pthread_condattr_init(&attr) != 0) {
+        pthread_mutex_destroy(&dir->coordinador);
         pthread_mutex_destroy(&dir->mutex);
         return -1;
     }
@@ -56,6 +61,7 @@ int dsm_directorio_init(dsm_directorio_t *dir, const dsm_config_t *cfg, uint16_t
         if (cola_lista) {
             pthread_cond_destroy(&dir->cola_cv);
         }
+        pthread_mutex_destroy(&dir->coordinador);
         pthread_mutex_destroy(&dir->mutex);
         return -1;
     }
@@ -85,6 +91,7 @@ void dsm_directorio_cerrar(dsm_directorio_t *dir)
     }
     pthread_cond_destroy(&dir->campana_cv);
     pthread_cond_destroy(&dir->cola_cv);
+    pthread_mutex_destroy(&dir->coordinador);
     pthread_mutex_destroy(&dir->mutex);
     free(dir->campana_buf);
     memset(dir, 0, sizeof *dir);
@@ -487,7 +494,7 @@ int dsm_directorio_servir_pagina(dsm_directorio_t *dir, uint16_t solicitante,
         return -1;
     }
     int resultado = -1;
-    if (solicitante >= dir->cantidad_nodos || solicitante == dir->nodo_id ||
+    if (solicitante >= dir->cantidad_nodos ||
         pedido->acceso != DSM_ACCESO_LECTURA || pedido->msi != DSM_MSI_I ||
         hogar_del_gpn(dir, pedido->gpn) != dir->nodo_id) {
         errno = EPROTO;
@@ -503,7 +510,8 @@ int dsm_directorio_servir_pagina(dsm_directorio_t *dir, uint16_t solicitante,
     }
     dsm_pagina_desc_t *pagina = &dir->paginas[i];
     dsm_vistas_t *vista = &dir->vistas[i];
-    if (pagina->msi != DSM_MSI_M && pagina->msi != DSM_MSI_S) {
+    if (pagina->perdida || (pagina->msi != DSM_MSI_S &&
+        (pagina->msi != DSM_MSI_M || pagina->poseedor != dir->nodo_id))) {
         errno = EPROTO;
         goto salir;
     }
@@ -523,6 +531,10 @@ int dsm_directorio_servir_pagina(dsm_directorio_t *dir, uint16_t solicitante,
         pagina->msi = DSM_MSI_S;
         pagina->poseedor = DSM_POSEEDOR_NINGUNO;
         pagina->version++;
+    }
+    if (solicitante == dir->nodo_id &&
+        dsm_vistas_proteger_pagina(vista, 0, dir->page_size, PROT_READ) != 0) {
+        goto salir;
     }
     pagina->mascara_copias |= UINT64_C(1) << solicitante;
     *datos = (dsm_page_data_t){
@@ -691,7 +703,7 @@ static void campana_abrir(dsm_directorio_t *dir, uint16_t par, uint32_t id)
     dir->campana_espera = 1;
     dir->campana_par = par;
     dir->campana_id = id;
-    dir->campana_error = 0;
+    dir->campana_error = dir->servicio_parar ? ECANCELED : 0;
     dir->tiene_datos = 0;
     dir->tiene_ack = 0;
     dir->datos_n = 0;
@@ -750,10 +762,13 @@ static int campana_esperar(dsm_directorio_t *dir, int quiere_datos, int quiere_a
     return 0;
 }
 
-static void pausa_poseedor(const dsm_directorio_t *dir)
+static void pausa_poseedor(dsm_directorio_t *dir)
 {
-    if (dir->retardo_ms != 0) {
-        usleep(dir->retardo_ms * 1000u);
+    pthread_mutex_lock(&dir->mutex);
+    uint32_t retardo = dir->retardo_ms;
+    pthread_mutex_unlock(&dir->mutex);
+    if (retardo != 0) {
+        usleep(retardo * 1000u);
     }
 }
 
@@ -771,22 +786,29 @@ static int atender_invalidate(dsm_directorio_t *dir, uint16_t par, const uint8_t
     uint16_t estado = DSM_ESTADO_OK;
     pthread_mutex_lock(&dir->mutex);
     size_t i = indice_gpn(dir, msg.gpn);
-    if (i < dir->npaginas && dir->paginas[i].msi == DSM_MSI_M &&
-        dir->paginas[i].poseedor == dir->nodo_id) {
+    dsm_pagina_desc_t *p = i < dir->npaginas ? &dir->paginas[i] : NULL;
+    /* El escritor puede pedir retirar la copia S del propio hogar. Las demas
+     * replicas unicamente aceptan la orden de su hogar. */
+    if (p == NULL || msg.escritor >= dir->cantidad_nodos ||
+        (p->hogar == dir->nodo_id ? msg.escritor != par : p->hogar != par) ||
+        (p->msi == DSM_MSI_M && p->poseedor == dir->nodo_id)) {
         estado = DSM_ESTADO_CONFLICTO;
-    } else if (i < dir->npaginas && dir->paginas[i].msi != DSM_MSI_I) {
+    } else if (p->msi == DSM_MSI_S && bit_de(p->mascara_copias, dir->nodo_id)) {
         if (proteger(dir, i, PROT_NONE) != 0) {
             int error = errno;
             pthread_mutex_unlock(&dir->mutex);
             errno = error;
             return -1;
         }
-        dir->paginas[i].msi = DSM_MSI_I;
-        dir->paginas[i].poseedor = DSM_POSEEDOR_NINGUNO;
-        dir->paginas[i].mascara_copias &= ~(UINT64_C(1) << dir->nodo_id);
+        if (p->hogar != dir->nodo_id) {
+            p->msi = DSM_MSI_I;
+        }
+        p->mascara_copias &= ~(UINT64_C(1) << dir->nodo_id);
         resultado = DSM_INVALIDA_HECHO;
     }
     pthread_mutex_unlock(&dir->mutex);
+    printf("nodo %u INVALIDATE recibido par %u gpn %" PRIu64 " solicitud %" PRIu32 "\n",
+           dir->nodo_id, par, msg.gpn, msg.id_solicitud);
 
     uint32_t id = dir->nuevo_id(dir->envio_ctx);
     dsm_cabecera_t cab = cabecera_de(dir, DSM_TIPO_INVALIDATE_ACK, par, id);
@@ -802,7 +824,12 @@ static int atender_invalidate(dsm_directorio_t *dir, uint16_t par, const uint8_t
         errno = EPROTO;
         return -1;
     }
-    return enviar_fuera(dir, par, buf, out);
+    int rc = enviar_fuera(dir, par, buf, out);
+    if (rc == 0 && estado == DSM_ESTADO_OK) {
+        printf("nodo %u INVALIDATE_ACK enviado par %u gpn %" PRIu64 " solicitud %" PRIu32 "\n",
+               dir->nodo_id, par, msg.gpn, msg.id_solicitud);
+    }
+    return rc;
 }
 
 static int atender_downgrade(dsm_directorio_t *dir, uint16_t par, const uint8_t *trama, size_t n)
@@ -813,6 +840,8 @@ static int atender_downgrade(dsm_directorio_t *dir, uint16_t par, const uint8_t 
         errno = EPROTO;
         return -1;
     }
+    printf("nodo %u PAGE_DOWNGRADE recibido par %u gpn %" PRIu64 " solicitud %" PRIu32 "\n",
+           dir->nodo_id, par, msg.gpn, msg.id_solicitud);
     pausa_poseedor(dir);
 
     uint8_t *imagen = malloc(dir->page_size);
@@ -909,22 +938,6 @@ static int atender_downgrade(dsm_directorio_t *dir, uint16_t par, const uint8_t 
          enviar_fuera(dir, par, raw, out) != 0)) {
         rc = -1;
     }
-    if (rc == 0 && tenia && msg.motivo == DSM_MOTIVO_A_S && msg.solicitante != dir->nodo_id &&
-        msg.solicitante != par) {
-        uint32_t id = dir->nuevo_id(dir->envio_ctx);
-        dsm_cabecera_t cab = cabecera_de(dir, DSM_TIPO_PAGE_DATA, msg.solicitante, id);
-        cab.banderas = DSM_FLAG_RESPUESTA;
-        cab.id_corr = msg.id_solicitud;
-        size_t cap = (size_t)dir->page_size + DSM_PAGE_DATA_BASE;
-        uint8_t *buf = malloc(cap);
-        size_t out_cli = 0;
-        if (buf == NULL || id == 0 ||
-            dsm_page_data_codificar(buf, cap, &cab, &datos, &out_cli) != 0 ||
-            enviar_fuera(dir, msg.solicitante, buf, out_cli) != 0) {
-            rc = -1;
-        }
-        free(buf);
-    }
     free(imagen);
     return rc;
 }
@@ -960,11 +973,23 @@ static int pedir_bajada(dsm_directorio_t *dir, uint16_t poseedor, uint64_t gpn, 
         dsm_downgrade_ack_t ack;
         dsm_cabecera_t cab_datos;
         dsm_page_data_t datos;
-        if (dsm_downgrade_ack_decodificar(ack_raw, DSM_CONTROL_BYTES, &cab_ack, &ack) == 0 &&
+        dsm_pagina_desc_t pagina;
+        uint64_t mascara = (UINT64_C(1) << dir->nodo_id) | (UINT64_C(1) << solicitante);
+        if (motivo == DSM_MOTIVO_A_S) {
+            mascara |= UINT64_C(1) << poseedor;
+        }
+        if (dsm_directorio_describir(dir, gpn, &pagina) == 0 &&
+            dsm_downgrade_ack_decodificar(ack_raw, DSM_CONTROL_BYTES, &cab_ack, &ack) == 0 &&
             cab_ack.estado == DSM_ESTADO_OK && cab_ack.id_corr == id && ack.gpn == gpn &&
+            ack.id_solicitud == id_solicitud &&
             ack.resultado == DSM_DOWNGRADE_HECHO &&
             dsm_page_data_decodificar(recibo, recibo_n, &cab_datos, &datos) == 0 &&
             cab_datos.estado == DSM_ESTADO_OK && cab_datos.id_corr == id && datos.gpn == gpn &&
+            datos.hogar == dir->nodo_id && datos.reserva_id == pagina.reserva &&
+            datos.orden == pagina.orden && datos.msi == DSM_MSI_S &&
+            datos.proc_id == ((uint32_t)solicitante << 16) &&
+            datos.poseedor == DSM_POSEEDOR_NINGUNO &&
+            datos.mascara_copias == mascara &&
             datos.version == version_esperada && datos.page_nbytes == dir->page_size &&
             datos.datos != NULL) {
             memcpy(imagen, datos.datos, dir->page_size);
@@ -973,6 +998,16 @@ static int pedir_bajada(dsm_directorio_t *dir, uint16_t poseedor, uint64_t gpn, 
         } else {
             errno = EPROTO;
         }
+    }
+    if (rc != 0) {
+        /* Tras enviar PAGE_DOWNGRADE, el antiguo M pudo haber renunciado
+         * aunque falten sus datos o su ACK. No reutilizar una imagen incierta. */
+        pthread_mutex_lock(&dir->mutex);
+        size_t i = indice_gpn(dir, gpn);
+        if (i < dir->npaginas) {
+            dir->paginas[i].perdida = 1;
+        }
+        pthread_mutex_unlock(&dir->mutex);
     }
     free(recibo);
     campana_cerrar(dir);
@@ -1001,7 +1036,7 @@ static int pedir_invalidacion(dsm_directorio_t *dir, uint16_t destino, uint64_t 
         dsm_invalidate_ack_t ack;
         if (dsm_invalidate_ack_decodificar(ack_raw, DSM_CONTROL_BYTES, &cab_ack, &ack) == 0 &&
             cab_ack.estado == DSM_ESTADO_OK && cab_ack.id_corr == id && ack.gpn == gpn &&
-            ack.resultado <= DSM_INVALIDA_YA_I) {
+            ack.id_solicitud == id_solicitud && ack.resultado <= DSM_INVALIDA_YA_I) {
             rc = 0;
         } else {
             errno = EPROTO;
@@ -1009,20 +1044,6 @@ static int pedir_invalidacion(dsm_directorio_t *dir, uint16_t destino, uint64_t 
     }
     campana_cerrar(dir);
     return rc;
-}
-
-static void adoptar_bytes(dsm_directorio_t *dir, uint64_t gpn, const uint8_t *imagen)
-{
-    pthread_mutex_lock(&dir->mutex);
-    size_t i = indice_gpn(dir, gpn);
-    if (i < dir->npaginas && proteger(dir, i, PROT_READ | PROT_WRITE) == 0) {
-        memcpy(dir->vistas[i].c_r, imagen, dir->page_size);
-        dir->paginas[i].msi = DSM_MSI_M;
-        dir->paginas[i].poseedor = dir->nodo_id;
-        dir->paginas[i].mascara_copias = UINT64_C(1) << dir->nodo_id;
-        dir->paginas[i].perdida = 0;
-    }
-    pthread_mutex_unlock(&dir->mutex);
 }
 
 static int publicar_lectura_local(dsm_directorio_t *dir, uint16_t par, const dsm_cabecera_t *pedido_cab,
@@ -1057,8 +1078,14 @@ static int instalar_bajada(dsm_directorio_t *dir, uint64_t gpn, uint16_t solicit
     pthread_mutex_lock(&dir->mutex);
     size_t i = indice_gpn(dir, gpn);
     int rc = -1;
-    if (i < dir->npaginas && proteger(dir, i, PROT_READ) == 0) {
+    if (i < dir->npaginas && !dir->paginas[i].perdida && version > 0 &&
+        dir->paginas[i].poseedor == poseedor && dir->paginas[i].version == version - 1u) {
         memcpy(dir->vistas[i].c_r, imagen, dir->page_size);
+        if (proteger(dir, i, PROT_READ) != 0) {
+            dir->paginas[i].perdida = 1;
+            pthread_mutex_unlock(&dir->mutex);
+            return -1;
+        }
         dsm_pagina_desc_t *pagina = &dir->paginas[i];
         pagina->msi = DSM_MSI_S;
         pagina->poseedor = DSM_POSEEDOR_NINGUNO;
@@ -1069,6 +1096,8 @@ static int instalar_bajada(dsm_directorio_t *dir, uint64_t gpn, uint16_t solicit
         printf("nodo %u reserva %" PRIu32 " gpn %" PRIu64 " MSI M -> S version %" PRIu32 "\n",
                dir->nodo_id, pagina->reserva, pagina->gpn, pagina->version);
         rc = 0;
+    } else {
+        errno = EPROTO;
     }
     pthread_mutex_unlock(&dir->mutex);
     return rc;
@@ -1090,13 +1119,15 @@ static int atender_lectura(dsm_directorio_t *dir, uint16_t par, const dsm_cabece
         modo = DSM_ESTADO_FUERA;
     } else if (dir->paginas[i].msi == DSM_MSI_M && dir->paginas[i].poseedor == dir->nodo_id) {
         modo = 0;
-    } else if (dir->paginas[i].msi == DSM_MSI_S && bit_de(dir->paginas[i].mascara_copias, dir->nodo_id)) {
+    } else if (dir->paginas[i].msi == DSM_MSI_S) {
         modo = 0;
     } else if (dir->paginas[i].msi == DSM_MSI_M && dir->paginas[i].poseedor != dir->nodo_id) {
         modo = 1;
         poseedor = dir->paginas[i].poseedor;
         version = dir->paginas[i].version;
-        if ((dir->fuera & (1u << poseedor)) != 0) {
+        if (version == UINT32_MAX) {
+            modo = DSM_ESTADO_RANGO;
+        } else if ((dir->fuera & (1u << poseedor)) != 0) {
             modo = DSM_ESTADO_FUERA;
         }
     } else {
@@ -1123,6 +1154,14 @@ static int atender_lectura(dsm_directorio_t *dir, uint16_t par, const dsm_cabece
                           version + 1u, imagen, &version_nueva);
     if (rc == 0) {
         rc = instalar_bajada(dir, pedido->gpn, par, poseedor, imagen, version_nueva);
+    }
+    if (rc == 0) {
+        dsm_page_data_t datos;
+        int cambio;
+        rc = dsm_directorio_servir_pagina(dir, par, pedido, &datos, imagen, dir->page_size, &cambio);
+        if (rc == 0) {
+            rc = enviar_pagina(dir, par, pedido_cab->id_msg, DSM_ESTADO_OK, &datos);
+        }
     } else {
         enviar_pagina(dir, par, pedido_cab->id_msg, estado_errno(errno), NULL);
     }
@@ -1136,146 +1175,111 @@ static int conceder_escritura(dsm_directorio_t *dir, uint16_t par, const dsm_cab
     printf("nodo %u PAGE_REQUEST escritura par %u gpn %" PRIu64 " id %" PRIu32 "\n",
            dir->nodo_id, par, pedido->gpn, pedido_cab->id_msg);
 
-    uint16_t fallo = 0;
-    uint32_t version = 0;
-    uint64_t mascara = 0;
-    uint16_t poseedor = DSM_POSEEDOR_NINGUNO;
-    uint8_t msi = DSM_MSI_I;
-    int ya_exclusivo = 0;
-    pthread_mutex_lock(&dir->mutex);
-    size_t indice = indice_gpn(dir, pedido->gpn);
-    if (hogar_del_gpn(dir, pedido->gpn) != dir->nodo_id) {
-        fallo = DSM_ESTADO_NO_HOGAR;
-    } else if (indice == dir->npaginas) {
-        fallo = DSM_ESTADO_RANGO;
-    } else if (dir->paginas[indice].perdida) {
-        fallo = DSM_ESTADO_FUERA;
-    } else if (dir->paginas[indice].msi == DSM_MSI_M && dir->paginas[indice].poseedor == par) {
-        ya_exclusivo = 1;
-        version = dir->paginas[indice].version;
-    } else {
-        version = dir->paginas[indice].version;
-        mascara = dir->paginas[indice].mascara_copias;
-        poseedor = dir->paginas[indice].poseedor;
-        msi = dir->paginas[indice].msi;
-        if (version == UINT32_MAX) {
-            fallo = DSM_ESTADO_RANGO;
-        }
+    uint16_t estado = DSM_ESTADO_OK;
+    dsm_pagina_desc_t inicial;
+    if (dsm_directorio_describir(dir, pedido->gpn, &inicial) != 0) {
+        estado = DSM_ESTADO_RANGO;
+    } else if (inicial.hogar != dir->nodo_id) {
+        estado = DSM_ESTADO_NO_HOGAR;
+    } else if (inicial.perdida) {
+        estado = DSM_ESTADO_FUERA;
+    } else if (inicial.version == UINT32_MAX) {
+        estado = DSM_ESTADO_RANGO;
+    } else if (inicial.msi == DSM_MSI_M && inicial.poseedor == par) {
+        /* Una copia que ya recibio M puede haber escrito. El hogar no
+         * dispone de una imagen para repetir esa concesion. */
+        estado = DSM_ESTADO_CONFLICTO;
     }
-    uint32_t reserva = fallo == 0 && indice < dir->npaginas ? dir->paginas[indice].reserva : 0;
-    uint32_t orden = fallo == 0 && indice < dir->npaginas ? dir->paginas[indice].orden : 0;
-    pthread_mutex_unlock(&dir->mutex);
-    if (fallo != 0) {
-        return enviar_pagina(dir, par, pedido_cab->id_msg, fallo, NULL);
+    if (estado != DSM_ESTADO_OK) {
+        return enviar_pagina(dir, par, pedido_cab->id_msg, estado, NULL);
     }
 
     uint8_t *imagen = malloc(dir->page_size);
     if (imagen == NULL) {
-        return -1;
+        return enviar_pagina(dir, par, pedido_cab->id_msg, DSM_ESTADO_COLA, NULL);
     }
-    int con_carga = 1;
-    int rescatada = 0;
-    uint32_t version_datos = version;
-    if (ya_exclusivo) {
-        con_carga = 0;
-    } else if (msi == DSM_MSI_M && poseedor != dir->nodo_id) {
-        if ((dir->fuera & (1u << poseedor)) != 0) {
-            free(imagen);
-            return enviar_pagina(dir, par, pedido_cab->id_msg, DSM_ESTADO_FUERA, NULL);
-        }
-        if (pedir_bajada(dir, poseedor, pedido->gpn, pedido_cab->id_msg, par, DSM_MOTIVO_A_I, version,
-                         imagen, &version_datos) != 0) {
-            int error = errno;
-            free(imagen);
-            return enviar_pagina(dir, par, pedido_cab->id_msg, estado_errno(error), NULL);
-        }
-        rescatada = 1;
-        con_carga = 1;
-        mascara &= ~(UINT64_C(1) << poseedor);
-    } else if (bit_de(mascara, par) && msi == DSM_MSI_S) {
-        con_carga = 0;
-    } else {
-        pthread_mutex_lock(&dir->mutex);
-        size_t i = indice_gpn(dir, pedido->gpn);
-        if (i == dir->npaginas) {
-            pthread_mutex_unlock(&dir->mutex);
-            free(imagen);
-            return enviar_pagina(dir, par, pedido_cab->id_msg, DSM_ESTADO_RANGO, NULL);
-        }
-        memcpy(imagen, dir->vistas[i].c_r, dir->page_size);
-        pthread_mutex_unlock(&dir->mutex);
-        con_carga = 1;
-    }
-
-    if (!ya_exclusivo) {
-        for (uint16_t nodo = 0; nodo < dir->cantidad_nodos; nodo++) {
-            if (nodo == par || nodo == dir->nodo_id || nodo == poseedor || !bit_de(mascara, nodo)) {
-                continue;
-            }
-            if ((dir->fuera & (1u << nodo)) != 0) {
-                continue;
-            }
-            if (pedir_invalidacion(dir, nodo, pedido->gpn, pedido_cab->id_msg, par) != 0) {
-                int error = errno;
-                if (rescatada) {
-                    adoptar_bytes(dir, pedido->gpn, imagen);
-                }
-                free(imagen);
-                return enviar_pagina(dir, par, pedido_cab->id_msg, estado_errno(error), NULL);
-            }
-        }
-    }
-
+    int recuperar = inicial.msi == DSM_MSI_M && inicial.poseedor != dir->nodo_id;
+    uint32_t version = inicial.version;
     dsm_page_data_t datos;
-    memset(&datos, 0, sizeof datos);
-    pthread_mutex_lock(&dir->mutex);
-    size_t i = indice_gpn(dir, pedido->gpn);
-    int rc = -1;
-    if (i < dir->npaginas && dir->paginas[i].version == version) {
-        dsm_pagina_desc_t *pagina = &dir->paginas[i];
-        if (!ya_exclusivo) {
-            if (rescatada) {
-                if (proteger(dir, i, PROT_READ | PROT_WRITE) == 0) {
-                    memcpy(dir->vistas[i].c_r, imagen, dir->page_size);
-                }
-            }
-            pagina->version++;
-            pagina->msi = DSM_MSI_M;
-            pagina->poseedor = par;
-            pagina->mascara_copias = UINT64_C(1) << par;
-            pagina->perdida = 0;
-            if (par != dir->nodo_id) {
-                proteger(dir, i, PROT_NONE);
-            }
+    int rc;
+    if (recuperar && pedir_bajada(dir, inicial.poseedor, inicial.gpn, pedido_cab->id_msg,
+                                  par, DSM_MOTIVO_A_I, version, imagen, &version) != 0) {
+        estado = estado_errno(errno);
+        goto responder;
+    }
+
+    /* Un nodo desconectado aun puede leer su mapeo. Su bit solo se retira
+     * despues de un ACK, tambien cuando una campana queda a medias. */
+    for (uint16_t n = 0; inicial.msi == DSM_MSI_S && n < dir->cantidad_nodos; n++) {
+        if (n == par || n == dir->nodo_id || !bit_de(inicial.mascara_copias, n)) {
+            continue;
         }
-        datos = (dsm_page_data_t){
-            .gpn = pagina->gpn,
-            .proc_id = pedido->proc_id,
-            .reserva_id = reserva,
-            .orden = orden,
-            .hogar = dir->nodo_id,
-            .poseedor = par,
-            .msi = DSM_MSI_M,
-            .permiso = DSM_PAGE_PERMISO_ESCRIBIR,
-            .banderas = con_carga ? 0 : DSM_PAGE_DATA_SIN_CARGA,
-            .mascara_copias = UINT64_C(1) << par,
-            .page_nbytes = con_carga ? dir->page_size : 0,
-            .version = pagina->version,
-            .datos = con_carga ? imagen : NULL,
-        };
-        printf("nodo %u reserva %" PRIu32 " gpn %" PRIu64 " MSI -> M poseedor %u version %" PRIu32
-               "\n",
-               dir->nodo_id, pagina->reserva, pagina->gpn, par, pagina->version);
-        rc = 0;
+        if (pedir_invalidacion(dir, n, inicial.gpn, pedido_cab->id_msg, par) != 0) {
+            estado = estado_errno(errno);
+            goto responder;
+        }
+        pthread_mutex_lock(&dir->mutex);
+        size_t i = indice_gpn(dir, inicial.gpn);
+        dir->paginas[i].mascara_copias &= ~(UINT64_C(1) << n);
+        pthread_mutex_unlock(&dir->mutex);
+    }
+
+    pthread_mutex_lock(&dir->mutex);
+    size_t i = indice_gpn(dir, inicial.gpn);
+    dsm_pagina_desc_t *p = &dir->paginas[i];
+    int con_carga = !(pedido->msi == DSM_MSI_S && inicial.msi == DSM_MSI_S &&
+                      bit_de(p->mascara_copias, par));
+    if (p->version != inicial.version || p->perdida ||
+        (par != dir->nodo_id && (dir->fuera & (1u << par)))) {
+        estado = DSM_ESTADO_FUERA;
+    } else if (proteger(dir, i, PROT_NONE) != 0) {
+        estado = DSM_ESTADO_CONFLICTO;
     } else {
-        errno = EPROTO;
+        /* Un escritor previo ya perdio acceso. La instantanea incluye hasta
+         * su ultima escritura, incluso cuando ese escritor era el hogar. */
+        if (recuperar) {
+            memcpy(dir->vistas[i].c_r, imagen, dir->page_size);
+        } else if (con_carga) {
+            memcpy(imagen, dir->vistas[i].c_r, dir->page_size);
+        }
+        if (par == dir->nodo_id && proteger(dir, i, PROT_READ | PROT_WRITE) != 0) {
+            p->perdida = 1;
+            estado = DSM_ESTADO_CONFLICTO;
+        } else {
+            p->version++;
+            p->msi = DSM_MSI_M;
+            p->poseedor = par;
+            p->mascara_copias = UINT64_C(1) << par;
+            datos = (dsm_page_data_t){
+                .gpn = p->gpn, .proc_id = pedido->proc_id, .reserva_id = p->reserva,
+                .orden = p->orden, .hogar = p->hogar, .poseedor = par, .msi = DSM_MSI_M,
+                .permiso = DSM_PAGE_PERMISO_ESCRIBIR, .version = p->version,
+                .mascara_copias = p->mascara_copias,
+                .banderas = con_carga ? 0 : DSM_PAGE_DATA_SIN_CARGA,
+                .page_nbytes = con_carga ? dir->page_size : 0, .datos = imagen,
+            };
+            printf("nodo %u reserva %" PRIu32 " gpn %" PRIu64 " MSI -> M poseedor %u version %" PRIu32 "\n",
+                   dir->nodo_id, p->reserva, p->gpn, par, p->version);
+        }
+    }
+    if (recuperar && estado != DSM_ESTADO_OK) {
+        /* El poseedor anterior ya confirmo M -> I. */
+        p->perdida = 1;
     }
     pthread_mutex_unlock(&dir->mutex);
-    if (rc == 0) {
-        rc = enviar_pagina(dir, par, pedido_cab->id_msg, DSM_ESTADO_OK, &datos);
-    } else if (rescatada) {
-        adoptar_bytes(dir, pedido->gpn, imagen);
-        enviar_pagina(dir, par, pedido_cab->id_msg, DSM_ESTADO_CONFLICTO, NULL);
+
+responder:
+    rc = enviar_pagina(dir, par, pedido_cab->id_msg, estado,
+                       estado == DSM_ESTADO_OK ? &datos : NULL);
+    if (rc != 0 && estado == DSM_ESTADO_OK) {
+        /* Una respuesta parcialmente transmitida es ambigua. */
+        pthread_mutex_lock(&dir->mutex);
+        size_t indice = indice_gpn(dir, inicial.gpn);
+        dir->paginas[indice].perdida = 1;
+        if (par == dir->nodo_id && proteger(dir, indice, PROT_NONE) != 0) {
+            abort();
+        }
+        pthread_mutex_unlock(&dir->mutex);
     }
     free(imagen);
     return rc;
@@ -1318,24 +1322,29 @@ static int procesar_item(dsm_directorio_t *dir, uint16_t par, const uint8_t *tra
 
 static void *servicio_coherencia(void *arg)
 {
-    dsm_directorio_t *dir = arg;
+    struct dsm_cola *cola = arg;
+    dsm_directorio_t *dir = cola->directorio;
     for (;;) {
         pthread_mutex_lock(&dir->mutex);
-        while (!dir->servicio_parar && dir->cola_n == 0) {
+        while (!dir->servicio_parar && cola->cantidad == 0) {
             pthread_cond_wait(&dir->cola_cv, &dir->mutex);
         }
-        if (dir->servicio_parar && dir->cola_n == 0) {
+        if (dir->servicio_parar) {
             pthread_mutex_unlock(&dir->mutex);
             return NULL;
         }
-        uint16_t par = dir->cola[dir->cola_ini].par;
-        uint16_t n = dir->cola[dir->cola_ini].n;
-        uint8_t trama[64];
-        memcpy(trama, dir->cola[dir->cola_ini].trama, n);
-        dir->cola_ini = (dir->cola_ini + 1u) % DSM_DIR_COLA;
-        dir->cola_n--;
+        struct dsm_item item = cola->items[cola->inicio];
+        cola->inicio = (cola->inicio + 1u) % DSM_DIR_COLA;
+        cola->cantidad--;
         pthread_mutex_unlock(&dir->mutex);
-        if (procesar_item(dir, par, trama, n) != 0) {
+        if (cola == &dir->hogar) {
+            pthread_mutex_lock(&dir->coordinador);
+        }
+        int rc = procesar_item(dir, item.par, item.trama, item.n);
+        if (cola == &dir->hogar) {
+            pthread_mutex_unlock(&dir->coordinador);
+        }
+        if (rc != 0) {
             fprintf(stderr, "nodo %u coherencia: %s\n", dir->nodo_id, strerror(errno));
         }
     }
@@ -1364,10 +1373,20 @@ int dsm_directorio_activar(dsm_directorio_t *dir, dsm_directorio_envio_t enviar,
     dir->nuevo_id = nuevo_id;
     dir->envio_ctx = ctx;
     dir->servicio_parar = 0;
-    dir->cola_ini = 0;
-    dir->cola_n = 0;
+    dir->hogar = (struct dsm_cola){.directorio = dir};
+    dir->replica = (struct dsm_cola){.directorio = dir};
     dir->campana_espera = 0;
-    int error = pthread_create(&dir->servicio_hilo, NULL, servicio_coherencia, dir);
+    int error = pthread_create(&dir->hogar.hilo, NULL, servicio_coherencia, &dir->hogar);
+    if (error == 0) {
+        error = pthread_create(&dir->replica.hilo, NULL, servicio_coherencia, &dir->replica);
+        if (error != 0) {
+            dir->servicio_parar = 1;
+            pthread_cond_broadcast(&dir->cola_cv);
+            pthread_mutex_unlock(&dir->mutex);
+            pthread_join(dir->hogar.hilo, NULL);
+            pthread_mutex_lock(&dir->mutex);
+        }
+    }
     if (error != 0) {
         free(dir->campana_buf);
         dir->campana_buf = NULL;
@@ -1393,11 +1412,11 @@ void dsm_directorio_desactivar(dsm_directorio_t *dir)
     pthread_cond_broadcast(&dir->cola_cv);
     pthread_cond_broadcast(&dir->campana_cv);
     pthread_mutex_unlock(&dir->mutex);
-    pthread_join(dir->servicio_hilo, NULL);
+    pthread_join(dir->hogar.hilo, NULL);
+    pthread_join(dir->replica.hilo, NULL);
     pthread_mutex_lock(&dir->mutex);
     dir->servicio_activo = 0;
     dir->servicio_parar = 0;
-    dir->cola_n = 0;
     dir->campana_espera = 0;
     free(dir->campana_buf);
     dir->campana_buf = NULL;
@@ -1406,8 +1425,8 @@ void dsm_directorio_desactivar(dsm_directorio_t *dir)
 
 int dsm_directorio_ofrecer(dsm_directorio_t *dir, uint16_t par, const uint8_t *trama, size_t n)
 {
-    if (dir == NULL || !dir->inicializado || !dir->servicio_activo || trama == NULL ||
-        n < DSM_CABECERA_BYTES || n > sizeof dir->cola[0].trama) {
+    if (dir == NULL || !dir->inicializado || trama == NULL ||
+        n < DSM_CABECERA_BYTES || n > sizeof dir->hogar.items[0].trama) {
         errno = EINVAL;
         return -1;
     }
@@ -1423,12 +1442,43 @@ int dsm_directorio_ofrecer(dsm_directorio_t *dir, uint16_t par, const uint8_t *t
         return -1;
     }
     pthread_mutex_lock(&dir->mutex);
-    if (dir->servicio_parar) {
+    if (!dir->servicio_activo || dir->servicio_parar) {
         pthread_mutex_unlock(&dir->mutex);
         errno = ECANCELED;
         return -1;
     }
-    if (dir->cola_n == DSM_DIR_COLA) {
+    /* Las revocaciones entrantes avanzan aunque el coordinador de este nodo
+     * espere un ACK de otro hogar. El hogar emisor espera nuestra confirmacion
+     * antes de emitir una concesion incompatible. */
+    struct dsm_cola *cola = &dir->hogar;
+    if (cab.tipo == DSM_TIPO_PAGE_DOWNGRADE || cab.tipo == DSM_TIPO_INVALIDATE) {
+        uint64_t gpn;
+        if (cab.tipo == DSM_TIPO_PAGE_DOWNGRADE) {
+            dsm_downgrade_t msg;
+            if (dsm_downgrade_decodificar(trama, n, &cab, &msg) != 0) {
+                pthread_mutex_unlock(&dir->mutex);
+                errno = EPROTO;
+                return -1;
+            }
+            gpn = msg.gpn;
+        } else {
+            dsm_invalidate_t msg;
+            if (dsm_invalidate_decodificar(trama, n, &cab, &msg) != 0) {
+                pthread_mutex_unlock(&dir->mutex);
+                errno = EPROTO;
+                return -1;
+            }
+            gpn = msg.gpn;
+        }
+        if (hogar_del_gpn(dir, gpn) == par) {
+            cola = &dir->replica;
+        } else if (cab.tipo != DSM_TIPO_INVALIDATE || hogar_del_gpn(dir, gpn) != dir->nodo_id) {
+            pthread_mutex_unlock(&dir->mutex);
+            errno = EPROTO;
+            return -1;
+        }
+    }
+    if (cola->cantidad == DSM_DIR_COLA) {
         pthread_mutex_unlock(&dir->mutex);
         if (cab.tipo == DSM_TIPO_PAGE_REQUEST) {
             return enviar_pagina(dir, par, cab.id_msg, DSM_ESTADO_COLA, NULL);
@@ -1436,12 +1486,12 @@ int dsm_directorio_ofrecer(dsm_directorio_t *dir, uint16_t par, const uint8_t *t
         errno = EAGAIN;
         return -1;
     }
-    size_t slot = (dir->cola_ini + dir->cola_n) % DSM_DIR_COLA;
-    dir->cola[slot].par = par;
-    dir->cola[slot].n = (uint16_t)n;
-    memcpy(dir->cola[slot].trama, trama, n);
-    dir->cola_n++;
-    pthread_cond_signal(&dir->cola_cv);
+    size_t slot = (cola->inicio + cola->cantidad) % DSM_DIR_COLA;
+    cola->items[slot].par = par;
+    cola->items[slot].n = (uint16_t)n;
+    memcpy(cola->items[slot].trama, trama, n);
+    cola->cantidad++;
+    pthread_cond_broadcast(&dir->cola_cv);
     pthread_mutex_unlock(&dir->mutex);
     return 0;
 }
@@ -1450,8 +1500,9 @@ int dsm_directorio_completar(dsm_directorio_t *dir, uint16_t par, const uint8_t 
 {
     dsm_cabecera_t cab;
     if (dir == NULL || !dir->inicializado || trama == NULL ||
-        dsm_cabecera_decodificar(trama, n, &cab) != 0 || (cab.banderas & DSM_FLAG_RESPUESTA) == 0 ||
-        cab.id_corr == 0) {
+        dsm_cabecera_decodificar(trama, n, &cab) != 0 || cab.banderas != DSM_FLAG_RESPUESTA ||
+        cab.longitud != n ||
+        cab.id_corr == 0 || cab.origen != par || cab.destino != dir->nodo_id) {
         return -1;
     }
     pthread_mutex_lock(&dir->mutex);
@@ -1468,9 +1519,16 @@ int dsm_directorio_completar(dsm_directorio_t *dir, uint16_t par, const uint8_t 
             dir->tiene_datos = 1;
         }
     } else if (cab.tipo == DSM_TIPO_PAGE_DOWNGRADE_ACK || cab.tipo == DSM_TIPO_INVALIDATE_ACK) {
-        if (n > sizeof dir->ack_trama) {
+        if (n != sizeof dir->ack_trama || cab.estado != DSM_ESTADO_OK) {
             dir->campana_error = EPROTO;
-        } else if (!dir->tiene_ack) {
+        } else if (cab.tipo == DSM_TIPO_PAGE_DOWNGRADE_ACK) {
+            dsm_downgrade_ack_t ack;
+            if (dsm_downgrade_ack_decodificar(trama, n, &cab, &ack) != 0 ||
+                ack.resultado != DSM_DOWNGRADE_HECHO) {
+                dir->campana_error = EPROTO;
+            }
+        }
+        if (!dir->campana_error && !dir->tiene_ack) {
             memset(dir->ack_trama, 0, sizeof dir->ack_trama);
             memcpy(dir->ack_trama, trama, n);
             dir->tiene_ack = 1;
@@ -1493,10 +1551,21 @@ void dsm_directorio_par_fuera(dsm_directorio_t *dir, uint16_t par)
     dir->fuera |= 1u << par;
     for (size_t i = 0; i < dir->npaginas; i++) {
         dsm_pagina_desc_t *pagina = &dir->paginas[i];
+        if (pagina->hogar == par) {
+            /* No hay epocas persistentes. Tras perder al hogar, esta reserva
+             * queda aislada incluso si reaparece otro proceso con el mismo ID. */
+            if (proteger(dir, i, PROT_NONE) != 0) {
+                abort();
+            }
+            pagina->perdida = 1;
+            pagina->msi = DSM_MSI_I;
+            pagina->mascara_copias = 0;
+            pagina->poseedor = DSM_POSEEDOR_NINGUNO;
+        }
         if (pagina->hogar != dir->nodo_id) {
             continue;
         }
-        pagina->mascara_copias &= ~(UINT64_C(1) << par);
+        /* La desconexion no demuestra que la copia ya no sea legible. */
         if (pagina->poseedor == par && pagina->msi == DSM_MSI_M) {
             pagina->perdida = 1;
         }
@@ -1546,63 +1615,45 @@ int dsm_directorio_aplicar_pagina(dsm_directorio_t *dir, const dsm_page_data_t *
         errno = EPROTO;
         goto salir;
     }
-    int sin_carga = datos->page_nbytes == 0 && datos->banderas == DSM_PAGE_DATA_SIN_CARGA;
-    if (datos->version < pagina->version) {
+    uint64_t bit = UINT64_C(1) << dir->nodo_id;
+    uint64_t admitidos = (UINT64_C(1) << dir->cantidad_nodos) - 1;
+    int escritura = datos->msi == DSM_MSI_M;
+    int sin_carga = datos->page_nbytes == 0;
+    if (pagina->perdida || pagina->hogar == dir->nodo_id ||
+        datos->version < pagina->version || !(datos->mascara_copias & bit) ||
+        (datos->mascara_copias & ~admitidos) ||
+        datos->poseedor != (escritura ? dir->nodo_id : DSM_POSEEDOR_NINGUNO) ||
+        datos->permiso != (escritura ? DSM_PAGE_PERMISO_ESCRIBIR : DSM_PAGE_PERMISO_LEER) ||
+        (escritura && (datos->mascara_copias != bit || datos->version <= pagina->version)) ||
+        pagina->msi == DSM_MSI_M) {
         errno = EPROTO;
         goto salir;
     }
-    if (datos->msi == DSM_MSI_M) {
-        if (sin_carga) {
-            if (pagina->msi != DSM_MSI_S || datos->version != pagina->version + 1u ||
-                datos->poseedor != dir->nodo_id || datos->permiso != DSM_PAGE_PERMISO_ESCRIBIR) {
-                errno = EPROTO;
-                goto salir;
-            }
-        } else if (datos->version == pagina->version && pagina->msi != DSM_MSI_I) {
+
+    if (sin_carga) {
+        if (!escritura || datos->banderas != DSM_PAGE_DATA_SIN_CARGA ||
+            pagina->msi != DSM_MSI_S || datos->version != pagina->version + 1u) {
             errno = EPROTO;
             goto salir;
-        } else if (datos->page_nbytes != dir->page_size || datos->datos == NULL ||
-                   datos->permiso != DSM_PAGE_PERMISO_ESCRIBIR) {
+        }
+    } else {
+        if (datos->page_nbytes != dir->page_size || datos->datos == NULL || datos->banderas != 0) {
             errno = EPROTO;
             goto salir;
-        } else if (proteger(dir, i, PROT_READ | PROT_WRITE) != 0) {
-            goto salir;
-        } else {
+        }
+        if (pagina->msi == DSM_MSI_I) {
+            /* Ar sigue en PROT_NONE hasta instalar toda la imagen. */
             memcpy(dir->vistas[i].c_r, datos->datos, dir->page_size);
-        }
-        if (sin_carga && proteger(dir, i, PROT_READ | PROT_WRITE) != 0) {
-            goto salir;
-        }
-        pagina->msi = DSM_MSI_M;
-        pagina->poseedor = dir->nodo_id;
-        pagina->version = datos->version;
-        pagina->mascara_copias = datos->mascara_copias;
-        resultado = 0;
-        goto salir;
-    }
-    if (sin_carga || datos->permiso != DSM_PAGE_PERMISO_LEER || datos->page_nbytes != dir->page_size ||
-        datos->datos == NULL || datos->poseedor != DSM_POSEEDOR_NINGUNO) {
-        errno = EPROTO;
-        goto salir;
-    }
-    if (datos->version == pagina->version && pagina->msi == DSM_MSI_S) {
-        if (memcmp(dir->vistas[i].c_r, datos->datos, dir->page_size) != 0) {
+        } else if (memcmp(dir->vistas[i].c_r, datos->datos, dir->page_size) != 0) {
             errno = EPROTO;
             goto salir;
         }
-        resultado = 0;
+    }
+    if (proteger(dir, i, escritura ? PROT_READ | PROT_WRITE : PROT_READ) != 0) {
         goto salir;
     }
-    if (datos->version == pagina->version && pagina->msi != DSM_MSI_I) {
-        errno = EPROTO;
-        goto salir;
-    }
-    if (proteger(dir, i, PROT_READ) != 0) {
-        goto salir;
-    }
-    memcpy(dir->vistas[i].c_r, datos->datos, dir->page_size);
-    pagina->msi = DSM_MSI_S;
-    pagina->poseedor = DSM_POSEEDOR_NINGUNO;
+    pagina->msi = datos->msi;
+    pagina->poseedor = datos->poseedor;
     pagina->version = datos->version;
     pagina->mascara_copias = datos->mascara_copias;
     resultado = 0;
@@ -1612,13 +1663,9 @@ salir:
     return resultado;
 }
 
-int dsm_directorio_copiar(dsm_directorio_t *dir, uint64_t gpn, void *imagen, size_t n,
-                          dsm_pagina_desc_t *desc)
+static int copiar_serializado(dsm_directorio_t *dir, uint64_t gpn, void *imagen,
+                              dsm_pagina_desc_t *desc)
 {
-    if (dir == NULL || !dir->inicializado || imagen == NULL || n < dir->page_size) {
-        errno = EINVAL;
-        return -1;
-    }
     pthread_mutex_lock(&dir->mutex);
     size_t i = indice_gpn(dir, gpn);
     if (i == dir->npaginas) {
@@ -1628,11 +1675,20 @@ int dsm_directorio_copiar(dsm_directorio_t *dir, uint64_t gpn, void *imagen, siz
     }
     dsm_pagina_desc_t pagina = dir->paginas[i];
     int local = !pagina.perdida &&
-                (pagina.poseedor == dir->nodo_id ||
-                 (pagina.msi == DSM_MSI_S && bit_de(pagina.mascara_copias, dir->nodo_id)) ||
+                ((pagina.msi == DSM_MSI_S && bit_de(pagina.mascara_copias, dir->nodo_id)) ||
                  (pagina.msi == DSM_MSI_M && pagina.poseedor == dir->nodo_id));
     if (local) {
+        int escritor = pagina.msi == DSM_MSI_M && pagina.poseedor == dir->nodo_id;
+        if (escritor && proteger(dir, i, PROT_READ) != 0) {
+            pthread_mutex_unlock(&dir->mutex);
+            return -1;
+        }
         memcpy(imagen, dir->vistas[i].c_r, dir->page_size);
+        if (escritor && proteger(dir, i, PROT_READ | PROT_WRITE) != 0) {
+            dir->paginas[i].perdida = 1;
+            pthread_mutex_unlock(&dir->mutex);
+            return -1;
+        }
         pthread_mutex_unlock(&dir->mutex);
         if (desc != NULL) {
             *desc = pagina;
@@ -1644,7 +1700,7 @@ int dsm_directorio_copiar(dsm_directorio_t *dir, uint64_t gpn, void *imagen, siz
     uint16_t poseedor = pagina.poseedor;
     uint32_t version = pagina.version;
     pthread_mutex_unlock(&dir->mutex);
-    if (!remota || dir->nuevo_id == NULL) {
+    if (!remota || dir->nuevo_id == NULL || version == UINT32_MAX) {
         errno = pagina.perdida ? ENOTCONN : EPROTO;
         return -1;
     }
@@ -1667,6 +1723,19 @@ int dsm_directorio_copiar(dsm_directorio_t *dir, uint64_t gpn, void *imagen, siz
         }
     }
     free(tmp);
+    return rc;
+}
+
+int dsm_directorio_copiar(dsm_directorio_t *dir, uint64_t gpn, void *imagen, size_t n,
+                          dsm_pagina_desc_t *desc)
+{
+    if (dir == NULL || !dir->inicializado || imagen == NULL || n < dir->page_size) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&dir->coordinador);
+    int rc = copiar_serializado(dir, gpn, imagen, desc);
+    pthread_mutex_unlock(&dir->coordinador);
     return rc;
 }
 

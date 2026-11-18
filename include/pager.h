@@ -56,6 +56,12 @@ typedef int (*dsm_pager_coherencia_t)(const dsm_pager_peticion_t *peticion,
                                        void *buf, size_t capacidad,
                                        dsm_pager_concesion_t *concesion, void *contexto);
 
+/* El directorio consulta su estado vigente, resuelve la solicitud e instala los
+ * permisos antes de devolver 0. Conserva la responsabilidad de revocar copias y
+ * descartar concesiones antiguas. El callback respeta el plazo absoluto.
+ */
+typedef int (*dsm_pager_fallo_t)(const dsm_pager_peticion_t *peticion, void *contexto);
+
 /* Ar comienza en PROT_NONE y Cr contiene los datos de las paginas S y M.
  * Recibe un descriptor por pagina, en orden, y aplica sus permisos iniciales.
  * El paginador es el unico que cambia estos permisos durante su uso.
@@ -65,6 +71,16 @@ int dsm_pager_iniciar_msi(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t pag
                           uint16_t solicitante, uint32_t timeout_ms,
                           dsm_pager_coherencia_t resolver, void *contexto);
 
+/* El directorio posee las protecciones de Ar durante este modo. paginas aporta
+ * identidades estables. Su estado MSI y version inicial no se usan como cache.
+ * Cada fallo se entrega al callback sin mantener el mutex del paginador.
+ */
+int dsm_pager_iniciar_directorio(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
+                                 size_t max_trabajadores, const dsm_pager_pagina_t *paginas,
+                                 uint16_t solicitante, uint32_t timeout_ms,
+                                 dsm_pager_fallo_t resolver, void *contexto);
+
+/* En modo directorio se consulta el estado en el propio directorio (ENOTSUP). */
 int dsm_pager_consultar_pagina(dsm_pager_t *pager, size_t indice, dsm_pager_pagina_t *pagina);
 
 /* Registrar y desregistrar desde el propio trabajador. Mientras este registrado,

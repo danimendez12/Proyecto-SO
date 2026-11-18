@@ -734,6 +734,7 @@ struct red_par {
     int activo;
     int enviando;
     uint8_t estado;
+    int sonda;
 };
 
 struct red_trabajador {
@@ -908,6 +909,9 @@ static void notificar_estado(dsm_red_t *red, uint16_t par, uint8_t estado)
     pthread_mutex_lock(&red->mutex);
     if (red->pares[par].estado != estado) {
         red->pares[par].estado = estado;
+        if (estado == DSM_NODO_FUERA) {
+            red->pares[par].activo = 0;
+        }
         cambio = 1;
         fn = red->al_estado;
         ctx = red->estado_ctx;
@@ -1007,6 +1011,8 @@ static void atender_conexion(struct red_trabajador *trabajador, uint16_t par)
     for (;;) {
         pthread_mutex_lock(&red->mutex);
         int cerrando = red->cerrando;
+        sonda = sonda || red->pares[par].sonda;
+        red->pares[par].sonda = 0;
         pthread_mutex_unlock(&red->mutex);
         if (cerrando || monotono_ms(&ahora) != 0) {
             break;
@@ -1041,8 +1047,8 @@ static void atender_conexion(struct red_trabajador *trabajador, uint16_t par)
         }
         uint64_t limite = red->self < par ? proximo : silencio;
         int espera = limite > ahora ? (int)(limite - ahora) : 0;
-        if (espera > 60000) {
-            espera = 60000;
+        if (espera > 100) {
+            espera = 100;
         }
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
         int rc = poll(&pfd, 1, espera);
@@ -1063,7 +1069,8 @@ static void atender_conexion(struct red_trabajador *trabajador, uint16_t par)
             cab.destino != red->self) {
             break;
         }
-        if (cab.tipo == DSM_TIPO_HEARTBEAT && cab.banderas == 0 && cab.id_corr == 0) {
+        if (cab.tipo == DSM_TIPO_HEARTBEAT && cab.banderas == 0 &&
+            cab.id_corr == 0 && cab.estado == DSM_ESTADO_OK) {
             dsm_heartbeat_t msg;
             dsm_cabecera_t copia;
             if (dsm_heartbeat_decodificar(trabajador->buf, n, &copia, &msg) != 0 ||
@@ -1073,12 +1080,13 @@ static void atender_conexion(struct red_trabajador *trabajador, uint16_t par)
             fallos = 0;
             silencio = 0;
             if (monotono_ms(&silencio) == 0) {
-                silencio += intervalo;
+                silencio += intervalo + intervalo / 2u;
             }
             notificar_estado(red, par, DSM_NODO_EN_LINEA);
             continue;
         }
-        if (cab.tipo == DSM_TIPO_HEARTBEAT_ACK && cab.banderas == DSM_FLAG_RESPUESTA) {
+        if (cab.tipo == DSM_TIPO_HEARTBEAT_ACK && cab.banderas == DSM_FLAG_RESPUESTA &&
+            cab.id_corr != 0) {
             dsm_heartbeat_t msg;
             dsm_cabecera_t copia;
             if (dsm_heartbeat_decodificar(trabajador->buf, n, &copia, &msg) != 0) {
@@ -1092,12 +1100,26 @@ static void atender_conexion(struct red_trabajador *trabajador, uint16_t par)
             }
             continue;
         }
-        if (cab.tipo == DSM_TIPO_NODE_BYE) {
-            notificar_estado(red, par, DSM_NODO_FUERA);
-            break;
-        }
-        if (cab.tipo == DSM_TIPO_NODE_DOWN_HINT) {
-            sonda = 1;
+        if (cab.tipo == DSM_TIPO_NODE_BYE || cab.tipo == DSM_TIPO_NODE_DOWN_HINT) {
+            dsm_aviso_t aviso;
+            dsm_cabecera_t copia;
+            if (cab.estado != DSM_ESTADO_OK ||
+                dsm_aviso_decodificar(trabajador->buf, n, &copia, &aviso) != 0 ||
+                aviso.node_id >= red->cfg->cantidad_nodos) {
+                break;
+            }
+            if (cab.tipo == DSM_TIPO_NODE_BYE) {
+                if (aviso.node_id != par) {
+                    break;
+                }
+                notificar_estado(red, par, DSM_NODO_FUERA);
+                break;
+            }
+            if (aviso.node_id != red->self) {
+                pthread_mutex_lock(&red->mutex);
+                red->pares[aviso.node_id].sonda = 1;
+                pthread_mutex_unlock(&red->mutex);
+            }
             continue;
         }
         if (red->atender(red->ctx, par, &cab, trabajador->buf, n) != 0) {

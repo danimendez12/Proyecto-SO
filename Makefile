@@ -13,7 +13,7 @@ tests: bin/tests/test_protocol bin/tests/test_memory bin/tests/test_signals
 aceptacion: bin/tests/aceptacion_red bin/tests/aceptacion_memoria bin/tests/aceptacion_directorio \
 	bin/tests/aceptacion_paginador bin/tests/aceptacion_paginacion_remota bin/tests/aceptacion_escritura_local \
 	bin/tests/aceptacion_coherencia \
-	bin/tests/aceptacion_api
+	bin/tests/aceptacion_api bin/tests/aceptacion_escritura_remota
 
 PASO_SRC = src/config.c src/protocol.c src/network.c src/memory.c src/directory.c
 API_SRC = $(PASO_SRC) src/dsm.c src/pager.c src/signals.c
@@ -67,6 +67,10 @@ bin/tests/aceptacion_coherencia: tests/aceptacion_coherencia.c $(PASO_SRC) $(wil
 bin/tests/aceptacion_api: tests/aceptacion_api.c $(API_SRC) $(wildcard include/*.h)
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+bin/tests/aceptacion_escritura_remota: tests/aceptacion_escritura_remota.c bin/dsm_node
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 clean:
 	rm -rf bin

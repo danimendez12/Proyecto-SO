@@ -21,6 +21,20 @@ enum {
 typedef int (*dsm_directorio_envio_t)(void *ctx, uint16_t destino, const uint8_t *trama, size_t n);
 typedef uint32_t (*dsm_directorio_id_t)(void *ctx);
 
+struct dsm_item {
+    uint16_t par;
+    uint16_t n;
+    uint8_t trama[64];
+};
+
+struct dsm_cola {
+    struct dsm_directorio *directorio;
+    struct dsm_item items[DSM_DIR_COLA];
+    size_t inicio;
+    size_t cantidad;
+    pthread_t hilo;
+};
+
 typedef struct dsm_pagina_desc {
     uint64_t gpn;
     uint16_t hogar;
@@ -53,20 +67,17 @@ typedef struct dsm_directorio {
     dsm_vistas_t vistas[DSM_DIR_MAX_VISTAS];
     size_t nvistas;
     pthread_mutex_t mutex;
+    /* Serializa a los iniciadores de campanas. Los receptores y las replicas
+     * completan las respuestas usando solo mutex. */
+    pthread_mutex_t coordinador;
     int inicializado;
     /* Servicio de coherencia. El hilo receptor solo encola. */
     int servicio_activo;
     int servicio_parar;
-    pthread_t servicio_hilo;
+    struct dsm_cola hogar;
+    struct dsm_cola replica;
     pthread_cond_t cola_cv;
     pthread_cond_t campana_cv;
-    struct {
-        uint16_t par;
-        uint16_t n;
-        uint8_t trama[64];
-    } cola[DSM_DIR_COLA];
-    size_t cola_ini;
-    size_t cola_n;
     dsm_directorio_envio_t enviar;
     dsm_directorio_id_t nuevo_id;
     void *envio_ctx;

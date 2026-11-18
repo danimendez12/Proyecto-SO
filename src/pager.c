@@ -22,6 +22,7 @@ struct dsm_pager {
     dsm_pager_pagina_t *paginas;
     unsigned char *imagen;
     dsm_pager_coherencia_t resolver;
+    dsm_pager_fallo_t resolver_directorio;
     uint16_t solicitante;
     uint32_t timeout_ms;
     struct trabajador *trabajadores;
@@ -125,6 +126,18 @@ static int cargar_pagina(dsm_pager_t *pager, size_t indice, dsm_acceso_t acceso)
     }
 
     dsm_pager_pagina_t *pagina = &pager->paginas[indice];
+    if (pager->resolver_directorio != NULL) {
+        dsm_pager_peticion_t peticion = {
+            .pagina = *pagina,
+            .solicitante = pager->solicitante,
+            .acceso = acceso,
+        };
+        if (vence_en(pager->timeout_ms, &peticion.plazo) != 0 ||
+            pager->resolver_directorio(&peticion, pager->datos) != 0) {
+            return DSM_SOLICITUD_ERROR;
+        }
+        return DSM_SOLICITUD_LISTA;
+    }
     if (pagina->msi == DSM_MSI_M ||
         (pagina->msi == DSM_MSI_S && acceso == DSM_FALLO_LECTURA)) {
         return DSM_SOLICITUD_LISTA;
@@ -216,7 +229,7 @@ static void liberar(dsm_pager_t *pager)
 static int iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
                    size_t max_trabajadores, dsm_pager_preparar_t preparar, void *datos,
                    const dsm_pager_pagina_t *paginas, uint16_t solicitante, uint32_t timeout_ms,
-                   dsm_pager_coherencia_t resolver)
+                   dsm_pager_coherencia_t resolver, dsm_pager_fallo_t resolver_directorio)
 {
     if (salida == NULL) {
         return error_con(EINVAL);
@@ -227,7 +240,8 @@ static int iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
         pagina_so <= 0 || page_size == 0 || page_size % (size_t)pagina_so != 0 ||
         vistas->bytes % page_size != 0 || (uintptr_t)vistas->a_r % (size_t)pagina_so != 0 ||
         max_trabajadores == 0 || max_trabajadores > DSM_PAGER_MAX_TRABAJADORES ||
-        (preparar == NULL && (resolver == NULL || paginas == NULL || timeout_ms == 0))) {
+        (preparar == NULL && ((resolver == NULL && resolver_directorio == NULL) ||
+                             paginas == NULL || timeout_ms == 0))) {
         return error_con(EINVAL);
     }
 
@@ -250,14 +264,17 @@ static int iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
     if (pager->paginas == NULL || pager->trabajadores == NULL) {
         goto fallo;
     }
+    if (paginas != NULL) {
+        memcpy(pager->paginas, paginas, cantidad * sizeof *paginas);
+    }
     if (resolver != NULL) {
         pager->imagen = malloc(page_size);
         if (pager->imagen == NULL) {
             goto fallo;
         }
-        memcpy(pager->paginas, paginas, cantidad * sizeof *paginas);
     }
     pager->resolver = resolver;
+    pager->resolver_directorio = resolver_directorio;
     pager->solicitante = solicitante;
     pager->timeout_ms = timeout_ms;
     pager->vistas = vistas;
@@ -294,7 +311,7 @@ static int iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
         pthread_join(pager->hilo, NULL);
         goto fallo_aviso;
     }
-    if (paginas != NULL) {
+    if (paginas != NULL && resolver_directorio == NULL) {
         for (size_t i = 0; i < cantidad; i++) {
             int prot = permisos(paginas[i].msi);
             if (prot != PROT_NONE && dsm_vistas_proteger_pagina(vistas, i, page_size, prot) != 0) {
@@ -321,7 +338,7 @@ int dsm_pager_iniciar(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_si
                       size_t max_trabajadores, dsm_pager_preparar_t preparar, void *datos)
 {
     return iniciar(salida, vistas, page_size, max_trabajadores, preparar, datos,
-                   NULL, 0, 0, NULL);
+                   NULL, 0, 0, NULL, NULL);
 }
 
 int dsm_pager_iniciar_msi(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
@@ -330,13 +347,25 @@ int dsm_pager_iniciar_msi(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t pag
                           dsm_pager_coherencia_t resolver, void *contexto)
 {
     return iniciar(salida, vistas, page_size, max_trabajadores, NULL, contexto,
-                   paginas, solicitante, timeout_ms, resolver);
+                   paginas, solicitante, timeout_ms, resolver, NULL);
+}
+
+int dsm_pager_iniciar_directorio(dsm_pager_t **salida, dsm_vistas_t *vistas, size_t page_size,
+                                 size_t max_trabajadores, const dsm_pager_pagina_t *paginas,
+                                 uint16_t solicitante, uint32_t timeout_ms,
+                                 dsm_pager_fallo_t resolver, void *contexto)
+{
+    return iniciar(salida, vistas, page_size, max_trabajadores, NULL, contexto,
+                   paginas, solicitante, timeout_ms, NULL, resolver);
 }
 
 int dsm_pager_consultar_pagina(dsm_pager_t *pager, size_t indice, dsm_pager_pagina_t *pagina)
 {
     if (pager == NULL || pagina == NULL || indice >= pager->vistas->bytes / pager->page_size) {
         return error_con(EINVAL);
+    }
+    if (pager->resolver_directorio != NULL) {
+        return error_con(ENOTSUP);
     }
     pthread_mutex_lock(&pager->mutex);
     *pagina = pager->paginas[indice];

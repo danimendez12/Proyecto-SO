@@ -1,12 +1,13 @@
 # Proyecto-SO
 
-Este proyecto corresponde al Entregable 2 del curso de Sistemas Operativos.
+Proyecto de los entregables 2 y 3 del curso IC-6600 Principios de Sistemas Operativos.
 El objetivo es implementar en C para Linux un sistema de Memoria Compartida
 Distribuida (DSM) que permita a procesos en distintos nodos acceder a una región
 de memoria compartida.
 
-El Prototipo 1 permite iniciar varios procesos DSM y leer una página remota
-bajo demanda por TCP.
+El Prototipo 2 permite leer y escribir una página compartida desde procesos Linux
+x86-64 independientes. Un fallo sobre la vista de aplicación activa al paginador
+y el hogar coordina por TCP los permisos MSI de esa página.
 
 ## Organización
 
@@ -20,14 +21,15 @@ bajo demanda por TCP.
 | `docs/` | Documentación técnica y evidencias del laboratorio. |
 | `bin/` | Ejecutables generados durante la compilación. |
 
-## Módulos previstos
+## Módulos
 
 | Módulo | Responsabilidad |
 | --- | --- |
 | `dsm` | Coordinar el ciclo de vida del nodo y sus módulos. |
 | `config` | Cargar y validar los parámetros del laboratorio. |
 | `protocol` | Definir el formato y la codificación de los mensajes entre nodos. |
-| `network` | Gestionar la comunicación TCP entre nodos. |
+| `network` | Gestionar las conexiones TCP, los latidos y las reincorporaciones. |
+| `coherence` | Correlacionar las solicitudes del paginador con el hogar y aplicar las respuestas al directorio local. |
 | `memory` | Administrar la región de memoria local y las protecciones de página. |
 | `directory` | Mantener los metadatos de páginas y sus estados de coherencia. |
 | `pager` | Coordinar la atención de fallos de página y la recuperación de datos. |
@@ -44,7 +46,7 @@ los ejecutables correspondientes.
 | `make` | Genera `bin/dsm_node`. |
 | `make examples` | Genera los ejemplos en `bin/examples/`. |
 | `make tests` | Genera los programas de prueba en `bin/tests/`. |
-| `make aceptacion` | Compila los siete binarios de aceptación. |
+| `make aceptacion` | Compila los nueve binarios de aceptación. |
 | `make clean` | Elimina el directorio de salida `bin/`. |
 
 ## Demostración de paginación remota
@@ -96,52 +98,69 @@ configuración es de hasta 16 nodos, limitada en cada archivo por `max_nodos`.
 El menor ID inicia cada conexión y reintenta el alta. El mayor conserva su
 puerto de escucha para sus pares.
 
-## Alcance del paso 6
+## Demostración de escritura coherente
 
-La demostración crea reservas unitarias en el hogar del creador. La apertura
-consulta al creador y la lectura se enruta por el hogar del GPN del manifiesto.
-La transferencia implementada parte de I y requiere una imagen completa.
-La primera concesión de lectura degrada M a S e incrementa la versión. Las
-escrituras distribuidas, las invalidaciones y la asignación en otros hogares
-quedan para pasos posteriores. El alta conserva un latido inicial y una
-ficha WELCOME por conexión. La paginación en este paso se ejercita desde la
-CLI y la API pública del Entregable 1 queda para su integración posterior.
+Ejecutá ambos procesos desde la raíz del proyecto y dejá ambas terminales
+abiertas. El nodo 0 crea la reserva 1 e inicializa la página con `Hola TEC`.
+El último argumento del nodo 1 indica qué reserva abre.
 
-## Paso 10 del Prototipo 2
+~~~bash
+# Terminal del nodo 0
+./bin/dsm_node config/lab.ini 0 interactivo
 
-En Linux x86-64, el manejador usa el bit 1 de `REG_ERR` de `ucontext_t`
-para distinguir un fallo de escritura de uno de lectura. El acceso se
-publica en la ranura del trabajador. El paginador aplica los permisos de
-`Ar` por página según MSI. I corresponde a `PROT_NONE`, S a `PROT_READ`
-y M a `PROT_READ | PROT_WRITE`.
+# Terminal del nodo 1
+./bin/dsm_node config/lab.ini 1 interactivo 1
+~~~
 
-`dsm_pager_iniciar_msi` recibe un adaptador interno para coordinar con la
-División 1. Por cada fallo el adaptador recibe ID de reserva, GPN, nodo
-solicitante, tipo de acceso, estado y versión locales, y un plazo absoluto
-de `CLOCK_MONOTONIC`. Debe resolver el hogar, correlacionar la respuesta y
-devolver antes del plazo con la versión autorizada, la imagen vigente si
-corresponde y la confirmación de exclusividad. Si la página parte de I se
-requiere una imagen completa. Desde S puede omitirse si el hogar confirma
-que la copia local conserva los datos vigentes. Si llega una imagen desde S,
-debe coincidir con Cr para preservar la vista de los lectores activos.
-El paginador exige una
-versión nueva y exclusividad confirmada para conceder M. La consulta al
-adaptador se realiza sin el mutex del paginador. Ante error o vencimiento,
-el trabajador termina por SIGSEGV según la política existente.
+Cuando ambos indiquen `listo reserva 1`, ingresá un comando por línea en la
+terminal indicada y esperá su resultado antes de pasar al siguiente.
 
-La integración de producción requiere acordar el adaptador que completa la
-solicitud después de las confirmaciones de invalidación. También debe
-coordinar la instalación de la concesión con las revocaciones posteriores,
-incluida la actualización de metadatos y permisos locales, y liberar o
-revocar una concesión si su instalación falla. Los nombres internos del
-paginador no forman parte del protocolo ni del API público.
-La CLI continúa usando la entrada de lectura del Prototipo 1. El proveedor
-de prueba de escritura vive en la aceptación local.
+| Paso | Terminal | Comando | Resultado observable |
+| --- | --- | --- | --- |
+| 1 | Nodo 1 | `leer` | Lee `Hola TEC` tras recibir 4096 bytes. |
+| 2 | Ambas | `estado` | Ambas copias están S, versión 1. |
+| 3 | Nodo 1 | `escribir` | Un fallo de escritura sobre Ar inicia la exclusividad y la instrucción escribe `Adios TEC`. |
+| 4 | Ambas | `estado` | Nodo 0 local I y nodo 1 M. El hogar identifica al poseedor 1 en la versión 2. |
+| 5 | Nodo 0 | `leer` | El poseedor devuelve su imagen y el hogar lee `Adios TEC`. |
+| 6 | Ambas | `estado` | S en ambos, versión 3. Otra lectura local conserva estos permisos. |
+| 7 | Ambas | `salir` | Cada proceso desregistra su trabajador y cierra el servicio. |
 
-La aceptación remota de escritura, una vez integrada la División 1, deberá
-comprobar S en ambos nodos, invalidación de `Ar` del nodo 0 antes de conceder
-M al nodo 1, escritura directa de `Adios TEC`, lectura posterior del nodo 0
-con los datos actualizados, versiones coherentes y un único poseedor M.
+Para repetirlo en dos computadoras Linux Mint, usá el mismo código e INI en
+ambas. Cambiá únicamente las dos IPv4 de `config/lab.ini` por las de los
+equipos y ejecutá cada comando en la máquina del nodo correspondiente.
+Los puertos configurados son 27200 y 27201. El modo `servir` del Prototipo 1
+sigue disponible con su interfaz anterior.
+
+## Paginador y directorio del Prototipo 2
+
+En Linux x86-64, el manejador distingue la lectura de la escritura con el bit
+de escritura de `REG_ERR`. Publica el fallo en la ranura del trabajador,
+notifica al paginador con `sem_post` y espera con `sigsuspend`. El paginador
+reanuda al hilo con `SIGUSR1`. Un fallo ajeno a la ventana o una solicitud
+que fracasa termina el proceso con `SIGSEGV`.
+
+El paginador distribuido delega cada fallo al directorio a través de
+`coherence`. El directorio controla conjuntamente los datos, los metadatos y
+el permiso real de Ar. I corresponde a `PROT_NONE`, S a `PROT_READ` y M a
+`PROT_READ | PROT_WRITE`. El modo MSI local del Paso 10 conserva su adaptador
+para ejercitar las concesiones con un proveedor controlado.
+
+El hogar serializa las solicitudes de su página. Para una promoción remota
+desde S, el escritor inicia la operación pidiendo al hogar retirar su propia
+copia mediante `INVALIDATE`. El ACK identifica la solicitud de escritura.
+Al procesar `PAGE_REQUEST`, el hogar vuelve a examinar todas las copias,
+invalida las réplicas y espera sus confirmaciones. Una contribución en S
+puede conservar una imagen vigente en Cr aunque su Ar esté revocada.
+Cuando el poseedor M es remoto, el hogar le pide `PAGE_DOWNGRADE`, recibe
+la imagen vigente y su confirmación, y responde al solicitante. Una
+promoción S vigente puede recibir una concesión sin carga. Desde I se exige
+la imagen completa antes de habilitar Ar.
+
+Cada conexión tiene un lector. Las respuestas de página se correlacionan e
+instalan en ese lector. Dos colas por nodo separan las campañas iniciadas
+como hogar de las revocaciones que debe atender como réplica. Una página
+con poseedor perdido queda indisponible. Una copia compartida desconectada
+sigue contando hasta que el hogar obtiene una confirmación de invalidación.
 
 ## API local del Prototipo 2
 
@@ -175,12 +194,11 @@ La liberación local desmonta la única reserva del contexto. Las consultas
 públicas de nodos y páginas y la impresión de estado quedan pendientes.
 
 La apertura remota y `dsm_desvincular_reserva` de una vista remota devuelven
-`DSM_ERR_NODO` en esta entrada local. Para integrarlas se necesita extraer
-de la CLI el despacho y la correlación de RPC, con un único lector por
-conexión, y exponer la apertura `REGION_LOOKUP/INFO` y el cierre
-`REGION_CLOSE`. Las escrituras distribuidas requieren el adaptador MSI
-real, sus plazos y la coordinación de revocaciones y versiones descrita
-en el Paso 10.
+`DSM_ERR_NODO` en esta entrada local. El servicio interno ya expone el intercambio
+`REGION_LOOKUP/INFO`. El API público prepara y registra trabajadores sobre
+su única vista local antes de publicar la reserva. Permitir abrir y cerrar
+también una vista remota requiere gestionar la vida de las demás ventanas,
+sus trabajadores y la desvinculación de las copias en el hogar.
 
 ## Pruebas de aceptación
 
@@ -195,9 +213,17 @@ timeout -k 1s 15s ./bin/tests/aceptacion_paginador
 timeout -k 1s 30s ./bin/tests/aceptacion_paginacion_remota
 timeout -k 1s 20s ./bin/tests/aceptacion_escritura_local
 timeout -k 1s 20s ./bin/tests/aceptacion_api
+timeout -k 1s 30s ./bin/tests/aceptacion_coherencia
+timeout -k 1s 45s ./bin/tests/aceptacion_escritura_remota
 ```
 
 La aceptación de paginación remota ejecuta dos procesos en loopback y después tres procesos
 activos en orden 2, 0, 3. En ese segundo escenario el nodo 2 lee del hogar 3
 mientras el nodo 1 permanece apagado. Usa aportes distintos para comprobar
 el GPN calculado por suma acumulada.
+
+La aceptación de escritura remota lanza procesos independientes, verifica los
+permisos de cada Ar en `/proc/<pid>/maps` y recupera las escrituras mediante
+lecturas reales. El segundo escenario enfrenta dos escritores sobre bytes
+distintos de la misma página con el hogar en el nodo 3. `demo_reader` y los
+programas `test_*` son plantillas compilables.
