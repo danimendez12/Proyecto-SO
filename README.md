@@ -17,6 +17,7 @@ el hogar de la página coordina por TCP sus permisos MSI.
 | `include/` | Cabeceras de los módulos. |
 | `src/` | Módulos en C y punto de entrada del nodo (`main.c`). |
 | `examples/` | Aplicaciones creadora y lectora que usan el API público. |
+| `apps/matrices/` | Multiplicación de matrices con Pthreads, reservas DSM multihogar y verificación numérica. |
 | `tests/` | Pruebas de aceptación de red, memoria, directorio y paginación. |
 | `config/` | Configuraciones locales de dos y tres nodos y plantilla para ocho nodos. |
 | `docs/` | Documentación técnica y evidencias del laboratorio. |
@@ -46,8 +47,9 @@ los ejecutables correspondientes.
 | --- | --- |
 | `make` | Genera `bin/dsm_node`. |
 | `make examples` | Genera los ejemplos en `bin/examples/`. |
+| `make apps` | Compila la aplicación de matrices y la referencia secuencial original. |
 | `make tests` | Genera los programas de prueba en `bin/tests/`. |
-| `make aceptacion` | Compila los quince binarios de aceptación. |
+| `make aceptacion` | Compila las quince aceptaciones del DSM y la aceptación de matrices. |
 | `make clean` | Elimina el directorio de salida `bin/`. |
 
 ## Demostración de paginación remota
@@ -290,6 +292,10 @@ mismo en el creador y finalmente en el hogar 1.
 
 ## Pruebas de aceptación
 
+Para el Paso 12A, consultá la guía de la aplicación con los comandos de
+tres terminales, las configuraciones para el TEC y las mediciones.
+[Multiplicación de matrices con Pthreads y DSM](apps/matrices/README.md)
+
 Desde la raíz del proyecto en Linux x86-64, con los puertos del INI libres:
 
 ```bash
@@ -297,6 +303,7 @@ set -e
 make clean
 make
 make examples tests aceptacion
+timeout -k 2s 90s ./bin/tests/aceptacion_app_matrices
 for prueba in red memoria directorio paginador paginacion_remota escritura_local \
               api coherencia escritura_remota api_remoto multipagina multipagina_remota api_errores
 do

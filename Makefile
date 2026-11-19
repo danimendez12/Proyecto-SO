@@ -7,9 +7,11 @@ ACEPTACIONES_API = bin/tests/aceptacion_api bin/tests/aceptacion_api_remoto \
 	bin/tests/aceptacion_api_errores bin/tests/aceptacion_multihogar \
 	bin/tests/aceptacion_multihogar_errores
 
-.PHONY: all examples tests aceptacion clean
+.PHONY: all apps examples tests aceptacion clean
 
 all: bin/dsm_node
+
+apps: bin/apps/matrices bin/apps/matrices_secuencial
 
 examples: bin/examples/demo_creator bin/examples/demo_reader
 
@@ -17,10 +19,28 @@ tests: bin/tests/test_protocol bin/tests/test_memory bin/tests/test_signals
 
 aceptacion: bin/tests/aceptacion_red bin/tests/aceptacion_memoria bin/tests/aceptacion_directorio \
 	bin/tests/aceptacion_paginador bin/tests/aceptacion_paginacion_remota bin/tests/aceptacion_escritura_local \
-	bin/tests/aceptacion_coherencia bin/tests/aceptacion_escritura_remota $(ACEPTACIONES_API)
+	bin/tests/aceptacion_coherencia bin/tests/aceptacion_escritura_remota $(ACEPTACIONES_API) \
+	bin/tests/aceptacion_app_matrices
 
 PASO_SRC = src/config.c src/protocol.c src/network.c src/memory.c src/directory.c
 API_SRC = $(PASO_SRC) src/dsm.c src/pager.c src/signals.c src/coherence.c
+MATRICES_CFLAGS ?= -O2
+
+bin/apps/matrices: $(wildcard apps/matrices/*.c) $(wildcard apps/matrices/*.h) \
+	$(API_SRC) $(wildcard include/*.h)
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(MATRICES_CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+# Las fuentes originales MIT se conservan sin cambios, con su compilacion secuencial.
+bin/apps/matrices_secuencial: apps/matrices/original/src/sequential.c \
+	apps/matrices/original/src/matrix.c apps/matrices/original/src/matrix.h
+	mkdir -p $(@D)
+	$(CC) -std=c11 -O2 $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+bin/tests/aceptacion_app_matrices: tests/aceptacion_app_matrices.c bin/apps/matrices \
+	bin/apps/matrices_secuencial
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 bin/dsm_node: $(wildcard src/*.c) $(wildcard include/*.h)
 	mkdir -p $(@D)
