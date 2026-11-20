@@ -274,6 +274,174 @@ int dsm_heartbeat_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
     return 0;
 }
 
+static int cabecera_pedido(const dsm_cabecera_t *cab, uint8_t tipo)
+{
+    return cab != NULL && cab->tipo == tipo && cab->banderas == 0 && cab->id_corr == 0 &&
+           cab->estado == DSM_ESTADO_OK;
+}
+
+static int cabecera_respuesta(const dsm_cabecera_t *cab, uint8_t tipo)
+{
+    return cab != NULL && cab->tipo == tipo && cab->banderas == DSM_FLAG_RESPUESTA &&
+           cab->id_corr != 0;
+}
+
+int dsm_aviso_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab, const dsm_aviso_t *msg,
+                        size_t *out)
+{
+    if (msg == NULL || out == NULL || cab == NULL ||
+        (cab->tipo != DSM_TIPO_NODE_BYE && cab->tipo != DSM_TIPO_NODE_DOWN_HINT) ||
+        cab->banderas != 0 || cab->id_corr != 0) {
+        return -1;
+    }
+    if (preparar(dst, cap, cab, DSM_AVISO_BYTES) != 0) {
+        return -1;
+    }
+    put_u16(dst + 32, msg->node_id);
+    put_u16(dst + 34, msg->razon);
+    *out = DSM_AVISO_BYTES;
+    return 0;
+}
+
+int dsm_aviso_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, dsm_aviso_t *msg)
+{
+    if (msg == NULL || n != DSM_AVISO_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0) {
+        return -1;
+    }
+    if ((cab->tipo != DSM_TIPO_NODE_BYE && cab->tipo != DSM_TIPO_NODE_DOWN_HINT) ||
+        cab->banderas != 0 || cab->id_corr != 0 || cab->longitud != DSM_AVISO_BYTES) {
+        return -1;
+    }
+    msg->node_id = get_u16(src + 32);
+    msg->razon = get_u16(src + 34);
+    return 0;
+}
+
+int dsm_downgrade_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                            const dsm_downgrade_t *msg, size_t *out)
+{
+    if (!cabecera_pedido(cab, DSM_TIPO_PAGE_DOWNGRADE) || msg == NULL ||
+        out == NULL || msg->id_solicitud == 0 || msg->motivo > DSM_MOTIVO_A_I ||
+        preparar(dst, cap, cab, DSM_CONTROL_BYTES) != 0) {
+        return -1;
+    }
+    put_u64(dst + 32, msg->gpn);
+    put_u32(dst + 40, msg->id_solicitud);
+    put_u16(dst + 44, msg->solicitante);
+    dst[46] = msg->motivo;
+    *out = DSM_CONTROL_BYTES;
+    return 0;
+}
+
+int dsm_downgrade_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                              dsm_downgrade_t *msg)
+{
+    if (msg == NULL || n != DSM_CONTROL_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        !cabecera_pedido(cab, DSM_TIPO_PAGE_DOWNGRADE) || cab->longitud != DSM_CONTROL_BYTES ||
+        get_u32(src + 40) == 0 || src[46] > DSM_MOTIVO_A_I) {
+        return -1;
+    }
+    *msg = (dsm_downgrade_t){
+        .gpn = get_u64(src + 32),
+        .id_solicitud = get_u32(src + 40),
+        .solicitante = get_u16(src + 44),
+        .motivo = src[46],
+    };
+    return 0;
+}
+
+int dsm_downgrade_ack_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                const dsm_downgrade_ack_t *msg, size_t *out)
+{
+    if (!cabecera_respuesta(cab, DSM_TIPO_PAGE_DOWNGRADE_ACK) || msg == NULL ||
+        out == NULL || msg->id_solicitud == 0 || msg->resultado > DSM_DOWNGRADE_NO_M ||
+        preparar(dst, cap, cab, DSM_CONTROL_BYTES) != 0) {
+        return -1;
+    }
+    put_u64(dst + 32, msg->gpn);
+    put_u32(dst + 40, msg->id_solicitud);
+    put_u16(dst + 44, msg->resultado);
+    *out = DSM_CONTROL_BYTES;
+    return 0;
+}
+
+int dsm_downgrade_ack_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                  dsm_downgrade_ack_t *msg)
+{
+    if (msg == NULL || n != DSM_CONTROL_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        !cabecera_respuesta(cab, DSM_TIPO_PAGE_DOWNGRADE_ACK) || cab->longitud != DSM_CONTROL_BYTES ||
+        get_u32(src + 40) == 0 || get_u16(src + 44) > DSM_DOWNGRADE_NO_M) {
+        return -1;
+    }
+    *msg = (dsm_downgrade_ack_t){
+        .gpn = get_u64(src + 32),
+        .id_solicitud = get_u32(src + 40),
+        .resultado = get_u16(src + 44),
+    };
+    return 0;
+}
+
+int dsm_invalidate_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                             const dsm_invalidate_t *msg, size_t *out)
+{
+    if (!cabecera_pedido(cab, DSM_TIPO_INVALIDATE) || msg == NULL ||
+        out == NULL || msg->id_solicitud == 0 || preparar(dst, cap, cab, DSM_CONTROL_BYTES) != 0) {
+        return -1;
+    }
+    put_u64(dst + 32, msg->gpn);
+    put_u32(dst + 40, msg->id_solicitud);
+    put_u16(dst + 44, msg->escritor);
+    *out = DSM_CONTROL_BYTES;
+    return 0;
+}
+
+int dsm_invalidate_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                               dsm_invalidate_t *msg)
+{
+    if (msg == NULL || n != DSM_CONTROL_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        !cabecera_pedido(cab, DSM_TIPO_INVALIDATE) || cab->longitud != DSM_CONTROL_BYTES ||
+        get_u32(src + 40) == 0) {
+        return -1;
+    }
+    *msg = (dsm_invalidate_t){
+        .gpn = get_u64(src + 32),
+        .id_solicitud = get_u32(src + 40),
+        .escritor = get_u16(src + 44),
+    };
+    return 0;
+}
+
+int dsm_invalidate_ack_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                 const dsm_invalidate_ack_t *msg, size_t *out)
+{
+    if (!cabecera_respuesta(cab, DSM_TIPO_INVALIDATE_ACK) || msg == NULL ||
+        out == NULL || msg->id_solicitud == 0 || msg->resultado > DSM_INVALIDA_YA_I ||
+        preparar(dst, cap, cab, DSM_CONTROL_BYTES) != 0) {
+        return -1;
+    }
+    put_u64(dst + 32, msg->gpn);
+    put_u32(dst + 40, msg->id_solicitud);
+    put_u16(dst + 44, msg->resultado);
+    *out = DSM_CONTROL_BYTES;
+    return 0;
+}
+
+int dsm_invalidate_ack_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                   dsm_invalidate_ack_t *msg)
+{
+    if (msg == NULL || n != DSM_CONTROL_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        !cabecera_respuesta(cab, DSM_TIPO_INVALIDATE_ACK) || cab->longitud != DSM_CONTROL_BYTES ||
+        get_u32(src + 40) == 0 || get_u16(src + 44) > DSM_INVALIDA_YA_I) {
+        return -1;
+    }
+    *msg = (dsm_invalidate_ack_t){
+        .gpn = get_u64(src + 32),
+        .id_solicitud = get_u32(src + 40),
+        .resultado = get_u16(src + 44),
+    };
+    return 0;
+}
+
 static int cabecera_page_request_valida(const dsm_cabecera_t *cab)
 {
     return cab != NULL && cab->tipo == DSM_TIPO_PAGE_REQUEST && cab->banderas == 0 &&
@@ -285,21 +453,29 @@ int dsm_page_request_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
 {
     if (!cabecera_page_request_valida(cab) || msg == NULL || out == NULL ||
         msg->acceso > DSM_ACCESO_ESCRITURA || msg->msi > DSM_MSI_M ||
-        preparar(dst, cap, cab, DSM_PAGE_REQUEST_BYTES) != 0) {
+        (msg->reserva_id != 0 && (uint16_t)msg->reserva_id == 0)) {
+        return -1;
+    }
+    uint32_t longitud = msg->reserva_id == 0 ? DSM_PAGE_REQUEST_BYTES : DSM_PAGE_REQUEST_MAP_BYTES;
+    if (preparar(dst, cap, cab, longitud) != 0) {
         return -1;
     }
     put_u64(dst + 32, msg->gpn);
     put_u32(dst + 40, msg->proc_id);
     dst[44] = msg->acceso;
     dst[45] = msg->msi;
-    *out = DSM_PAGE_REQUEST_BYTES;
+    if (msg->reserva_id != 0) {
+        put_u32(dst + 48, msg->reserva_id);
+        put_u32(dst + 52, msg->orden);
+    }
+    *out = longitud;
     return 0;
 }
 
 int dsm_page_request_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
                                   dsm_page_request_t *msg)
 {
-    if (msg == NULL || n != DSM_PAGE_REQUEST_BYTES ||
+    if (msg == NULL || (n != DSM_PAGE_REQUEST_BYTES && n != DSM_PAGE_REQUEST_MAP_BYTES) ||
         dsm_cabecera_decodificar(src, n, cab) != 0 || !cabecera_page_request_valida(cab) ||
         src[44] > DSM_ACCESO_ESCRITURA || src[45] > DSM_MSI_M) {
         return -1;
@@ -310,6 +486,13 @@ int dsm_page_request_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *c
         .acceso = src[44],
         .msi = src[45],
     };
+    if (n == DSM_PAGE_REQUEST_MAP_BYTES) {
+        msg->reserva_id = get_u32(src + 48);
+        msg->orden = get_u32(src + 52);
+        if ((uint16_t)msg->reserva_id == 0) {
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -436,6 +619,81 @@ int dsm_region_lookup_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *
     return 0;
 }
 
+static int cabecera_cierre_valida(const dsm_cabecera_t *cab)
+{
+    return cabecera_pedido(cab, DSM_TIPO_REGION_CLOSE) ||
+           cabecera_respuesta(cab, DSM_TIPO_REGION_CLOSE_ACK) ||
+           cabecera_pedido(cab, DSM_TIPO_REGION_COPY_CLOSE) ||
+           cabecera_respuesta(cab, DSM_TIPO_REGION_COPY_CLOSE_ACK);
+}
+
+int dsm_region_cierre_codificar(uint8_t *buf, size_t cap, dsm_cabecera_t *cab,
+                                uint32_t reserva, size_t *out)
+{
+    if (!cabecera_cierre_valida(cab) || (uint16_t)reserva == 0 || out == NULL ||
+        preparar(buf, cap, cab, DSM_REGION_CIERRE_BYTES) != 0) {
+        return -1;
+    }
+    put_u32(buf + 32, reserva);
+    put_u16(buf + 36, cab->estado);
+    *out = DSM_REGION_CIERRE_BYTES;
+    return 0;
+}
+
+int dsm_region_cierre_decodificar(const uint8_t *buf, size_t n, dsm_cabecera_t *cab,
+                                  uint32_t *reserva)
+{
+    if (reserva == NULL || n != DSM_REGION_CIERRE_BYTES ||
+        dsm_cabecera_decodificar(buf, n, cab) != 0 || !cabecera_cierre_valida(cab) ||
+        get_u16(buf + 36) != cab->estado || get_u16(buf + 38) != 0 ||
+        (uint16_t)get_u32(buf + 32) == 0) {
+        return -1;
+    }
+    *reserva = get_u32(buf + 32);
+    return 0;
+}
+
+static void escribir_info(uint8_t *p, const dsm_region_info_t *msg)
+{
+    put_u32(p + 0, msg->reserva_id);
+    put_u32(p + 4, msg->total_tramos);
+    put_u64(p + 8, msg->tamano_bytes);
+    put_u32(p + 16, msg->primer_tramo);
+    put_u32(p + 20, msg->cantidad_tramos);
+    put_u32(p + 24, msg->total_paginas);
+    for (uint32_t i = 0; i < msg->cantidad_tramos; i++) {
+        uint8_t *tramo = p + 28 + (size_t)i * 16u;
+        put_u32(tramo + 0, msg->tramos[i].orden_inicial);
+        put_u32(tramo + 4, msg->tramos[i].cantidad);
+        put_u64(tramo + 8, msg->tramos[i].gpn_inicial);
+    }
+}
+
+static int leer_info(const uint8_t *p, size_t n, dsm_region_info_t *msg)
+{
+    if (n < 28 || (n - 28u) % 16u != 0) {
+        return -1;
+    }
+    size_t cantidad = (n - 28u) / 16u;
+    if (cantidad > DSM_MAX_TRAMOS || get_u32(p + 20) != cantidad) {
+        return -1;
+    }
+    memset(msg, 0, sizeof *msg);
+    msg->reserva_id = get_u32(p + 0);
+    msg->total_tramos = get_u32(p + 4);
+    msg->tamano_bytes = get_u64(p + 8);
+    msg->primer_tramo = get_u32(p + 16);
+    msg->cantidad_tramos = (uint32_t)cantidad;
+    msg->total_paginas = get_u32(p + 24);
+    for (size_t i = 0; i < cantidad; i++) {
+        const uint8_t *tramo = p + 28 + i * 16u;
+        msg->tramos[i].orden_inicial = get_u32(tramo + 0);
+        msg->tramos[i].cantidad = get_u32(tramo + 4);
+        msg->tramos[i].gpn_inicial = get_u64(tramo + 8);
+    }
+    return 0;
+}
+
 int dsm_region_info_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                               const dsm_region_info_t *msg, size_t *out)
 {
@@ -446,18 +704,7 @@ int dsm_region_info_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
     if (preparar(dst, cap, cab, longitud) != 0) {
         return -1;
     }
-    put_u32(dst + 32, msg->reserva_id);
-    put_u32(dst + 36, msg->total_tramos);
-    put_u64(dst + 40, msg->tamano_bytes);
-    put_u32(dst + 48, msg->primer_tramo);
-    put_u32(dst + 52, msg->cantidad_tramos);
-    put_u32(dst + 56, msg->total_paginas);
-    for (uint32_t i = 0; i < msg->cantidad_tramos; i++) {
-        uint8_t *p = dst + 60 + (size_t)i * 16u;
-        put_u32(p + 0, msg->tramos[i].orden_inicial);
-        put_u32(p + 4, msg->tramos[i].cantidad);
-        put_u64(p + 8, msg->tramos[i].gpn_inicial);
-    }
+    escribir_info(dst + DSM_CABECERA_BYTES, msg);
     *out = longitud;
     return 0;
 }
@@ -465,38 +712,103 @@ int dsm_region_info_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
 int dsm_region_info_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
                                 dsm_region_info_t *msg)
 {
-    if (msg == NULL || dsm_cabecera_decodificar(src, n, cab) != 0) {
-        return -1;
-    }
-    if (cab->tipo != DSM_TIPO_REGION_INFO || n != cab->longitud) {
+    if (msg == NULL || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        cab->tipo != DSM_TIPO_REGION_INFO || n != cab->longitud) {
         return -1;
     }
     if (cab->estado != DSM_ESTADO_OK) {
-        if (cab->longitud != DSM_CABECERA_BYTES) {
+        if (n != DSM_CABECERA_BYTES) {
             return -1;
         }
         memset(msg, 0, sizeof *msg);
         return 0;
     }
-    if (cab->longitud < 60 || (cab->longitud - 60u) % 16u != 0) {
+    return leer_info(src + DSM_CABECERA_BYTES, n - DSM_CABECERA_BYTES, msg);
+}
+
+static int cabecera_capacidad_valida(const dsm_cabecera_t *cab)
+{
+    if (cab == NULL || cab->tipo < DSM_TIPO_CAP_PREPARE ||
+        cab->tipo > DSM_TIPO_CAP_RELEASE_ACK) {
+        return 0;
+    }
+    return (cab->tipo & 1u) ? cabecera_respuesta(cab, cab->tipo) :
+                              cabecera_pedido(cab, cab->tipo);
+}
+
+static int capacidad_valida(const dsm_cabecera_t *cab, const dsm_capacidad_t *msg)
+{
+    if (!cabecera_capacidad_valida(cab) || msg == NULL || msg->token == 0 ||
+        (uint16_t)msg->reserva_id == 0) {
+        return 0;
+    }
+    if (cab->tipo == DSM_TIPO_CAP_PREPARE || cab->tipo == DSM_TIPO_CAP_PREPARE_ACK) {
+        if (msg->max_paginas == 0 || msg->max_tramos == 0 ||
+            msg->max_tramos > DSM_TRAMOS_POR_HOGAR ||
+            msg->orden > UINT32_MAX - msg->max_paginas) {
+            return 0;
+        }
+    } else if (msg->orden != 0 || msg->max_paginas != 0 || msg->max_tramos != 0) {
+        return 0;
+    }
+    if (cab->estado == DSM_ESTADO_OK &&
+        (cab->tipo == DSM_TIPO_CAP_COMMIT || cab->tipo == DSM_TIPO_CAP_PREPARE_ACK)) {
+        return msg->info.reserva_id == msg->reserva_id &&
+               msg->info.cantidad_tramos <= DSM_MAX_TRAMOS &&
+               msg->info.cantidad_tramos != 0 && msg->info.total_paginas != 0;
+    }
+    return 1;
+}
+
+int dsm_capacidad_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                             const dsm_capacidad_t *msg, size_t *out)
+{
+    if (out == NULL || !capacidad_valida(cab, msg)) {
         return -1;
     }
-    uint32_t cantidad = (cab->longitud - 60u) / 16u;
-    if (cantidad > DSM_MAX_TRAMOS || get_u32(src + 52) != cantidad) {
+    int manifiesto = cab->estado == DSM_ESTADO_OK &&
+                     (cab->tipo == DSM_TIPO_CAP_COMMIT || cab->tipo == DSM_TIPO_CAP_PREPARE_ACK);
+    uint32_t longitud = DSM_CAPACIDAD_BASE_BYTES;
+    if (manifiesto) {
+        longitud += 28u + 16u * msg->info.cantidad_tramos;
+    }
+    if (preparar(dst, cap, cab, longitud) != 0) {
+        return -1;
+    }
+    put_u32(dst + 32, msg->reserva_id);
+    put_u32(dst + 36, msg->orden);
+    put_u32(dst + 40, msg->max_paginas);
+    put_u32(dst + 44, msg->max_tramos);
+    put_u64(dst + 48, msg->token);
+    if (manifiesto) {
+        escribir_info(dst + DSM_CAPACIDAD_BASE_BYTES, &msg->info);
+    }
+    *out = longitud;
+    return 0;
+}
+
+int dsm_capacidad_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                               dsm_capacidad_t *msg)
+{
+    if (msg == NULL || n < DSM_CAPACIDAD_BASE_BYTES || n > DSM_CAPACIDAD_MAX ||
+        dsm_cabecera_decodificar(src, n, cab) != 0 || n != cab->longitud ||
+        !cabecera_capacidad_valida(cab)) {
         return -1;
     }
     memset(msg, 0, sizeof *msg);
     msg->reserva_id = get_u32(src + 32);
-    msg->total_tramos = get_u32(src + 36);
-    msg->tamano_bytes = get_u64(src + 40);
-    msg->primer_tramo = get_u32(src + 48);
-    msg->cantidad_tramos = cantidad;
-    msg->total_paginas = get_u32(src + 56);
-    for (uint32_t i = 0; i < cantidad; i++) {
-        const uint8_t *p = src + 60 + (size_t)i * 16u;
-        msg->tramos[i].orden_inicial = get_u32(p + 0);
-        msg->tramos[i].cantidad = get_u32(p + 4);
-        msg->tramos[i].gpn_inicial = get_u64(p + 8);
+    msg->orden = get_u32(src + 36);
+    msg->max_paginas = get_u32(src + 40);
+    msg->max_tramos = get_u32(src + 44);
+    msg->token = get_u64(src + 48);
+    int manifiesto = cab->estado == DSM_ESTADO_OK &&
+                     (cab->tipo == DSM_TIPO_CAP_COMMIT || cab->tipo == DSM_TIPO_CAP_PREPARE_ACK);
+    if (manifiesto) {
+        if (leer_info(src + DSM_CAPACIDAD_BASE_BYTES, n - DSM_CAPACIDAD_BASE_BYTES, &msg->info) != 0) {
+            return -1;
+        }
+    } else if (n != DSM_CAPACIDAD_BASE_BYTES) {
+        return -1;
     }
-    return 0;
+    return capacidad_valida(cab, msg) ? 0 : -1;
 }

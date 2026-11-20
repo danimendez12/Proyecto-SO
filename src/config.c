@@ -87,6 +87,8 @@ static void predeterminados(dsm_config_t *cfg)
     cfg->heartbeat_intervalo_ms = 1000;
     cfg->heartbeat_fallos = 3;
     cfg->rpc_timeout_ms = 2000;
+    cfg->puerto_rango_inicio = DSM_CONFIG_PUERTO_MIN;
+    cfg->puerto_rango_fin = DSM_CONFIG_PUERTO_MAX;
 }
 
 static int memoria_valida(uint64_t bytes, uint32_t page_size)

@@ -14,12 +14,28 @@ enum {
     DSM_SOLICITUD_ERROR
 };
 
+typedef enum dsm_acceso {
+    DSM_FALLO_LECTURA,
+    DSM_FALLO_ESCRITURA
+} dsm_acceso_t;
+
+/* Los nodos publicados se conservan mientras haya trabajadores registrados. */
+typedef struct dsm_ventana_senal {
+    uintptr_t base;
+    size_t bytes;
+    size_t page_size;
+    struct dsm_ventana_senal *siguiente;
+} dsm_ventana_senal_t;
+
 typedef struct dsm_solicitud {
     atomic_int estado;
     uintptr_t base;
     size_t bytes;
     size_t page_size;
     size_t pagina;
+    dsm_acceso_t acceso;
+    const _Atomic(dsm_ventana_senal_t *) *ventanas;
+    dsm_ventana_senal_t *ventana;
     sem_t *aviso;
     int usr1_bloqueada;
 } dsm_solicitud_t;

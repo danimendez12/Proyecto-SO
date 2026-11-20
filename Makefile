@@ -2,26 +2,66 @@ CC = gcc
 CPPFLAGS += -Iinclude -D_GNU_SOURCE
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -pthread
 
-.PHONY: all examples tests aceptacion clean
+ACEPTACIONES_API = bin/tests/aceptacion_api bin/tests/aceptacion_api_remoto \
+	bin/tests/aceptacion_multipagina bin/tests/aceptacion_multipagina_remota \
+	bin/tests/aceptacion_api_errores bin/tests/aceptacion_multihogar \
+	bin/tests/aceptacion_multihogar_errores
+
+.PHONY: all apps examples tests aceptacion clean
 
 all: bin/dsm_node
+
+apps: bin/apps/matrices bin/apps/matrices_secuencial bin/apps/mergesort
 
 examples: bin/examples/demo_creator bin/examples/demo_reader
 
 tests: bin/tests/test_protocol bin/tests/test_memory bin/tests/test_signals
 
 aceptacion: bin/tests/aceptacion_red bin/tests/aceptacion_memoria bin/tests/aceptacion_directorio \
-	bin/tests/aceptacion_paginador bin/tests/aceptacion_paginacion_remota
+	bin/tests/aceptacion_paginador bin/tests/aceptacion_paginacion_remota bin/tests/aceptacion_escritura_local \
+	bin/tests/aceptacion_coherencia bin/tests/aceptacion_escritura_remota $(ACEPTACIONES_API) \
+	bin/tests/aceptacion_app_matrices bin/tests/aceptacion_app_mergesort
 
 PASO_SRC = src/config.c src/protocol.c src/network.c src/memory.c src/directory.c
+API_SRC = $(PASO_SRC) src/dsm.c src/pager.c src/signals.c src/coherence.c
+MATRICES_CFLAGS ?= -O2
+MERGESORT_CFLAGS ?= -O2
+MERGESORT_MOD = $(filter-out apps/mergesort/main.c,$(wildcard apps/mergesort/*.c))
+
+bin/apps/mergesort: $(wildcard apps/mergesort/*.c) $(wildcard apps/mergesort/*.h) \
+	$(API_SRC) $(wildcard include/*.h)
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(MERGESORT_CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+bin/tests/aceptacion_app_mergesort: tests/aceptacion_app_mergesort.c \
+	$(MERGESORT_MOD) $(wildcard apps/mergesort/*.h) $(API_SRC) $(wildcard include/*.h) \
+	bin/apps/mergesort apps/mergesort/prueba_red.sh config/mergesort-lab.ini
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(MERGESORT_CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+bin/apps/matrices: $(wildcard apps/matrices/*.c) $(wildcard apps/matrices/*.h) \
+	$(API_SRC) $(wildcard include/*.h)
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(MATRICES_CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+# Las fuentes originales MIT se conservan sin cambios, con su compilacion secuencial.
+bin/apps/matrices_secuencial: apps/matrices/original/src/sequential.c \
+	apps/matrices/original/src/matrix.c apps/matrices/original/src/matrix.h
+	mkdir -p $(@D)
+	$(CC) -std=c11 -O2 $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+bin/tests/aceptacion_app_matrices: tests/aceptacion_app_matrices.c bin/apps/matrices \
+	bin/apps/matrices_secuencial
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 bin/dsm_node: $(wildcard src/*.c) $(wildcard include/*.h)
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
-bin/examples/%: examples/%.c include/dsm.h
+bin/examples/%: examples/%.c $(API_SRC) $(wildcard include/*.h)
 	mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 bin/tests/test_%: tests/test_%.c include/%.h
 	mkdir -p $(@D)
@@ -40,11 +80,33 @@ bin/tests/aceptacion_directorio: tests/aceptacion_directorio.c $(PASO_SRC) $(wil
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/aceptacion_directorio.c $(PASO_SRC) $(LDLIBS)
 
 bin/tests/aceptacion_paginador: tests/aceptacion_paginador.c src/pager.c src/signals.c src/memory.c \
-	include/pager.h include/signals.h include/memory.h
+	include/pager.h include/signals.h include/memory.h include/protocol.h
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 bin/tests/aceptacion_paginacion_remota: tests/aceptacion_paginacion_remota.c bin/dsm_node
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+bin/tests/aceptacion_escritura_local: tests/aceptacion_escritura_local.c src/pager.c src/signals.c src/memory.c \
+	include/pager.h include/signals.h include/memory.h include/protocol.h
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+bin/tests/aceptacion_coherencia: tests/aceptacion_coherencia.c $(PASO_SRC) $(wildcard include/*.h)
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/aceptacion_coherencia.c $(PASO_SRC) $(LDLIBS)
+
+bin/tests/aceptacion_multipagina: override LDFLAGS += -Wl,--wrap=mmap
+bin/tests/aceptacion_multihogar_errores: override LDFLAGS += -Wl,--wrap=send
+bin/tests/aceptacion_api_remoto bin/tests/aceptacion_multipagina_remota bin/tests/aceptacion_api_errores \
+bin/tests/aceptacion_multihogar bin/tests/aceptacion_multihogar_errores: tests/api_prueba.h
+
+$(ACEPTACIONES_API): bin/tests/%: tests/%.c $(API_SRC) $(wildcard include/*.h)
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+bin/tests/aceptacion_escritura_remota: tests/aceptacion_escritura_remota.c bin/dsm_node
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 

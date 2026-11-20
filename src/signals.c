@@ -6,6 +6,10 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+#if !defined(__linux__) || !defined(__x86_64__) || !defined(REG_ERR)
+#error "El manejador requiere Linux x86-64 y REG_ERR en ucontext.h"
+#endif
+
 _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "El manejador requiere punteros atomicos lock-free");
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "El manejador requiere enteros atomicos lock-free");
 
@@ -45,10 +49,29 @@ static void atender_fallo(int signo, siginfo_t *info, void *contexto)
 
     const ucontext_t *uc = contexto;
     uintptr_t direccion = (uintptr_t)info->si_addr;
-    /* Bits W/R e I/D del codigo de fallo de pagina de x86-64. */
-    const greg_t escritura_o_ejecucion = (1u << 1) | (1u << 4);
-    if (direccion < solicitud->base || direccion - solicitud->base >= solicitud->bytes ||
-        (uc->uc_mcontext.gregs[REG_ERR] & escritura_o_ejecucion) != 0 ||
+    /* REG_ERR conserva los bits W/R e I/D del fallo de pagina de x86-64. */
+    const greg_t escritura = 1u << 1;
+    const greg_t ejecucion = 1u << 4;
+    greg_t error_pagina = uc->uc_mcontext.gregs[REG_ERR];
+    uintptr_t base = solicitud->base;
+    size_t bytes = solicitud->bytes;
+    size_t page_size = solicitud->page_size;
+    dsm_ventana_senal_t *ventana = NULL;
+    if (solicitud->ventanas != NULL) {
+        ventana = atomic_load_explicit(solicitud->ventanas, memory_order_acquire);
+        while (ventana != NULL &&
+               (direccion < ventana->base || direccion - ventana->base >= ventana->bytes)) {
+            ventana = ventana->siguiente;
+        }
+        if (ventana == NULL) {
+            fallo_fatal();
+        }
+        base = ventana->base;
+        bytes = ventana->bytes;
+        page_size = ventana->page_size;
+    }
+    if (direccion < base || direccion - base >= bytes ||
+        (error_pagina & ejecucion) != 0 ||
         atomic_load_explicit(&solicitud->estado, memory_order_acquire) != DSM_SOLICITUD_QUIETA) {
         fallo_fatal();
     }
@@ -56,7 +79,9 @@ static void atender_fallo(int signo, siginfo_t *info, void *contexto)
     sigset_t espera = uc->uc_sigmask;
     sigdelset(&espera, SIGUSR1);
     sigaddset(&espera, SIGSEGV);
-    solicitud->pagina = (direccion - solicitud->base) / solicitud->page_size;
+    solicitud->ventana = ventana;
+    solicitud->pagina = (direccion - base) / page_size;
+    solicitud->acceso = (error_pagina & escritura) ? DSM_FALLO_ESCRITURA : DSM_FALLO_LECTURA;
     atomic_store_explicit(&solicitud->estado, DSM_SOLICITUD_PENDIENTE, memory_order_release);
     if (sem_post(solicitud->aviso) != 0) {
         fallo_fatal();
@@ -161,9 +186,11 @@ static void conjunto_usr1(sigset_t *usr1)
 
 int dsm_senales_registrar(dsm_solicitud_t *solicitud)
 {
-    if (solicitud == NULL || solicitud->aviso == NULL || solicitud->bytes == 0 ||
-        solicitud->page_size == 0 || solicitud->bytes % solicitud->page_size != 0 ||
-        solicitud->bytes - 1 > UINTPTR_MAX - solicitud->base ||
+    if (solicitud == NULL || solicitud->aviso == NULL ||
+        (solicitud->ventanas == NULL &&
+         (solicitud->bytes == 0 || solicitud->page_size == 0 ||
+          solicitud->bytes % solicitud->page_size != 0 ||
+          solicitud->bytes - 1 > UINTPTR_MAX - solicitud->base)) ||
         atomic_load_explicit(&solicitud->estado, memory_order_relaxed) != DSM_SOLICITUD_QUIETA) {
         return fallo(EINVAL);
     }

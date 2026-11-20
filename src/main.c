@@ -1,43 +1,31 @@
+#include "coherence.h"
 #include "config.h"
 #include "directory.h"
-#include "network.h"
 #include "pager.h"
 
 #include <errno.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static const char saludo[] = "Hola TEC";
-
-struct pendiente {
-    uint32_t id;
-    uint8_t tipo;
-    uint8_t *respuesta;
-    size_t capacidad;
-    size_t bytes;
-    int lista;
-    int error;
-};
+static const char despedida[] = "Adios TEC";
 
 struct servicio {
     const dsm_config_t *cfg;
     uint16_t id;
     dsm_directorio_t directorio;
-    dsm_red_t *red;
-    pthread_mutex_t mutex;
-    pthread_cond_t respuesta;
-    struct pendiente pendientes[DSM_CONFIG_MAX_NODOS];
-};
-
-struct lectura {
-    struct servicio *servicio;
+    dsm_coherencia_t *coherencia;
+    dsm_pager_t *pager;
     dsm_pagina_desc_t pagina;
     dsm_vistas_t *vista;
+    int registrado;
 };
 
 static int fallo(int error)
@@ -46,316 +34,189 @@ static int fallo(int error)
     return -1;
 }
 
-static dsm_cabecera_t cabecera(struct servicio *s, uint8_t tipo, uint16_t destino)
-{
-    return (dsm_cabecera_t){
-        .version = DSM_PROTO_VERSION,
-        .tipo = tipo,
-        .origen = s->id,
-        .destino = destino,
-        .id_msg = dsm_red_id(s->red),
-    };
-}
-
-static int iniciar_pendientes(struct servicio *s)
-{
-    int error = pthread_mutex_init(&s->mutex, NULL);
-    if (error != 0) {
-        return fallo(error);
-    }
-    pthread_condattr_t attr;
-    error = pthread_condattr_init(&attr);
-    if (error == 0) {
-        error = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-        if (error == 0) {
-            error = pthread_cond_init(&s->respuesta, &attr);
-        }
-        pthread_condattr_destroy(&attr);
-    }
-    if (error != 0) {
-        pthread_mutex_destroy(&s->mutex);
-        return fallo(error);
-    }
-    return 0;
-}
-
-static int intercambiar(struct servicio *s, const dsm_cabecera_t *cab,
-                         const uint8_t *envio, size_t n, uint8_t tipo,
-                         uint8_t *respuesta, size_t capacidad, size_t *bytes)
-{
-    struct timespec plazo;
-    if (clock_gettime(CLOCK_MONOTONIC, &plazo) != 0) {
-        return -1;
-    }
-    uint32_t ms = s->cfg->rpc_timeout_ms;
-    plazo.tv_sec += ms / 1000;
-    plazo.tv_nsec += (long)(ms % 1000) * 1000000L;
-    if (plazo.tv_nsec >= 1000000000L) {
-        plazo.tv_sec++;
-        plazo.tv_nsec -= 1000000000L;
-    }
-
-    struct pendiente *p = &s->pendientes[cab->destino];
-    pthread_mutex_lock(&s->mutex);
-    if (p->id != 0) {
-        pthread_mutex_unlock(&s->mutex);
-        return fallo(EBUSY);
-    }
-    *p = (struct pendiente){
-        .id = cab->id_msg, .tipo = tipo, .respuesta = respuesta, .capacidad = capacidad,
-    };
-    pthread_mutex_unlock(&s->mutex);
-
-    int error = 0;
-    if (dsm_red_enviar(s->red, cab->destino, envio, n) != 0) {
-        error = errno;
-    } else if (cab->tipo == DSM_TIPO_PAGE_REQUEST) {
-        printf("nodo %u PAGE_REQUEST enviado hogar %u bytes %zu id %" PRIu32 "\n",
-               s->id, cab->destino, n, cab->id_msg);
-    }
-
-    pthread_mutex_lock(&s->mutex);
-    while (error == 0 && !p->lista) {
-        error = pthread_cond_timedwait(&s->respuesta, &s->mutex, &plazo);
-    }
-    if (error == 0) {
-        error = p->error;
-        *bytes = p->bytes;
-    }
-    *p = (struct pendiente){0};
-    pthread_mutex_unlock(&s->mutex);
-    return error == 0 ? 0 : fallo(error);
-}
-
-static void entregar_respuesta(struct servicio *s, uint16_t par, const dsm_cabecera_t *cab,
-                                const uint8_t *buf, size_t n)
-{
-    pthread_mutex_lock(&s->mutex);
-    struct pendiente *p = &s->pendientes[par];
-    if (p->id != 0 && p->id == cab->id_corr && !p->lista) {
-        if (cab->tipo != p->tipo || n > p->capacidad) {
-            p->error = EPROTO;
-        } else {
-            memcpy(p->respuesta, buf, n);
-            p->bytes = n;
-        }
-        p->lista = 1;
-        pthread_cond_broadcast(&s->respuesta);
-    }
-    pthread_mutex_unlock(&s->mutex);
-}
-
-static int responder_pagina(struct servicio *s, uint16_t par, const uint8_t *buf, size_t n)
-{
-    dsm_cabecera_t pedido_cab;
-    dsm_page_request_t pedido;
-    if (dsm_page_request_decodificar(buf, n, &pedido_cab, &pedido) != 0 ||
-        (pedido.proc_id >> 16) != par || (uint16_t)pedido.proc_id == 0) {
-        return fallo(EPROTO);
-    }
-    printf("nodo %u PAGE_REQUEST recibido par %u gpn %" PRIu64 " bytes %zu id %" PRIu32 "\n",
-           s->id, par, pedido.gpn, n, pedido_cab.id_msg);
-
-    dsm_cabecera_t cab = cabecera(s, DSM_TIPO_PAGE_DATA, par);
-    cab.banderas = DSM_FLAG_RESPUESTA;
-    cab.id_corr = pedido_cab.id_msg;
-    dsm_page_data_t datos;
-    int cambio = 0;
-    if (dsm_directorio_servir_pagina(&s->directorio, par, &pedido, &datos, &cambio) != 0) {
-        cab.estado = DSM_ESTADO_RANGO;
-    } else if (cambio) {
-        printf("nodo %u reserva %" PRIu32 " gpn %" PRIu64 " MSI M -> S version %" PRIu32 "\n",
-               s->id, datos.reserva_id, datos.gpn, datos.version);
-    }
-
-    uint8_t respuesta[DSM_PAGE_DATA_BASE + s->cfg->page_size];
-    size_t bytes;
-    if (dsm_page_data_codificar(respuesta, sizeof respuesta, &cab,
-                               cab.estado == DSM_ESTADO_OK ? &datos : NULL, &bytes) != 0 ||
-        dsm_red_enviar(s->red, par, respuesta, bytes) != 0) {
-        return -1;
-    }
-    if (cab.estado == DSM_ESTADO_OK) {
-        printf("nodo %u PAGE_DATA enviado par %u reserva %" PRIu32 " gpn %" PRIu64
-               " bytes %" PRIu32 " trama %zu corr %" PRIu32 "\n",
-               s->id, par, datos.reserva_id, datos.gpn, datos.page_nbytes, bytes, cab.id_corr);
-    }
-    return 0;
-}
-
-static int despachar(void *ctx, uint16_t par, const dsm_cabecera_t *cab,
-                      const uint8_t *buf, size_t n)
-{
-    struct servicio *s = ctx;
-    if (cab->origen != par || cab->destino != s->id) {
-        return fallo(EPROTO);
-    }
-    if (cab->banderas == DSM_FLAG_RESPUESTA && cab->id_corr != 0) {
-        entregar_respuesta(s, par, cab, buf, n);
-        return 0;
-    }
-    if (cab->banderas != 0 || cab->id_corr != 0 || cab->estado != DSM_ESTADO_OK) {
-        return fallo(EPROTO);
-    }
-    if (cab->tipo == DSM_TIPO_PAGE_REQUEST) {
-        return responder_pagina(s, par, buf, n);
-    }
-    if (cab->tipo == DSM_TIPO_REGION_LOOKUP) {
-        dsm_cabecera_t pedido;
-        dsm_region_lookup_t consulta;
-        uint8_t respuesta[512];
-        size_t bytes;
-        if (dsm_region_lookup_decodificar(buf, n, &pedido, &consulta) != 0 ||
-            dsm_directorio_codificar_info(&s->directorio, &pedido, &consulta,
-                                           dsm_red_id(s->red), respuesta, sizeof respuesta,
-                                           &bytes) != 0) {
-            return -1;
-        }
-        return dsm_red_enviar(s->red, par, respuesta, bytes);
-    }
-    return fallo(EPROTO);
-}
-
-static int abrir_reserva(struct servicio *s, uint32_t reserva, struct lectura *lectura)
-{
-    uint16_t creador = (uint16_t)(reserva >> 16);
-    dsm_cabecera_t cab = cabecera(s, DSM_TIPO_REGION_LOOKUP, creador);
-    dsm_region_lookup_t consulta = {.reserva_id = reserva};
-    uint8_t envio[40], respuesta[512];
-    size_t n, bytes;
-    if (dsm_region_lookup_codificar(envio, sizeof envio, &cab, &consulta, &n) != 0) {
-        return fallo(EPROTO);
-    }
-    if (intercambiar(s, &cab, envio, n, DSM_TIPO_REGION_INFO,
-                     respuesta, sizeof respuesta, &bytes) != 0 ||
-        dsm_directorio_recibir_info(&s->directorio, reserva, cab.id_msg,
-                                    respuesta, bytes, NULL, NULL) != 0 ||
-        dsm_directorio_vista(&s->directorio, reserva, &lectura->pagina, &lectura->vista) != 0) {
-        return -1;
-    }
-    if (lectura->pagina.msi != DSM_MSI_I) {
-        return fallo(EPROTO);
-    }
-    lectura->servicio = s;
-    printf("nodo %u reserva_remota %" PRIu32 " gpn %" PRIu64 " hogar %u MSI I\n",
-           s->id, reserva, lectura->pagina.gpn, lectura->pagina.hogar);
-    return 0;
-}
-
-static int traer_pagina(void *pagina_cr, size_t indice, size_t bytes, void *arg)
-{
-    struct lectura *lectura = arg;
-    struct servicio *s = lectura->servicio;
-    const dsm_pagina_desc_t *pagina = &lectura->pagina;
-    if (indice != 0 || pagina_cr != lectura->vista->c_r || bytes != s->cfg->page_size) {
-        return fallo(EINVAL);
-    }
-
-    dsm_cabecera_t cab = cabecera(s, DSM_TIPO_PAGE_REQUEST, pagina->hogar);
-    dsm_page_request_t pedido = {
-        .gpn = pagina->gpn, .proc_id = ((uint32_t)s->id << 16) | 1u, .msi = DSM_MSI_I,
-    };
-    uint8_t envio[48], respuesta[DSM_PAGE_DATA_BASE + bytes];
-    size_t n, recibidos;
-    if (dsm_page_request_codificar(envio, sizeof envio, &cab, &pedido, &n) != 0) {
-        return fallo(EPROTO);
-    }
-    if (intercambiar(s, &cab, envio, n, DSM_TIPO_PAGE_DATA,
-                     respuesta, sizeof respuesta, &recibidos) != 0) {
-        perror("PAGE_REQUEST");
-        return -1;
-    }
-    dsm_cabecera_t recibida;
-    dsm_page_data_t datos;
-    if (dsm_page_data_decodificar(respuesta, recibidos, &recibida, &datos) != 0 ||
-        recibida.estado != DSM_ESTADO_OK || recibida.id_corr != cab.id_msg ||
-        recibida.origen != pagina->hogar || recibida.destino != s->id ||
-        datos.proc_id != pedido.proc_id ||
-        dsm_directorio_compartir_pagina(&s->directorio, pagina->reserva, &datos) != 0) {
-        fprintf(stderr, "PAGE_DATA invalido para la reserva %" PRIu32 "\n", pagina->reserva);
-        return fallo(EPROTO);
-    }
-    printf("nodo %u PAGE_DATA recibido hogar %u reserva %" PRIu32 " gpn %" PRIu64
-           " bytes %" PRIu32 " trama %zu corr %" PRIu32 "\n",
-           s->id, datos.hogar, datos.reserva_id, datos.gpn,
-           datos.page_nbytes, recibidos, recibida.id_corr);
-    printf("nodo %u reserva %" PRIu32 " gpn %" PRIu64 " MSI I -> S version %" PRIu32 "\n",
-           s->id, datos.reserva_id, datos.gpn, datos.version);
-    return 0;
-}
-
-static int leer_reserva(struct servicio *s, uint32_t reserva)
-{
-    struct lectura lectura;
-    if (abrir_reserva(s, reserva, &lectura) != 0) {
-        return -1;
-    }
-    dsm_pager_t *pager;
-    if (dsm_pager_iniciar(&pager, lectura.vista, s->cfg->page_size, 1,
-                          traer_pagina, &lectura) != 0) {
-        return -1;
-    }
-    int error = 0;
-    if (dsm_pager_registrar(pager) != 0) {
-        error = errno;
-    } else {
-        const volatile char *ar = lectura.vista->a_r;
-        for (int intento = 0; intento < 2; intento++) {
-            char texto[sizeof saludo + 1] = {0};
-            for (size_t i = 0; i < sizeof saludo; i++) {
-                texto[i] = ar[i];
-            }
-            printf("nodo %u %s reserva %" PRIu32 " gpn %" PRIu64 " resultado %s\n",
-                   s->id, intento == 0 ? "lectura" : "segunda lectura",
-                   reserva, lectura.pagina.gpn, texto);
-            if (memcmp(texto, saludo, sizeof saludo) != 0) {
-                error = EPROTO;
-                break;
-            }
-            if (intento == 0) {
-                /* El creador escribe el saludo sobre una pagina inicializada en cero. */
-                for (size_t i = sizeof saludo; i < lectura.vista->bytes; i++) {
-                    if (ar[i] != 0) {
-                        error = EPROTO;
-                        break;
-                    }
-                }
-                if (error != 0) {
-                    break;
-                }
-                printf("nodo %u imagen verificada %zu bytes\n", s->id, lectura.vista->bytes);
-            }
-        }
-        if (dsm_pager_desregistrar(pager) != 0) {
-            perror("dsm_pager_desregistrar");
-            exit(EXIT_FAILURE);
-        }
-    }
-    if (dsm_pager_cerrar(pager) != 0) {
-        perror("dsm_pager_cerrar");
-        exit(EXIT_FAILURE);
-    }
-    return error == 0 ? 0 : fallo(error);
-}
-
-/* SIGINT se consume en el hilo principal y se mantiene bloqueada en los demas. */
-static int esperar_lector(struct servicio *s, uint16_t par, const sigset_t *interrupcion)
+static int interrumpido(const sigset_t *interrupcion)
 {
     const struct timespec inmediato = {0};
-    for (;;) {
-        if (sigtimedwait(interrupcion, NULL, &inmediato) == SIGINT) {
-            return 1;
-        }
-        if (dsm_red_esperar(s->red, par) == 0) {
-            return sigtimedwait(interrupcion, NULL, &inmediato) == SIGINT;
+    return sigtimedwait(interrupcion, NULL, &inmediato) == SIGINT;
+}
+
+/* La espera de un par sigue atendiendo SIGINT aunque aun no haya arrancado. */
+static int esperar_par(struct servicio *s, uint16_t par, const sigset_t *interrupcion)
+{
+    while (!interrumpido(interrupcion)) {
+        if (dsm_coherencia_esperar(s->coherencia, par) == 0) {
+            return interrumpido(interrupcion) ? 1 : 0;
         }
         if (errno != ETIMEDOUT) {
             return -1;
         }
     }
+    return 1;
 }
 
-static int servir(const dsm_config_t *cfg, const dsm_nodo_cfg_t *nodo, uint32_t reserva)
+static int preparar_vista(struct servicio *s, uint32_t reserva)
+{
+    if (dsm_coherencia_abrir(s->coherencia, reserva, &s->pagina, &s->vista) != 0) {
+        return -1;
+    }
+    if (dsm_pager_iniciar_vacio(&s->pager, s->cfg->page_size, s->cfg->max_hilos,
+                                s->id, s->cfg->rpc_timeout_ms, dsm_coherencia_resolver,
+                                s->coherencia) != 0 ||
+        dsm_coherencia_asociar(s->coherencia, s->pager, reserva, s->vista, NULL) != 0) {
+        return -1;
+    }
+    if (dsm_pager_registrar(s->pager) != 0) {
+        return -1;
+    }
+    s->registrado = 1;
+    return 0;
+}
+
+static int leer_prototipo(struct servicio *s)
+{
+    const volatile char *ar = s->vista->a_r;
+    for (int intento = 0; intento < 2; intento++) {
+        char texto[sizeof saludo + 1] = {0};
+        for (size_t i = 0; i < sizeof saludo; i++) {
+            texto[i] = ar[i];
+        }
+        printf("nodo %u %s reserva %" PRIu32 " gpn %" PRIu64 " resultado %s\n",
+               s->id, intento == 0 ? "lectura" : "segunda lectura",
+               s->pagina.reserva, s->pagina.gpn, texto);
+        if (memcmp(texto, saludo, sizeof saludo) != 0) {
+            return fallo(EPROTO);
+        }
+        if (intento == 0) {
+            for (size_t i = sizeof saludo; i < s->vista->bytes; i++) {
+                if (ar[i] != 0) {
+                    return fallo(EPROTO);
+                }
+            }
+            printf("nodo %u imagen verificada %zu bytes\n", s->id, s->vista->bytes);
+        }
+    }
+    return 0;
+}
+
+static int imprimir_estado(struct servicio *s)
+{
+    dsm_pagina_desc_t pagina;
+    if (dsm_directorio_describir(&s->directorio, s->pagina.gpn, &pagina) != 0) {
+        return -1;
+    }
+    uint8_t local = pagina.mascara_copias & (UINT64_C(1) << s->id) ? pagina.msi : DSM_MSI_I;
+    char estado = local == DSM_MSI_M ? 'M' : local == DSM_MSI_S ? 'S' : 'I';
+    printf("nodo %u estado %c version %" PRIu32 " poseedor %u mascara %" PRIu64 "\n",
+           s->id, estado, pagina.version, pagina.poseedor, pagina.mascara_copias);
+    return 0;
+}
+
+static int ejecutar_comando(struct servicio *s, const char *comando)
+{
+    volatile unsigned char *ar = s->vista->a_r;
+    if (strcmp(comando, "leer") == 0) {
+        char texto[64] = {0};
+        size_t i;
+        for (i = 0; i < sizeof texto - 1; i++) {
+            texto[i] = (char)ar[i];
+            if (texto[i] == '\0') {
+                break;
+            }
+        }
+        if (i == sizeof texto - 1) {
+            return fallo(EOVERFLOW);
+        }
+        printf("nodo %u lectura [%s]\n", s->id, texto);
+    } else if (strcmp(comando, "escribir") == 0) {
+        for (size_t i = 0; i < sizeof despedida; i++) {
+            ar[i] = (unsigned char)despedida[i];
+        }
+        printf("nodo %u escritura [%s]\n", s->id, despedida);
+    } else if (strcmp(comando, "marca") == 0) {
+        ar[64 + s->id] = (unsigned char)(s->id + 1);
+        printf("nodo %u marca aplicada\n", s->id);
+    } else if (strcmp(comando, "marcas") == 0) {
+        /* Cada acceso es una lectura de Ar y puede provocar un fallo real. */
+        unsigned marcas[DSM_CONFIG_MAX_NODOS];
+        for (size_t i = 0; i < s->cfg->cantidad_nodos; i++) {
+            marcas[i] = ar[64 + i];
+        }
+        flockfile(stdout);
+        printf("nodo %u marcas", s->id);
+        for (size_t i = 0; i < s->cfg->cantidad_nodos; i++) {
+            printf(" %u", marcas[i]);
+        }
+        putchar('\n');
+        funlockfile(stdout);
+    } else if (strcmp(comando, "estado") == 0) {
+        return imprimir_estado(s);
+    } else if (*comando != '\0') {
+        fprintf(stderr, "comando desconocido (leer, escribir, marca, marcas, estado, salir)\n");
+        return fallo(EINVAL);
+    }
+    return 0;
+}
+
+/* Lee una linea sin ocultar SIGINT tras una espera bloqueante en stdin. */
+static int leer_comando(char *linea, size_t capacidad, const sigset_t *interrupcion)
+{
+    size_t usados = 0;
+    while (!interrumpido(interrupcion)) {
+        struct pollfd entrada = {.fd = STDIN_FILENO, .events = POLLIN};
+        int listo = poll(&entrada, 1, 100);
+        if (listo < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (listo == 0) {
+            continue;
+        }
+        char letra;
+        ssize_t leidos = read(STDIN_FILENO, &letra, 1);
+        if (leidos == 0) {
+            return 0;
+        }
+        if (leidos < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (letra == '\n') {
+            linea[usados] = '\0';
+            return 1;
+        }
+        if (letra == '\r') {
+            continue;
+        }
+        if (usados + 1 == capacidad) {
+            return fallo(EOVERFLOW);
+        }
+        linea[usados++] = letra;
+    }
+    return 0;
+}
+
+static int interactuar(struct servicio *s, const sigset_t *interrupcion)
+{
+    printf("nodo %u listo reserva %" PRIu32 " Ar %p\n", s->id, s->pagina.reserva, s->vista->a_r);
+    char comando[80];
+    int rc;
+    while ((rc = leer_comando(comando, sizeof comando, interrupcion)) > 0) {
+        if (strcmp(comando, "salir") == 0) {
+            return 0;
+        }
+        if (ejecutar_comando(s, comando) != 0) {
+            return -1;
+        }
+    }
+    return rc;
+}
+
+static int servir(const dsm_config_t *cfg, const dsm_nodo_cfg_t *nodo,
+                   uint32_t reserva, int interactivo)
 {
     sigset_t interrupcion;
     sigemptyset(&interrupcion);
@@ -380,22 +241,31 @@ static int servir(const dsm_config_t *cfg, const dsm_nodo_cfg_t *nodo, uint32_t 
         goto cerrar_directorio;
     }
     memcpy(local.ubicacion_local, saludo, sizeof saludo);
-    if (iniciar_pendientes(&s) != 0) {
-        perror("iniciar solicitudes");
-        goto cerrar_directorio;
-    }
     setvbuf(stdout, NULL, _IOLBF, 0);
-    if (dsm_red_iniciar(&s.red, cfg, nodo->id, despachar, &s) != 0) {
-        perror("iniciar red");
-        goto cerrar_pendientes;
+    if (dsm_coherencia_iniciar(&s.coherencia, cfg, nodo->id, &s.directorio) != 0) {
+        perror("iniciar coherencia");
+        goto cerrar_directorio;
     }
     printf("nodo %u escuchando puerto %u reserva_local %" PRIu32 " gpn %" PRIu64 " MSI M\n",
            nodo->id, nodo->puerto, local.reserva, local.gpn);
 
+    int espera = reserva == 0 ? 0 : esperar_par(&s, (uint16_t)(reserva >> 16), &interrupcion);
+    if (espera > 0) {
+        rc = 0;
+        goto cerrar_coherencia;
+    }
+    if (espera < 0 || preparar_vista(&s, reserva == 0 ? local.reserva : reserva) != 0) {
+        perror("abrir reserva");
+        goto cerrar_paginador;
+    }
     rc = 0;
-    int espera = reserva == 0 ? 0 : esperar_lector(&s, (uint16_t)(reserva >> 16), &interrupcion);
-    if (espera <= 0) {
-        if (espera < 0 || (reserva != 0 && leer_reserva(&s, reserva) != 0)) {
+    if (interactivo) {
+        if (interactuar(&s, &interrupcion) != 0) {
+            perror("interactivo");
+            rc = 1;
+        }
+    } else {
+        if (reserva != 0 && leer_prototipo(&s) != 0) {
             perror("lectura remota");
             rc = 1;
         }
@@ -406,12 +276,28 @@ static int servir(const dsm_config_t *cfg, const dsm_nodo_cfg_t *nodo, uint32_t 
             rc = 1;
         }
     }
-    dsm_red_cerrar(s.red);
-    printf("nodo %u servicio detenido\n", nodo->id);
 
-cerrar_pendientes:
-    pthread_cond_destroy(&s.respuesta);
-    pthread_mutex_destroy(&s.mutex);
+cerrar_paginador:
+    if (s.registrado && dsm_pager_desregistrar(s.pager) != 0) {
+        perror("dsm_pager_desregistrar");
+        return 1;
+    }
+    if (s.pager != NULL && dsm_pager_cerrar(s.pager) != 0) {
+        perror("dsm_pager_cerrar");
+        return 1;
+    }
+cerrar_coherencia:
+    if (reserva != 0 && s.vista != NULL &&
+        (dsm_coherencia_desvincular(s.coherencia, reserva) != 0 ||
+         (dsm_directorio_desvincular(&s.directorio, reserva) != 0 && errno != ENOENT))) {
+        perror("cierre de la vista remota al detener el nodo");
+    }
+    if (dsm_directorio_esperar_fin_aportes(&s.directorio) != 0) {
+        perror("espera de los aportes al detener el nodo");
+        rc = 1;
+    }
+    dsm_coherencia_cerrar(s.coherencia);
+    printf("nodo %u servicio detenido\n", nodo->id);
 cerrar_directorio:
     dsm_directorio_cerrar(&s.directorio);
     return rc;
@@ -419,12 +305,13 @@ cerrar_directorio:
 
 static void uso(const char *argv0)
 {
-    fprintf(stderr, "uso: %s <config> <id-nodo> [servir [id-reserva-remota]]\n", argv0);
+    fprintf(stderr, "uso: %s <config> <id-nodo> [servir|interactivo [id-reserva-remota]]\n", argv0);
 }
 
 int main(int argc, char **argv)
 {
-    if (argc < 3 || argc > 5 || (argc >= 4 && strcmp(argv[3], "servir") != 0)) {
+    if (argc < 3 || argc > 5 ||
+        (argc >= 4 && strcmp(argv[3], "servir") != 0 && strcmp(argv[3], "interactivo") != 0)) {
         uso(argv[0]);
         return 1;
     }
@@ -435,7 +322,7 @@ int main(int argc, char **argv)
     errno = 0;
     char *fin = NULL;
     unsigned long id = strtoul(argv[2], &fin, 10);
-    if (errno != 0 || fin == argv[2] || *fin != '\0' || id > 65535ul) {
+    if (errno != 0 || argv[2][0] < '0' || argv[2][0] > '9' || *fin != '\0' || id > UINT16_MAX) {
         fprintf(stderr, "id de nodo invalido\n");
         return 1;
     }
@@ -458,7 +345,7 @@ int main(int argc, char **argv)
             }
             reserva = (uint32_t)valor;
         }
-        return servir(&cfg, nodo, reserva);
+        return servir(&cfg, nodo, reserva, strcmp(argv[3], "interactivo") == 0);
     }
     printf("nodo %u\n", (unsigned)nodo->id);
     printf("puerto %u\n", (unsigned)nodo->puerto);

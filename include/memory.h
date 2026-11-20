@@ -13,6 +13,8 @@ typedef struct dsm_vistas {
 } dsm_vistas_t;
 
 int dsm_vistas_crear(size_t bytes, dsm_vistas_t *salida);
+/* Compromete respaldo del memfd para los bytes aportados por este hogar. */
+int dsm_vistas_respaldar_tramo(dsm_vistas_t *vista, size_t offset, size_t bytes);
 int dsm_vistas_proteger(dsm_vistas_t *vistas, int prot);
 /* Cambia solo la pagina indicada de A_r con un tamano multiplo de la pagina del sistema. */
 int dsm_vistas_proteger_pagina(dsm_vistas_t *vistas, size_t indice, size_t page_size, int prot);
