@@ -1,6 +1,6 @@
 # Merge Sort paralelo con Pthreads y DSM
 
-El creador publica dos reservas de `int32_t`; los trabajadores las abren desde procesos Linux independientes. El ordenamiento local y la fusión global adaptan la aplicación Pthreads de Brandon Lavello. El mismo binario tiene un modo secuencial para comparar tiempos. [Procedencia y correspondencia de funciones](UPSTREAM.md) · [Licencia MIT](LICENSE) · [Mediciones y aceptaciones](RESULTADOS.md)
+El creador publica dos reservas de `int32_t`; los trabajadores las abren desde procesos Linux independientes. El ordenamiento local y la fusión global adaptan la aplicación Pthreads de Brandon Lavello. El mismo binario tiene un modo secuencial para comparar tiempos. [Procedencia](UPSTREAM.md) · [Licencia MIT](LICENSE) · [Resultados](RESULTADOS.md)
 
 ## Demostración de un millón de enteros en tres terminales
 

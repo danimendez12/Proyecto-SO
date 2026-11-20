@@ -30,8 +30,8 @@ int matrices_inicializar(dsm_context_t *ctx, const matrices_t *m);
 int matrices_verificar(dsm_context_t *ctx, const matrices_t *m);
 
 /* Rangos [primer_bloque, fin_bloque), en paginas de C. El coordinador evita
- * solaparlos entre procesos. Cada Pthread registra su propio hilo, lee A/B
- * por Ar y publica una pagina de C por dsm_escribir. A/B permanecen estables. */
+ * solaparlos entre procesos. Cada Pthread registra su hilo, trae A y B con
+ * dsm_leer y publica cada pagina de C con dsm_escribir. */
 int matrices_calcular(dsm_context_t *ctx, dsm_proc_id_t proc, const matrices_t *m,
                        size_t primer_bloque, size_t fin_bloque, size_t hilos);
 
