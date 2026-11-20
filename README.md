@@ -18,6 +18,7 @@ el hogar de la página coordina por TCP sus permisos MSI.
 | `src/` | Módulos en C y punto de entrada del nodo (`main.c`). |
 | `examples/` | Aplicaciones creadora y lectora que usan el API público. |
 | `apps/matrices/` | Multiplicación de matrices con Pthreads, reservas DSM multihogar y verificación numérica. |
+| `apps/mergesort/` | Merge Sort con Pthreads, fusión por niveles en DSM y comparación exhaustiva con una referencia independiente. |
 | `tests/` | Pruebas de aceptación de red, memoria, directorio y paginación. |
 | `config/` | Configuraciones locales de dos y tres nodos y plantilla para ocho nodos. |
 | `docs/` | Documentación técnica y evidencias del laboratorio. |
@@ -47,9 +48,9 @@ los ejecutables correspondientes.
 | --- | --- |
 | `make` | Genera `bin/dsm_node`. |
 | `make examples` | Genera los ejemplos en `bin/examples/`. |
-| `make apps` | Compila la aplicación de matrices y la referencia secuencial original. |
+| `make apps` | Compila matrices, su referencia secuencial original y Merge Sort con sus modos distribuido y secuencial. |
 | `make tests` | Genera los programas de prueba en `bin/tests/`. |
-| `make aceptacion` | Compila las quince aceptaciones del DSM y la aceptación de matrices. |
+| `make aceptacion` | Compila las quince aceptaciones del DSM y las dos aceptaciones de aplicaciones. |
 | `make clean` | Elimina el directorio de salida `bin/`. |
 
 ## Demostración de paginación remota
@@ -296,6 +297,10 @@ Para el Paso 12A, consultá la guía de la aplicación con los comandos de
 tres terminales, las configuraciones para el TEC y las mediciones.
 [Multiplicación de matrices con Pthreads y DSM](apps/matrices/README.md)
 
+El Paso 12B incluye una segunda aplicación, con instrucciones para tres
+terminales, dos o tres computadoras y casos de uno y dos millones de enteros.
+[Merge Sort con Pthreads y DSM](apps/mergesort/README.md)
+
 Desde la raíz del proyecto en Linux x86-64, con los puertos del INI libres:
 
 ```bash
@@ -304,6 +309,7 @@ make clean
 make
 make examples tests aceptacion
 timeout -k 2s 90s ./bin/tests/aceptacion_app_matrices
+timeout -k 5s 180s ./bin/tests/aceptacion_app_mergesort
 for prueba in red memoria directorio paginador paginacion_remota escritura_local \
               api coherencia escritura_remota api_remoto multipagina multipagina_remota api_errores
 do

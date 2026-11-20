@@ -11,7 +11,7 @@ ACEPTACIONES_API = bin/tests/aceptacion_api bin/tests/aceptacion_api_remoto \
 
 all: bin/dsm_node
 
-apps: bin/apps/matrices bin/apps/matrices_secuencial
+apps: bin/apps/matrices bin/apps/matrices_secuencial bin/apps/mergesort
 
 examples: bin/examples/demo_creator bin/examples/demo_reader
 
@@ -20,11 +20,24 @@ tests: bin/tests/test_protocol bin/tests/test_memory bin/tests/test_signals
 aceptacion: bin/tests/aceptacion_red bin/tests/aceptacion_memoria bin/tests/aceptacion_directorio \
 	bin/tests/aceptacion_paginador bin/tests/aceptacion_paginacion_remota bin/tests/aceptacion_escritura_local \
 	bin/tests/aceptacion_coherencia bin/tests/aceptacion_escritura_remota $(ACEPTACIONES_API) \
-	bin/tests/aceptacion_app_matrices
+	bin/tests/aceptacion_app_matrices bin/tests/aceptacion_app_mergesort
 
 PASO_SRC = src/config.c src/protocol.c src/network.c src/memory.c src/directory.c
 API_SRC = $(PASO_SRC) src/dsm.c src/pager.c src/signals.c src/coherence.c
 MATRICES_CFLAGS ?= -O2
+MERGESORT_CFLAGS ?= -O2
+MERGESORT_MOD = $(filter-out apps/mergesort/main.c,$(wildcard apps/mergesort/*.c))
+
+bin/apps/mergesort: $(wildcard apps/mergesort/*.c) $(wildcard apps/mergesort/*.h) \
+	$(API_SRC) $(wildcard include/*.h)
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(MERGESORT_CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+bin/tests/aceptacion_app_mergesort: tests/aceptacion_app_mergesort.c \
+	$(MERGESORT_MOD) $(wildcard apps/mergesort/*.h) $(API_SRC) $(wildcard include/*.h) \
+	bin/apps/mergesort apps/mergesort/prueba_red.sh config/mergesort-lab.ini
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(MERGESORT_CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 bin/apps/matrices: $(wildcard apps/matrices/*.c) $(wildcard apps/matrices/*.h) \
 	$(API_SRC) $(wildcard include/*.h)
