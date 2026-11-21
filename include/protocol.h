@@ -49,8 +49,22 @@ enum {
     DSM_TIPO_CAP_CANCEL_ACK = 0x45,
     DSM_TIPO_CAP_RELEASE = 0x46,
     DSM_TIPO_CAP_RELEASE_ACK = 0x47,
+    DSM_TIPO_STATS_REQUEST = 0x30,
+    DSM_TIPO_STATS_REPLY = 0x31,
     DSM_TIPO_REGION_COPY_CLOSE = 0x48,
-    DSM_TIPO_REGION_COPY_CLOSE_ACK = 0x49
+    DSM_TIPO_REGION_COPY_CLOSE_ACK = 0x49,
+    DSM_TIPO_PROTO_ERROR = 0x7F
+};
+
+enum {
+    DSM_STATS_NODOS = 1,
+    DSM_STATS_PAGINAS = 2,
+    DSM_STATS_AMBOS = 3,
+    DSM_STATS_CONTADORES = 8,
+    DSM_STATS_PREF = 104,
+    DSM_FICHA_PAGINA = 40,
+    DSM_PROTO_ERROR_BYTES = 104,
+    DSM_PROTO_TEXTO = 64
 };
 
 enum {
@@ -201,6 +215,40 @@ typedef struct dsm_invalidate_ack {
     uint16_t resultado;
 } dsm_invalidate_ack_t;
 
+typedef struct dsm_stats_request {
+    uint8_t seleccion;
+} dsm_stats_request_t;
+
+typedef struct dsm_pagina_consulta {
+    uint64_t gpn;
+    uint64_t mascara;
+    uint32_t proc;
+    uint32_t reserva;
+    uint32_t orden;
+    uint16_t hogar;
+    uint16_t poseedor;
+    uint8_t msi;
+    uint8_t permiso;
+    uint8_t banderas;
+    uint8_t copias;
+} dsm_pagina_consulta_t;
+
+typedef struct dsm_stats_reply {
+    uint16_t emisor;
+    uint16_t n;
+    uint32_t p;
+    uint64_t contadores[DSM_STATS_CONTADORES];
+    dsm_ficha_t fichas[DSM_MAX_FICHAS];
+    /* Al decodificar, paginas es memoria propia que el llamador libera. */
+    dsm_pagina_consulta_t *paginas;
+} dsm_stats_reply_t;
+
+typedef struct dsm_proto_error {
+    uint16_t codigo;
+    uint32_t id_causante;
+    char texto[DSM_PROTO_TEXTO];
+} dsm_proto_error_t;
+
 typedef struct dsm_region_lookup {
     uint32_t reserva_id;
     uint32_t primer_tramo;
@@ -301,5 +349,19 @@ int dsm_region_info_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                               const dsm_region_info_t *msg, size_t *out);
 int dsm_region_info_decodificar(const uint8_t *src, size_t n,
                                 dsm_cabecera_t *cab, dsm_region_info_t *msg);
+
+int dsm_stats_request_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                const dsm_stats_request_t *msg, size_t *out);
+int dsm_stats_request_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                  dsm_stats_request_t *msg);
+int dsm_stats_reply_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                              const dsm_stats_reply_t *msg, size_t *out);
+/* paginas queda en memoria propia. Liberarla si el retorno es 0. */
+int dsm_stats_reply_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                dsm_stats_reply_t *msg);
+int dsm_proto_error_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                              const dsm_proto_error_t *msg, size_t *out);
+int dsm_proto_error_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                dsm_proto_error_t *msg);
 
 #endif

@@ -1,5 +1,6 @@
 #include "protocol.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static void put_u16(uint8_t *p, uint16_t v)
@@ -811,4 +812,163 @@ int dsm_capacidad_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
         return -1;
     }
     return capacidad_valida(cab, msg) ? 0 : -1;
+}
+
+int dsm_stats_request_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                const dsm_stats_request_t *msg, size_t *out)
+{
+    if (msg == NULL || out == NULL || cab == NULL || cab->tipo != DSM_TIPO_STATS_REQUEST ||
+        cab->banderas != 0 || cab->id_corr != 0 ||
+        (msg->seleccion != DSM_STATS_NODOS && msg->seleccion != DSM_STATS_PAGINAS &&
+         msg->seleccion != DSM_STATS_AMBOS) ||
+        preparar(dst, cap, cab, 40) != 0) {
+        return -1;
+    }
+    dst[32] = msg->seleccion;
+    *out = 40;
+    return 0;
+}
+
+int dsm_stats_request_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                  dsm_stats_request_t *msg)
+{
+    if (msg == NULL || n != 40 || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        cab->tipo != DSM_TIPO_STATS_REQUEST || cab->banderas != 0 || cab->id_corr != 0 ||
+        cab->longitud != 40 ||
+        (src[32] != DSM_STATS_NODOS && src[32] != DSM_STATS_PAGINAS && src[32] != DSM_STATS_AMBOS)) {
+        return -1;
+    }
+    msg->seleccion = src[32];
+    return 0;
+}
+
+static void escribir_pagina_consulta(uint8_t *p, const dsm_pagina_consulta_t *pag)
+{
+    memset(p, 0, DSM_FICHA_PAGINA);
+    put_u64(p + 0, pag->gpn);
+    put_u64(p + 8, pag->mascara);
+    put_u32(p + 16, pag->proc);
+    put_u32(p + 20, pag->reserva);
+    put_u32(p + 24, pag->orden);
+    put_u16(p + 28, pag->hogar);
+    put_u16(p + 30, pag->poseedor);
+    p[32] = pag->msi;
+    p[33] = pag->permiso;
+    p[34] = pag->banderas;
+    p[35] = pag->copias;
+}
+
+static void leer_pagina_consulta(const uint8_t *p, dsm_pagina_consulta_t *pag)
+{
+    memset(pag, 0, sizeof *pag);
+    pag->gpn = get_u64(p + 0);
+    pag->mascara = get_u64(p + 8);
+    pag->proc = get_u32(p + 16);
+    pag->reserva = get_u32(p + 20);
+    pag->orden = get_u32(p + 24);
+    pag->hogar = get_u16(p + 28);
+    pag->poseedor = get_u16(p + 30);
+    pag->msi = p[32];
+    pag->permiso = p[33];
+    pag->banderas = p[34];
+    pag->copias = p[35];
+}
+
+int dsm_stats_reply_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                              const dsm_stats_reply_t *msg, size_t *out)
+{
+    if (msg == NULL || out == NULL || cab == NULL || cab->tipo != DSM_TIPO_STATS_REPLY ||
+        (cab->banderas & DSM_FLAG_RESPUESTA) == 0 || cab->id_corr == 0 ||
+        msg->n > DSM_MAX_FICHAS || (msg->p != 0 && msg->paginas == NULL)) {
+        return -1;
+    }
+    uint64_t longitud = (uint64_t)DSM_STATS_PREF + (uint64_t)msg->n * 104u +
+                        (uint64_t)msg->p * DSM_FICHA_PAGINA;
+    if (longitud > DSM_LONGITUD_MAX || preparar(dst, cap, cab, (uint32_t)longitud) != 0) {
+        return -1;
+    }
+    put_u16(dst + 32, msg->emisor);
+    put_u16(dst + 34, msg->n);
+    put_u32(dst + 36, msg->p);
+    for (int i = 0; i < DSM_STATS_CONTADORES; i++) {
+        put_u64(dst + 40 + (size_t)i * 8u, msg->contadores[i]);
+    }
+    for (uint16_t i = 0; i < msg->n; i++) {
+        escribir_ficha(dst + DSM_STATS_PREF + (size_t)i * 104u, &msg->fichas[i]);
+    }
+    uint8_t *base = dst + DSM_STATS_PREF + (size_t)msg->n * 104u;
+    for (uint32_t i = 0; i < msg->p; i++) {
+        escribir_pagina_consulta(base + (size_t)i * DSM_FICHA_PAGINA, &msg->paginas[i]);
+    }
+    *out = (size_t)longitud;
+    return 0;
+}
+
+int dsm_stats_reply_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                dsm_stats_reply_t *msg)
+{
+    if (msg == NULL || n < DSM_STATS_PREF || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        cab->tipo != DSM_TIPO_STATS_REPLY || (cab->banderas & DSM_FLAG_RESPUESTA) == 0 ||
+        cab->id_corr == 0 || n != cab->longitud) {
+        return -1;
+    }
+    uint16_t cantidad_nodos = get_u16(src + 34);
+    uint32_t cantidad_paginas = get_u32(src + 36);
+    uint64_t esperada = (uint64_t)DSM_STATS_PREF + (uint64_t)cantidad_nodos * 104u +
+                        (uint64_t)cantidad_paginas * DSM_FICHA_PAGINA;
+    if (cantidad_nodos > DSM_MAX_FICHAS || esperada != n) {
+        return -1;
+    }
+    dsm_pagina_consulta_t *paginas = NULL;
+    if (cantidad_paginas != 0) {
+        paginas = calloc(cantidad_paginas, sizeof *paginas);
+        if (paginas == NULL) {
+            return -1;
+        }
+    }
+    memset(msg, 0, sizeof *msg);
+    msg->emisor = get_u16(src + 32);
+    msg->n = cantidad_nodos;
+    msg->p = cantidad_paginas;
+    for (int i = 0; i < DSM_STATS_CONTADORES; i++) {
+        msg->contadores[i] = get_u64(src + 40 + (size_t)i * 8u);
+    }
+    for (uint16_t i = 0; i < cantidad_nodos; i++) {
+        leer_ficha(src + DSM_STATS_PREF + (size_t)i * 104u, &msg->fichas[i]);
+    }
+    const uint8_t *base = src + DSM_STATS_PREF + (size_t)cantidad_nodos * 104u;
+    for (uint32_t i = 0; i < cantidad_paginas; i++) {
+        leer_pagina_consulta(base + (size_t)i * DSM_FICHA_PAGINA, &paginas[i]);
+    }
+    msg->paginas = paginas;
+    return 0;
+}
+
+int dsm_proto_error_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                              const dsm_proto_error_t *msg, size_t *out)
+{
+    if (msg == NULL || out == NULL || cab == NULL || cab->tipo != DSM_TIPO_PROTO_ERROR ||
+        cab->banderas != 0 || preparar(dst, cap, cab, DSM_PROTO_ERROR_BYTES) != 0) {
+        return -1;
+    }
+    put_u16(dst + 32, msg->codigo);
+    put_u32(dst + 36, msg->id_causante);
+    memcpy(dst + 40, msg->texto, DSM_PROTO_TEXTO);
+    *out = DSM_PROTO_ERROR_BYTES;
+    return 0;
+}
+
+int dsm_proto_error_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                dsm_proto_error_t *msg)
+{
+    if (msg == NULL || n != DSM_PROTO_ERROR_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        cab->tipo != DSM_TIPO_PROTO_ERROR || cab->longitud != DSM_PROTO_ERROR_BYTES) {
+        return -1;
+    }
+    memset(msg, 0, sizeof *msg);
+    msg->codigo = get_u16(src + 32);
+    msg->id_causante = get_u32(src + 36);
+    memcpy(msg->texto, src + 40, DSM_PROTO_TEXTO);
+    msg->texto[DSM_PROTO_TEXTO - 1] = '\0';
+    return 0;
 }

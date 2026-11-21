@@ -3,7 +3,9 @@
 #include "coherence.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -753,13 +755,276 @@ static int copiar(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
 int dsm_leer(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
              void *destino, size_t bytes)
 {
-    return copiar(ctx, id, offset, destino, NULL, bytes, 0);
+    if (bytes == 0) {
+        return copiar(ctx, id, offset, destino, NULL, bytes, 0);
+    }
+    void *temporal = malloc(bytes);
+    if (temporal == NULL) {
+        return DSM_ERR_NOMEM;
+    }
+    int rc = copiar(ctx, id, offset, temporal, NULL, bytes, 0);
+    if (rc == DSM_OK) {
+        memcpy(destino, temporal, bytes);
+    }
+    free(temporal);
+    return rc;
 }
 
 int dsm_escribir(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
                  const void *origen, size_t bytes)
 {
-    return copiar(ctx, id, offset, NULL, origen, bytes, 1);
+    if (bytes == 0) {
+        return copiar(ctx, id, offset, NULL, origen, bytes, 1);
+    }
+    void *previo = malloc(bytes);
+    if (previo == NULL) {
+        return DSM_ERR_NOMEM;
+    }
+    int rc = copiar(ctx, id, offset, previo, NULL, bytes, 0);
+    if (rc == DSM_OK) {
+        rc = copiar(ctx, id, offset, NULL, origen, bytes, 1);
+        if (rc != DSM_OK) {
+            int vuelta = copiar(ctx, id, offset, NULL, previo, bytes, 1);
+            if (vuelta != DSM_OK) {
+                rc = vuelta;
+            }
+        }
+    }
+    free(previo);
+    return rc;
+}
+
+static int pedir_stats(dsm_context_t *ctx, uint16_t par, uint8_t seleccion, dsm_stats_reply_t *msg)
+{
+    if (dsm_coherencia_stats(ctx->coherencia, par, seleccion, msg) != 0) {
+        return error_api(errno);
+    }
+    return DSM_OK;
+}
+
+/* Un par apagado no aporta páginas. La consulta lo anota como fuera y sigue. */
+static int par_mudo(int rc)
+{
+    return rc == DSM_ERR_NODO || rc == DSM_ERR_TIEMPO;
+}
+
+static void anotar_fuera(dsm_nodo_info_t *info, const dsm_nodo_cfg_t *nodo)
+{
+    memset(info, 0, sizeof *info);
+    info->id = nodo->id;
+    info->estado = DSM_NODO_FUERA;
+    info->ipv4_host = nodo->ipv4_host;
+    info->puerto = nodo->puerto;
+    info->memoria = nodo->memoria;
+    memcpy(info->nombre, nodo->nombre, DSM_CONSULTA_NOMBRE - 1);
+}
+
+static void llenar_nodo(dsm_nodo_info_t *info, const dsm_ficha_t *ficha, const uint64_t *contadores)
+{
+    memset(info, 0, sizeof *info);
+    info->id = ficha->id;
+    info->estado = ficha->estado;
+    info->ipv4_host = ficha->ipv4_host;
+    info->puerto = ficha->puerto;
+    info->memoria = ficha->memoria;
+    info->base = ficha->base;
+    info->libres = ficha->libres;
+    info->totales = ficha->totales;
+    info->aportados = ficha->totales >= ficha->libres ? ficha->totales - ficha->libres : 0;
+    memcpy(info->nombre, ficha->nombre, DSM_CONSULTA_NOMBRE - 1);
+    memcpy(info->contadores, contadores, sizeof info->contadores);
+}
+
+static int publicar(void *salida, size_t cap, size_t tam, size_t total, const void *origen,
+                    size_t *cantidad)
+{
+    *cantidad = total;
+    if (salida == NULL) {
+        return cap == 0 ? DSM_OK : DSM_ERR_INVAL;
+    }
+    size_t n = total < cap ? total : cap;
+    if (n != 0) {
+        memcpy(salida, origen, n * tam);
+    }
+    return total <= cap ? DSM_OK : DSM_ERR_NOMEM;
+}
+
+int dsm_consultar_nodos(dsm_context_t *ctx, dsm_nodo_info_t *salida, size_t cap, size_t *cantidad)
+{
+    int rc = entrar(ctx);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+    if (cantidad == NULL) {
+        return salir(DSM_ERR_INVAL);
+    }
+    uint16_t nodos = ctx->cfg.cantidad_nodos;
+    dsm_nodo_info_t *tabla = calloc(nodos == 0 ? 1 : nodos, sizeof *tabla);
+    size_t total = 0;
+    if (tabla == NULL) {
+        return salir(DSM_ERR_NOMEM);
+    }
+    for (uint16_t id = 0; id < nodos; id++) {
+        dsm_stats_reply_t msg;
+        rc = pedir_stats(ctx, id, DSM_STATS_NODOS, &msg);
+        if (par_mudo(rc)) {
+            if (total + 1 > nodos) {
+                dsm_nodo_info_t *nueva = realloc(tabla, (total + 1) * sizeof *tabla);
+                if (nueva == NULL) {
+                    free(tabla);
+                    return salir(DSM_ERR_NOMEM);
+                }
+                tabla = nueva;
+            }
+            anotar_fuera(&tabla[total], dsm_config_nodo(&ctx->cfg, id));
+            total++;
+            continue;
+        }
+        if (rc != DSM_OK) {
+            free(tabla);
+            return salir(rc);
+        }
+        uint16_t n = msg.n;
+        if (total + n > nodos) {
+            dsm_nodo_info_t *nueva = realloc(tabla, (total + n) * sizeof *tabla);
+            if (nueva == NULL) {
+                free(msg.paginas);
+                free(tabla);
+                return salir(DSM_ERR_NOMEM);
+            }
+            tabla = nueva;
+        }
+        for (uint16_t i = 0; i < n; i++) {
+            llenar_nodo(&tabla[total + i], &msg.fichas[i], msg.contadores);
+        }
+        total += n;
+        free(msg.paginas);
+    }
+    rc = publicar(salida, cap, sizeof *salida, total, tabla, cantidad);
+    free(tabla);
+    return salir(rc);
+}
+
+int dsm_consultar_paginas(dsm_context_t *ctx, uint16_t hogar, dsm_pagina_info_t *salida,
+                          size_t cap, size_t *cantidad)
+{
+    int rc = entrar(ctx);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+    if (cantidad == NULL || (hogar != DSM_HOGAR_TODOS && hogar >= ctx->cfg.cantidad_nodos)) {
+        return salir(DSM_ERR_INVAL);
+    }
+    uint16_t desde = hogar == DSM_HOGAR_TODOS ? 0 : hogar;
+    uint16_t hasta = hogar == DSM_HOGAR_TODOS ? ctx->cfg.cantidad_nodos : (uint16_t)(hogar + 1u);
+    dsm_pagina_info_t *tabla = NULL;
+    size_t total = 0;
+    for (uint16_t id = desde; id < hasta; id++) {
+        dsm_stats_reply_t msg;
+        rc = pedir_stats(ctx, id, DSM_STATS_AMBOS, &msg);
+        if (par_mudo(rc)) {
+            continue;
+        }
+        if (rc != DSM_OK) {
+            free(tabla);
+            return salir(rc);
+        }
+        uint32_t libres = msg.n > 0 ? msg.fichas[0].libres : 0;
+        if (msg.p != 0) {
+            dsm_pagina_info_t *nueva = realloc(tabla, (total + msg.p) * sizeof *tabla);
+            if (nueva == NULL) {
+                free(msg.paginas);
+                free(tabla);
+                return salir(DSM_ERR_NOMEM);
+            }
+            tabla = nueva;
+            for (uint32_t i = 0; i < msg.p; i++) {
+                const dsm_pagina_consulta_t *p = &msg.paginas[i];
+                tabla[total + i] = (dsm_pagina_info_t){
+                    .gpn = p->gpn,
+                    .mascara = p->mascara,
+                    .proc = p->proc,
+                    .reserva = p->reserva,
+                    .orden = p->orden,
+                    .hogar = p->hogar,
+                    .poseedor = p->poseedor,
+                    .msi = p->msi,
+                    .permiso = p->permiso,
+                    .copias = p->copias,
+                    .memoria_libre = libres,
+                };
+            }
+            total += msg.p;
+        }
+        free(msg.paginas);
+    }
+    rc = publicar(salida, cap, sizeof *salida, total, tabla, cantidad);
+    free(tabla);
+    return salir(rc);
+}
+
+static char letra_msi(uint8_t msi)
+{
+    return msi == DSM_MSI_M ? 'M' : msi == DSM_MSI_S ? 'S' : 'I';
+}
+
+int dsm_imprimir(dsm_context_t *ctx, FILE *salida, int global)
+{
+    int rc = entrar(ctx);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+    if (salida == NULL || (global != 0 && global != 1)) {
+        return salir(DSM_ERR_INVAL);
+    }
+    uint16_t desde = global ? 0 : ctx->nodo;
+    uint16_t hasta = global ? ctx->cfg.cantidad_nodos : (uint16_t)(ctx->nodo + 1u);
+    flockfile(salida);
+    for (uint16_t id = desde; id < hasta; id++) {
+        dsm_stats_reply_t msg;
+        rc = pedir_stats(ctx, id, DSM_STATS_AMBOS, &msg);
+        if (par_mudo(rc)) {
+            const dsm_nodo_cfg_t *nodo = dsm_config_nodo(&ctx->cfg, id);
+            fprintf(salida, "nodo %u estado %u puerto %u aportados 0 libres 0 nombre %s\n",
+                    nodo->id, DSM_NODO_FUERA, nodo->puerto, nodo->nombre);
+            continue;
+        }
+        if (rc != DSM_OK) {
+            funlockfile(salida);
+            return salir(rc);
+        }
+        uint32_t libres = 0;
+        for (uint16_t i = 0; i < msg.n; i++) {
+            const dsm_ficha_t *f = &msg.fichas[i];
+            char nombre[DSM_CONSULTA_NOMBRE];
+            uint32_t aportados = f->totales >= f->libres ? f->totales - f->libres : 0;
+            libres = f->libres;
+            memcpy(nombre, f->nombre, sizeof nombre - 1);
+            nombre[sizeof nombre - 1] = '\0';
+            fprintf(salida,
+                    "nodo %u estado %u puerto %u aportados %u libres %u nombre %s\n",
+                    f->id, f->estado, f->puerto, aportados, f->libres, nombre);
+        }
+        fprintf(salida,
+                "contadores nodo %u lectura %" PRIu64 " escritura %" PRIu64
+                " inv_env %" PRIu64 " inv_rec %" PRIu64 " pag_env %" PRIu64
+                " pag_rec %" PRIu64 " bytes_env %" PRIu64 " bytes_rec %" PRIu64 "\n",
+                msg.emisor, msg.contadores[DSM_CONTA_LECTURA], msg.contadores[DSM_CONTA_ESCRITURA],
+                msg.contadores[DSM_CONTA_INV_ENV], msg.contadores[DSM_CONTA_INV_REC],
+                msg.contadores[DSM_CONTA_PAG_ENV], msg.contadores[DSM_CONTA_PAG_REC],
+                msg.contadores[DSM_CONTA_BYTES_ENV], msg.contadores[DSM_CONTA_BYTES_REC]);
+        for (uint32_t i = 0; i < msg.p; i++) {
+            const dsm_pagina_consulta_t *p = &msg.paginas[i];
+            fprintf(salida,
+                    "pagina gpn %" PRIu64 " hogar %u poseedor %u msi %c reserva %" PRIu32
+                    " orden %" PRIu32 " proceso %" PRIu32 " memoria_libre %u\n",
+                    p->gpn, p->hogar, p->poseedor, letra_msi(p->msi), p->reserva, p->orden,
+                    p->proc, libres);
+        }
+        free(msg.paginas);
+    }
+    funlockfile(salida);
+    return salir(DSM_OK);
 }
 
 int dsm_traducir(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset, void **salida)

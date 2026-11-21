@@ -43,5 +43,8 @@ int dsm_coherencia_resolver(const dsm_pager_peticion_t *peticion, void *contexto
 int dsm_coherencia_copiar_controlado(dsm_coherencia_t *coherencia, uint32_t reserva,
                                      uint64_t gpn, size_t offset, void *scratch, size_t bytes,
                                      int escritura, const struct timespec *plazo);
+/* STATS_REQUEST al par indicado. msg->paginas queda en manos del llamador. */
+int dsm_coherencia_stats(dsm_coherencia_t *coherencia, uint16_t par, uint8_t seleccion,
+                         dsm_stats_reply_t *msg);
 
 #endif
