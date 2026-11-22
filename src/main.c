@@ -98,6 +98,11 @@ static int leer_prototipo(struct servicio *s)
     return 0;
 }
 
+static char letra_msi(uint8_t msi)
+{
+    return msi == DSM_MSI_M ? 'M' : msi == DSM_MSI_S ? 'S' : 'I';
+}
+
 static int imprimir_estado(struct servicio *s)
 {
     dsm_pagina_desc_t pagina;
@@ -105,9 +110,41 @@ static int imprimir_estado(struct servicio *s)
         return -1;
     }
     uint8_t local = pagina.mascara_copias & (UINT64_C(1) << s->id) ? pagina.msi : DSM_MSI_I;
-    char estado = local == DSM_MSI_M ? 'M' : local == DSM_MSI_S ? 'S' : 'I';
     printf("nodo %u estado %c version %" PRIu32 " poseedor %u mascara %" PRIu64 "\n",
-           s->id, estado, pagina.version, pagina.poseedor, pagina.mascara_copias);
+           s->id, letra_msi(local), pagina.version, pagina.poseedor, pagina.mascara_copias);
+    for (uint16_t id = 0; id < s->cfg->cantidad_nodos; id++) {
+        dsm_stats_reply_t msg;
+        if (dsm_coherencia_stats(s->coherencia, id, DSM_STATS_AMBOS, &msg) != 0) {
+            printf("nodo %u sin respuesta\n", id);
+            continue;
+        }
+        uint32_t libres = 0;
+        for (uint16_t i = 0; i < msg.n; i++) {
+            const dsm_ficha_t *f = &msg.fichas[i];
+            char nombre[DSM_NOMBRE_MAX];
+            uint32_t aportados = f->totales >= f->libres ? f->totales - f->libres : 0;
+            libres = f->libres;
+            memcpy(nombre, f->nombre, sizeof nombre - 1);
+            nombre[sizeof nombre - 1] = '\0';
+            printf("nodo %u ficha estado %u puerto %u aportados %u libres %u nombre %s\n",
+                   f->id, f->estado, f->puerto, aportados, f->libres, nombre);
+        }
+        printf("nodo %u contadores lectura %" PRIu64 " escritura %" PRIu64
+               " inv_env %" PRIu64 " inv_rec %" PRIu64 " pag_env %" PRIu64
+               " pag_rec %" PRIu64 " bytes_env %" PRIu64 " bytes_rec %" PRIu64 "\n",
+               msg.emisor, msg.contadores[DSM_CONTA_LECTURA], msg.contadores[DSM_CONTA_ESCRITURA],
+               msg.contadores[DSM_CONTA_INV_ENV], msg.contadores[DSM_CONTA_INV_REC],
+               msg.contadores[DSM_CONTA_PAG_ENV], msg.contadores[DSM_CONTA_PAG_REC],
+               msg.contadores[DSM_CONTA_BYTES_ENV], msg.contadores[DSM_CONTA_BYTES_REC]);
+        for (uint32_t i = 0; i < msg.p; i++) {
+            const dsm_pagina_consulta_t *p = &msg.paginas[i];
+            printf("pagina gpn %" PRIu64 " hogar %u poseedor %u msi %c reserva %" PRIu32
+                   " orden %" PRIu32 " proceso %" PRIu32 " memoria_libre %u\n",
+                   p->gpn, p->hogar, p->poseedor, letra_msi(p->msi), p->reserva, p->orden,
+                   p->proc, libres);
+        }
+        free(msg.paginas);
+    }
     return 0;
 }
 

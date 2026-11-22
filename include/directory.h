@@ -8,6 +8,7 @@
 #include "protocol.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -44,7 +45,20 @@ typedef struct dsm_pagina_desc {
     void *ubicacion_local;
     uint32_t orden;
     uint8_t perdida;
+    uint32_t proc;
 } dsm_pagina_desc_t;
+
+enum {
+    DSM_CONTA_LECTURA = 0,
+    DSM_CONTA_ESCRITURA,
+    DSM_CONTA_INV_ENV,
+    DSM_CONTA_INV_REC,
+    DSM_CONTA_PAG_ENV,
+    DSM_CONTA_PAG_REC,
+    DSM_CONTA_BYTES_ENV,
+    DSM_CONTA_BYTES_REC,
+    DSM_CONTA_N
+};
 
 typedef struct dsm_directorio {
     uint16_t nodo_id;
@@ -92,6 +106,8 @@ typedef struct dsm_directorio {
     uint8_t ack_trama[DSM_CONTROL_BYTES];
     uint8_t *campana_buf;
     size_t campana_cap;
+    dsm_nodo_cfg_t local;
+    _Atomic uint64_t contadores[DSM_CONTA_N];
 } dsm_directorio_t;
 
 /* Un directorio inicializado contiene un mutex y no se copia. */
@@ -180,5 +196,10 @@ void dsm_directorio_par_fuera(dsm_directorio_t *dir, uint16_t par);
 void dsm_directorio_par_linea(dsm_directorio_t *dir, uint16_t par);
 /* Retardo del poseedor antes de reconocer una invalidacion. Cero en produccion. */
 void dsm_directorio_fijar_retardo(dsm_directorio_t *dir, uint32_t ms);
+void dsm_directorio_contar(dsm_directorio_t *dir, int indice, uint64_t n);
+/* Copia las paginas conocidas y los ocho contadores. paginas puede ser NULL. */
+int dsm_directorio_exportar(dsm_directorio_t *dir, uint64_t contadores[DSM_CONTA_N],
+                            dsm_pagina_desc_t *paginas, size_t capacidad, size_t *cantidad,
+                            uint32_t *libres, uint32_t *totales);
 
 #endif

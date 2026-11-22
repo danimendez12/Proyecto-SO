@@ -248,6 +248,7 @@ int dsm_directorio_init(dsm_directorio_t *dir, const dsm_config_t *cfg, uint16_t
     dir->paginas_totales = (uint32_t)paginas;
     dir->paginas_libres = dir->paginas_totales;
     dir->siguiente_local = 1;
+    dir->local = *nodo;
     dir->ocupadas = calloc(dir->paginas_totales, 1);
     if (dir->ocupadas == NULL) {
         pthread_cond_destroy(&dir->campana_cv);
@@ -1651,6 +1652,8 @@ static int enviar_pagina(dsm_directorio_t *dir, uint16_t destino, uint32_t id_co
         rc = enviar_fuera(dir, destino, buf, n);
     }
     if (rc == 0 && estado == DSM_ESTADO_OK && datos != NULL) {
+        dsm_directorio_contar(dir, DSM_CONTA_PAG_ENV, 1);
+        dsm_directorio_contar(dir, DSM_CONTA_BYTES_ENV, datos->page_nbytes);
         printf("nodo %u PAGE_DATA enviado par %u reserva %" PRIu32 " gpn %" PRIu64
                " bytes %" PRIu32 " trama %zu corr %" PRIu32 "\n",
                dir->nodo_id, destino, datos->reserva_id, datos->gpn, datos->page_nbytes, n,
@@ -1794,6 +1797,7 @@ static int atender_invalidate(dsm_directorio_t *dir, uint16_t par, const uint8_t
         resultado = DSM_INVALIDA_HECHO;
     }
     pthread_mutex_unlock(&dir->mutex);
+    dsm_directorio_contar(dir, DSM_CONTA_INV_REC, 1);
     printf("nodo %u INVALIDATE recibido par %u gpn %" PRIu64 " solicitud %" PRIu32 "\n",
            dir->nodo_id, par, msg.gpn, msg.id_solicitud);
 
@@ -2026,9 +2030,12 @@ static int pedir_invalidacion_plazo(dsm_directorio_t *dir, uint16_t destino, uin
     size_t n = 0;
     int rc = -1;
     uint8_t ack_raw[DSM_CONTROL_BYTES];
-    if (dsm_invalidate_codificar(envio, sizeof envio, &cab, &msg, &n) == 0 &&
-        enviar_fuera(dir, destino, envio, n) == 0 &&
-        campana_esperar(dir, 0, 1, ack_raw, NULL, NULL, limite) == 0) {
+    int enviado = dsm_invalidate_codificar(envio, sizeof envio, &cab, &msg, &n) == 0 &&
+                  enviar_fuera(dir, destino, envio, n) == 0;
+    if (enviado) {
+        dsm_directorio_contar(dir, DSM_CONTA_INV_ENV, 1);
+    }
+    if (enviado && campana_esperar(dir, 0, 1, ack_raw, NULL, NULL, limite) == 0) {
         dsm_cabecera_t cab_ack;
         dsm_invalidate_ack_t ack;
         if (dsm_invalidate_ack_decodificar(ack_raw, DSM_CONTROL_BYTES, &cab_ack, &ack) == 0 &&
@@ -2539,11 +2546,19 @@ static int atender_pedido(dsm_directorio_t *dir, uint16_t par, const uint8_t *tr
             return enviar_pagina(dir, par, cab.id_msg, DSM_ESTADO_RANGO, NULL);
         }
     }
+    pthread_mutex_lock(&dir->mutex);
+    size_t anotada = indice_gpn(dir, pedido.gpn);
+    if (anotada < dir->npaginas) {
+        dir->paginas[anotada].proc = pedido.proc_id;
+    }
+    pthread_mutex_unlock(&dir->mutex);
     if (pedido.acceso == DSM_ACCESO_ESCRITURA) {
         return conceder_escritura(dir, par, &cab, &pedido);
     }
     return atender_lectura(dir, par, &cab, &pedido);
 }
+
+static int atender_stats(dsm_directorio_t *dir, uint16_t par, const uint8_t *trama, size_t n);
 
 static int procesar_item(dsm_directorio_t *dir, uint16_t par, const uint8_t *trama, size_t n)
 {
@@ -2569,6 +2584,9 @@ static int procesar_item(dsm_directorio_t *dir, uint16_t par, const uint8_t *tra
     }
     if (cab.tipo == DSM_TIPO_PAGE_DOWNGRADE) {
         return atender_downgrade(dir, par, trama, n);
+    }
+    if (cab.tipo == DSM_TIPO_STATS_REQUEST) {
+        return atender_stats(dir, par, trama, n);
     }
     errno = EPROTO;
     return -1;
@@ -2730,7 +2748,8 @@ int dsm_directorio_ofrecer(dsm_directorio_t *dir, uint16_t par, const uint8_t *t
     }
     if (cab.tipo != DSM_TIPO_PAGE_REQUEST && cab.tipo != DSM_TIPO_INVALIDATE &&
         cab.tipo != DSM_TIPO_PAGE_DOWNGRADE && cab.tipo != DSM_TIPO_REGION_LOOKUP &&
-        cab.tipo != DSM_TIPO_REGION_CLOSE && cab.tipo != DSM_TIPO_REGION_COPY_CLOSE) {
+        cab.tipo != DSM_TIPO_REGION_CLOSE && cab.tipo != DSM_TIPO_REGION_COPY_CLOSE &&
+        cab.tipo != DSM_TIPO_STATS_REQUEST) {
         errno = EPROTO;
         return -1;
     }
@@ -3084,4 +3103,138 @@ int dsm_directorio_copiar_controlado(dsm_directorio_t *dir, uint32_t reserva, ui
         return -1;
     }
     return 0;
+}
+
+static uint8_t copias_de(uint64_t mascara)
+{
+    uint8_t n = 0;
+    while (mascara != 0) {
+        n = (uint8_t)(n + (mascara & 1u));
+        mascara >>= 1;
+    }
+    return n;
+}
+
+void dsm_directorio_contar(dsm_directorio_t *dir, int indice, uint64_t n)
+{
+    if (dir == NULL || !dir->inicializado || indice < 0 || indice >= DSM_CONTA_N || n == 0) {
+        return;
+    }
+    atomic_fetch_add_explicit(&dir->contadores[indice], n, memory_order_relaxed);
+}
+
+int dsm_directorio_exportar(dsm_directorio_t *dir, uint64_t contadores[DSM_CONTA_N],
+                            dsm_pagina_desc_t *paginas, size_t capacidad, size_t *cantidad,
+                            uint32_t *libres, uint32_t *totales)
+{
+    if (contadores == NULL || cantidad == NULL || !bloquear(dir)) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (int i = 0; i < DSM_CONTA_N; i++) {
+        contadores[i] = atomic_load_explicit(&dir->contadores[i], memory_order_relaxed);
+    }
+    *cantidad = dir->npaginas;
+    if (libres != NULL) {
+        *libres = dir->paginas_libres;
+    }
+    if (totales != NULL) {
+        *totales = dir->paginas_totales;
+    }
+    int rc = 0;
+    if (paginas != NULL) {
+        if (capacidad < dir->npaginas) {
+            errno = ENOMEM;
+            rc = -1;
+        } else if (dir->npaginas != 0) {
+            memcpy(paginas, dir->paginas, dir->npaginas * sizeof *paginas);
+        }
+    }
+    pthread_mutex_unlock(&dir->mutex);
+    return rc;
+}
+
+static int atender_stats(dsm_directorio_t *dir, uint16_t par, const uint8_t *trama, size_t n)
+{
+    dsm_cabecera_t pedido;
+    dsm_stats_request_t pedido_stats;
+    if (dsm_stats_request_decodificar(trama, n, &pedido, &pedido_stats) != 0 || pedido.origen != par) {
+        errno = EPROTO;
+        return -1;
+    }
+    uint64_t contadores[DSM_CONTA_N];
+    size_t np = 0;
+    uint32_t libres = 0;
+    uint32_t totales = 0;
+    if (dsm_directorio_exportar(dir, contadores, NULL, 0, &np, &libres, &totales) != 0) {
+        return -1;
+    }
+    int con_paginas = pedido_stats.seleccion != DSM_STATS_NODOS;
+    int con_nodos = pedido_stats.seleccion != DSM_STATS_PAGINAS;
+    dsm_pagina_desc_t *desc = NULL;
+    dsm_pagina_consulta_t *consultas = NULL;
+    if (con_paginas && np != 0) {
+        desc = calloc(np, sizeof *desc);
+        consultas = calloc(np, sizeof *consultas);
+        size_t n2 = 0;
+        if (desc == NULL || consultas == NULL ||
+            dsm_directorio_exportar(dir, contadores, desc, np, &n2, &libres, &totales) != 0) {
+            free(desc);
+            free(consultas);
+            return -1;
+        }
+        np = n2;
+        for (size_t i = 0; i < np; i++) {
+            consultas[i] = (dsm_pagina_consulta_t){
+                .gpn = desc[i].gpn,
+                .mascara = desc[i].mascara_copias,
+                .proc = desc[i].proc,
+                .reserva = desc[i].reserva,
+                .orden = desc[i].orden,
+                .hogar = desc[i].hogar,
+                .poseedor = desc[i].poseedor,
+                .msi = desc[i].msi,
+                .permiso = desc[i].msi == DSM_MSI_M ? DSM_PAGE_PERMISO_ESCRIBIR :
+                           desc[i].msi == DSM_MSI_S ? DSM_PAGE_PERMISO_LEER : 0,
+                .copias = copias_de(desc[i].mascara_copias),
+            };
+        }
+    }
+    dsm_stats_reply_t msg;
+    memset(&msg, 0, sizeof msg);
+    msg.emisor = dir->nodo_id;
+    msg.n = con_nodos ? 1 : 0;
+    msg.p = con_paginas ? (uint32_t)np : 0;
+    msg.paginas = consultas;
+    memcpy(msg.contadores, contadores, sizeof msg.contadores);
+    if (con_nodos) {
+        msg.fichas[0].id = dir->local.id;
+        msg.fichas[0].estado = DSM_NODO_EN_LINEA;
+        msg.fichas[0].ipv4_host = dir->local.ipv4_host;
+        msg.fichas[0].puerto = dir->local.puerto;
+        msg.fichas[0].memoria = dir->local.memoria;
+        msg.fichas[0].base = dir->limites_gpn[dir->nodo_id] * (uint64_t)dir->page_size;
+        msg.fichas[0].libres = libres;
+        msg.fichas[0].totales = totales;
+        memcpy(msg.fichas[0].nombre, dir->local.nombre, DSM_NOMBRE_MAX);
+    }
+    uint32_t id = dir->nuevo_id == NULL ? 0 : dir->nuevo_id(dir->envio_ctx);
+    dsm_cabecera_t cab = cabecera_de(dir, DSM_TIPO_STATS_REPLY, par, id);
+    cab.banderas = DSM_FLAG_RESPUESTA;
+    cab.id_corr = pedido.id_msg;
+    size_t cap = DSM_STATS_PREF + (size_t)msg.n * 104u + (size_t)msg.p * DSM_FICHA_PAGINA;
+    uint8_t *buf = malloc(cap);
+    size_t out = 0;
+    int rc = -1;
+    if (buf != NULL && id != 0 &&
+        dsm_stats_reply_codificar(buf, cap, &cab, &msg, &out) == 0 &&
+        enviar_fuera(dir, par, buf, out) == 0) {
+        rc = 0;
+    } else {
+        errno = EPROTO;
+    }
+    free(buf);
+    free(consultas);
+    free(desc);
+    return rc;
 }
