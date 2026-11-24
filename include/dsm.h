@@ -21,7 +21,8 @@ enum {
     DSM_ERR_PROTO = -7,
     DSM_ERR_CERRADO = -8,
     DSM_ERR_OCUPADA = -9,
-    DSM_ERR_HILOS = -10
+    DSM_ERR_HILOS = -10,
+    DSM_ERR_PARCIAL = -11
 };
 
 /* Un contexto activo por proceso. El cierre exitoso consume ctx. */
@@ -49,8 +50,17 @@ int dsm_ubicacion_pagina(dsm_context_t *ctx, dsm_reserva_id_t id, size_t orden,
 int dsm_desvincular_reserva(dsm_context_t *ctx, dsm_reserva_id_t id);
 int dsm_liberar(dsm_context_t *ctx, dsm_reserva_id_t id);
 
-/* Copian el rango completo o dejan el destino como estaba. bytes == 0 admite
- * un puntero nulo y no toca memoria. */
+/* Validan el rango antes de copiar; bytes == 0 admite un puntero nulo.
+ * Una lectura hacia memoria ordinaria conserva el destino ante un error DSM.
+ * Las escrituras y las lecturas hacia otra vista DSM avanzan por trozos: un
+ * error puede dejar parte del destino modificada. Escribir intenta restaurar
+ * localmente solo los trozos que aun conserva en M, en su misma version y
+ * con los bytes que escribio; no pide permisos ni reemplaza cambios ajenos.
+ * Si no puede restaurar todo, devuelve igualmente el fallo original.
+ * Admiten solapamiento como memmove y registran temporalmente el hilo si hace
+ * falta. No ofrecen una transaccion ni una instantanea distribuida; el acceso
+ * directo Ar local solapado y los buffers ordinarios requieren sincronizacion
+ * del llamador durante toda la operacion, incluida la restauracion. */
 int dsm_leer(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
               void *destino, size_t bytes);
 int dsm_escribir(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
@@ -90,29 +100,46 @@ typedef struct dsm_pagina_info {
     uint8_t msi;
     uint8_t permiso;
     uint8_t copias;
-    uint32_t memoria_libre;
+    uint32_t memoria_libre; /* páginas libres en el hogar */
+    uint32_t version;
 } dsm_pagina_info_t;
 
 /* Si cap no alcanza, escribe solo las primeras cap entradas, informa el total
  * en cantidad y devuelve DSM_ERR_NOMEM. cap 0 con salida NULL solo cuenta. */
 int dsm_consultar_nodos(dsm_context_t *ctx, dsm_nodo_info_t *salida, size_t cap,
                         size_t *cantidad);
-/* hogar DSM_HOGAR_TODOS reúne las páginas de todos los nodos. */
+/* Una fila por página en su hogar. DSM_ERR_PARCIAL con TODOS entrega las
+ * filas disponibles si algún puesto está fuera. Un hogar explícito devuelve
+ * su error. Las observaciones de distintos hogares no son simultáneas. */
 int dsm_consultar_paginas(dsm_context_t *ctx, uint16_t hogar, dsm_pagina_info_t *salida,
                           size_t cap, size_t *cantidad);
 /* global distinto de cero incluye los demás nodos. */
 int dsm_imprimir(dsm_context_t *ctx, FILE *salida, int global);
 
 /* Ocupa el primer puesto del pool cuya IPv4 es local y cuyo puerto está libre.
- * El candado sigue tomado durante la vida del proceso. */
+ * Un reclamo por proceso; el cierre DSM exitoso lo devuelve. */
 int dsm_pool_reclamar(const char *ruta, uint16_t *id);
-/* Publica un aviso y lo inunda a los puestos ya conectados. Un puesto que
- * entre después lo recibe al completar el HELLO. */
+void dsm_pool_liberar(void);
+/* Ronda inicial de descubrimiento: reintenta puestos ausentes durante un
+ * plazo comun y termina antes si todos estan conectados. Los ausentes al
+ * vencer el plazo son normales. No acuerda membresia entre particiones. */
+int dsm_sondear(dsm_context_t *ctx, uint32_t plazo_ms);
+/* Avisos por autor y sesion, difundidos asincronamente en la malla TCP.
+ * Todos los participantes de las apps usan esta misma revision. Una clave
+ * tiene 1..31 bytes, datos 0..128. Tabla acotada a 128 entradas por contexto;
+ * las retiradas se reciclan al entregarse. Saturacion local devuelve NOMEM
+ * sin cerrar conexiones.
+ * Consultar observa solo autores de una sesion actualmente conectada.
+ * Publicar no es una barrera de entrega ni un consenso de participantes. */
 int dsm_aviso_publicar(dsm_context_t *ctx, const char *clave, const void *datos, size_t n);
 int dsm_aviso_consultar(dsm_context_t *ctx, const char *clave, uint16_t *autor,
                         void *datos, size_t n);
 int dsm_aviso_participantes(dsm_context_t *ctx, const char *clave, uint16_t *autores,
                             size_t cap, size_t *cantidad);
+int dsm_aviso_consultar_autor(dsm_context_t *ctx, const char *clave,
+                              uint16_t autor, void *datos, size_t n);
+int dsm_aviso_retirar(dsm_context_t *ctx, const char *clave);
+int dsm_aviso_sesion(dsm_context_t *ctx, uint16_t autor, uint64_t *sesion);
 /* Los punteros prestados se usan desde hilos registrados hasta liberar o cerrar. */
 int dsm_traducir(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset, void **salida);
 

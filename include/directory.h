@@ -95,7 +95,7 @@ typedef struct dsm_directorio {
     dsm_directorio_id_t nuevo_id;
     void *envio_ctx;
     uint32_t retardo_ms;
-    uint32_t fuera;
+    uint64_t fuera;
     int campana_espera;
     uint16_t campana_par;
     uint32_t campana_id;
@@ -180,6 +180,15 @@ int dsm_directorio_describir(dsm_directorio_t *dir, uint64_t gpn, dsm_pagina_des
  */
 int dsm_directorio_copiar_controlado(dsm_directorio_t *dir, uint32_t reserva, uint64_t gpn,
                                      size_t offset, void *scratch, size_t bytes, int escritura);
+/* Captura y escritura atomicas respecto del directorio. Los buffers son del
+ * gestor; restaurar no pide permisos ni cambia version/estado MSI. Ar local
+ * solapada requiere sincronizacion de la aplicacion tambien durante la copia. */
+int dsm_directorio_escribir_respaldo(dsm_directorio_t *dir, uint32_t reserva, uint64_t gpn,
+                                     size_t offset, const void *nuevo, void *previo,
+                                     size_t bytes, uint32_t *version);
+int dsm_directorio_restaurar_respaldo(dsm_directorio_t *dir, uint32_t reserva, uint64_t gpn,
+                                      size_t offset, const void *previo, const void *escrito,
+                                      size_t bytes, uint32_t version);
 /* Copia la version vigente. Si el poseedor es remoto, pide la bajada por la red activa. */
 int dsm_directorio_copiar(dsm_directorio_t *dir, uint64_t gpn, void *imagen, size_t n,
                           dsm_pagina_desc_t *desc);

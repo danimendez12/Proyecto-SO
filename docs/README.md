@@ -1,5 +1,10 @@
 # Documentación del DSM
 
+Para la versión de entrega consultá la [arquitectura final](arquitectura-final.md),
+la [validación del Paso 13B](validacion-13b.md) y la [guía de laboratorio](guia-laboratorio.md).
+Las secciones siguientes conservan las decisiones y evidencias de los prototipos anteriores.
+
+
 Este directorio reúne las decisiones de arquitectura y las evidencias de prueba.
 
 ## Paso 11B-C · Reservas multihogar

@@ -30,6 +30,7 @@ typedef struct dsm_par {
     uint32_t ipv4_host;
     uint64_t memoria;
     uint64_t base;
+    uint64_t sesion;
     char nombre[DSM_NOMBRE_MAX];
 } dsm_par_t;
 
@@ -57,6 +58,16 @@ typedef int (*dsm_red_trama_t)(void *ctx, uint16_t peer, const dsm_cabecera_t *c
  */
 int dsm_red_iniciar(dsm_red_t **out, const dsm_config_t *cfg, uint16_t self,
                     dsm_red_trama_t atender, void *ctx);
+/* Sesion no nula para avisos. La interfaz anterior conserva alta heredada. */
+int dsm_red_iniciar_sesion(dsm_red_t **out, const dsm_config_t *cfg, uint16_t self,
+                           dsm_red_trama_t atender, void *ctx, uint64_t sesion);
+int dsm_red_sesion_par(dsm_red_t *red, uint16_t par, uint64_t *sesion);
+/* Epoca local del fd: el envio comprueba y reserva ese mismo enlace bajo el
+ * mutex de red, para que un snapshot no cruce a una conexion reemplazada. */
+int dsm_red_enlace_par(dsm_red_t *red, uint16_t par, uint64_t *sesion, uint64_t *epoca);
+int dsm_red_enviar_enlace(dsm_red_t *red, uint16_t par, uint64_t epoca,
+                           const uint8_t *buf, size_t n);
+int dsm_red_sondear(dsm_red_t *red, uint32_t plazo_ms);
 /* Cierra tras terminar las operaciones externas y espera a los lectores. */
 void dsm_red_cerrar(dsm_red_t *red);
 int dsm_red_enviar(dsm_red_t *red, uint16_t peer, const uint8_t *buf, size_t n);

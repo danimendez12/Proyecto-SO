@@ -298,6 +298,7 @@ struct alta_ctx {
     uint16_t self;
     uint16_t peer;
     uint64_t plazo;
+    uint64_t sesion_local;
     uint32_t seq;
     uint32_t id_hello;
     int tiene;
@@ -358,6 +359,7 @@ static int enviar_hello(struct alta_ctx *cx)
     msg.puerto = yo->puerto;
     msg.memoria = yo->memoria;
     msg.base = dsm_config_base(cx->cfg, yo->id);
+    msg.sesion = cx->sesion_local;
     memcpy(msg.nombre, yo->nombre, DSM_NOMBRE_MAX);
 
     dsm_cabecera_t cab;
@@ -370,7 +372,7 @@ static int enviar_hello(struct alta_ctx *cx)
     cab.estado = DSM_ESTADO_OK;
     cx->id_hello = cab.id_msg;
 
-    uint8_t buf[128];
+    uint8_t buf[136];
     size_t n = 0;
     if (dsm_hello_codificar(buf, sizeof buf, &cab, &msg, &n) != 0) {
         return -1;
@@ -532,6 +534,7 @@ static int tomar_hello(struct alta_ctx *cx, const uint8_t *buf, size_t n,
         return responder_fuera_de_rango(cx, cab->origen, cab->id_msg);
     }
     cx->hello = 1;
+    cx->par.sesion = msg.sesion;
     cx->estado_tras_hello = cx->par.estado;
     return 0;
 }
@@ -683,8 +686,8 @@ static int secuencia_servidor(struct alta_ctx *cx, int identificar_par)
     return ronda_latido_primero_el(cx);
 }
 
-static int alta(int fd, const dsm_config_t *cfg, uint16_t self_id, uint16_t peer_id,
-                int identificar_par, dsm_alta_resultado_t *out)
+static int realizar_alta(int fd, const dsm_config_t *cfg, uint16_t self_id, uint16_t peer_id,
+                int identificar_par, dsm_alta_resultado_t *out, uint64_t sesion)
 {
     if (cfg == NULL || out == NULL || cfg->page_size == 0 ||
         dsm_config_nodo(cfg, self_id) == NULL ||
@@ -699,6 +702,7 @@ static int alta(int fd, const dsm_config_t *cfg, uint16_t self_id, uint16_t peer
     cx.self = self_id;
     cx.peer = peer_id;
     cx.seq = 1;
+    cx.sesion_local = sesion;
     if (iniciar_plazo(cfg->rpc_timeout_ms, &cx.plazo) != 0) {
         return -1;
     }
@@ -721,12 +725,12 @@ static int alta(int fd, const dsm_config_t *cfg, uint16_t self_id, uint16_t peer
 int dsm_alta_par(int fd, const dsm_config_t *cfg, uint16_t self_id, uint16_t peer_id,
                  dsm_alta_resultado_t *out)
 {
-    return alta(fd, cfg, self_id, peer_id, 0, out);
+    return realizar_alta(fd, cfg, self_id, peer_id, 0, out, 0);
 }
 
 int dsm_alta_aceptada(int fd, const dsm_config_t *cfg, uint16_t self_id, dsm_alta_resultado_t *out)
 {
-    return alta(fd, cfg, self_id, 0, 1, out);
+    return realizar_alta(fd, cfg, self_id, 0, 1, out, 0);
 }
 
 struct red_par {
@@ -735,6 +739,8 @@ struct red_par {
     int enviando;
     uint8_t estado;
     int sonda;
+    uint64_t sesion;
+    uint64_t epoca;
 };
 
 struct red_trabajador {
@@ -744,11 +750,13 @@ struct red_trabajador {
     int creado;
     int fd;
     uint8_t *buf;
+    uint64_t sondear_hasta;
 };
 
 struct dsm_red {
     const dsm_config_t *cfg;
     uint16_t self;
+    uint64_t sesion;
     dsm_red_trama_t atender;
     void *ctx;
     int escucha;
@@ -859,7 +867,8 @@ int dsm_red_destinos(dsm_red_t *red, uint16_t *ids, uint16_t cap, uint16_t *cant
     return n <= cap ? 0 : error_red(ENOSPC);
 }
 
-int dsm_red_enviar(dsm_red_t *red, uint16_t par, const uint8_t *buf, size_t n)
+static int enviar_enlace(dsm_red_t *red, uint16_t par, const uint8_t *buf, size_t n,
+                          uint64_t epoca)
 {
     if (!par_valido(red, par) || buf == NULL || n < DSM_CABECERA_BYTES || n > DSM_LONGITUD_MAX) {
         return error_red(EINVAL);
@@ -872,12 +881,13 @@ int dsm_red_enviar(dsm_red_t *red, uint16_t par, const uint8_t *buf, size_t n)
     struct red_par *enlace = &red->pares[par];
     pthread_mutex_lock(&red->mutex);
     int error = 0;
-    while (!red->cerrando && enlace->activo && enlace->enviando && error == 0) {
+    while (!red->cerrando && enlace->activo && enlace->enviando && error == 0 &&
+           (epoca == 0 || epoca == enlace->epoca)) {
         error = esperar_cambio(red, plazo);
     }
     if (red->cerrando) {
         error = ECANCELED;
-    } else if (!enlace->activo) {
+    } else if (!enlace->activo || (epoca != 0 && epoca != enlace->epoca)) {
         error = ENOTCONN;
     }
     if (error != 0) {
@@ -902,17 +912,30 @@ int dsm_red_enviar(dsm_red_t *red, uint16_t par, const uint8_t *buf, size_t n)
     return rc == 0 ? 0 : error_red(error);
 }
 
+int dsm_red_enviar(dsm_red_t *red, uint16_t par, const uint8_t *buf, size_t n)
+{
+    return enviar_enlace(red, par, buf, n, 0);
+}
+
+int dsm_red_enviar_enlace(dsm_red_t *red, uint16_t par, uint64_t epoca,
+                           const uint8_t *buf, size_t n)
+{
+    return epoca == 0 ? error_red(EINVAL) : enviar_enlace(red, par, buf, n, epoca);
+}
+
 static int registrar_conexion(dsm_red_t *red, int fd, const dsm_alta_resultado_t *alta)
 {
     struct red_par *enlace = &red->pares[alta->par.id];
     dsm_red_estado_t fn = NULL;
     void *ctx = NULL;
     pthread_mutex_lock(&red->mutex);
-    int registrar = !red->cerrando && enlace->fd < 0;
+    int registrar = !red->cerrando && enlace->fd < 0 && enlace->epoca != UINT64_MAX;
     if (registrar) {
         enlace->fd = fd;
         enlace->activo = 1;
         enlace->estado = DSM_NODO_EN_LINEA;
+        enlace->sesion = alta->par.sesion;
+        enlace->epoca++;
         fn = red->al_estado;
         ctx = red->estado_ctx;
         if (red->siguiente < alta->siguiente_msg) {
@@ -1164,8 +1187,8 @@ static int procesar_conexion(struct red_trabajador *trabajador, int saliente)
     dsm_red_t *red = trabajador->red;
     int fd = trabajador->fd;
     dsm_alta_resultado_t alta;
-    int rc = saliente ? dsm_alta_par(fd, red->cfg, red->self, trabajador->indice, &alta)
-                      : dsm_alta_aceptada(fd, red->cfg, red->self, &alta);
+    int rc = realizar_alta(fd, red->cfg, red->self, saliente ? trabajador->indice : 0,
+                  !saliente, &alta, red->sesion);
     struct red_par *enlace = NULL;
     if (rc == 0 && registrar_conexion(red, fd, &alta)) {
         enlace = &red->pares[alta.par.id];
@@ -1188,18 +1211,26 @@ static int procesar_conexion(struct red_trabajador *trabajador, int saliente)
     return rc;
 }
 
-static int esperar_reintento(dsm_red_t *red)
+static int esperar_reintento(struct red_trabajador *trabajador)
 {
-    uint64_t plazo;
-    if (iniciar_plazo(red->cfg->heartbeat_intervalo_ms, &plazo) != 0) {
+    dsm_red_t *red = trabajador->red;
+    pthread_mutex_lock(&red->mutex);
+    uint64_t ahora;
+    if (monotono_ms(&ahora) != 0) {
+        pthread_mutex_unlock(&red->mutex);
         return 0;
     }
-    pthread_mutex_lock(&red->mutex);
+    uint64_t ronda = trabajador->sondear_hasta;
+    uint64_t demora = red->cfg->heartbeat_intervalo_ms;
+    if (ronda > ahora) {
+        demora = ronda - ahora < 100 ? ronda - ahora : 100;
+    }
+    uint64_t plazo = ahora + demora;
     int error = 0;
-    while (!red->cerrando && error == 0) {
+    while (!red->cerrando && error == 0 && trabajador->sondear_hasta == ronda) {
         error = esperar_cambio(red, plazo);
     }
-    int seguir = !red->cerrando && error == ETIMEDOUT;
+    int seguir = !red->cerrando && (error == 0 || error == ETIMEDOUT);
     pthread_mutex_unlock(&red->mutex);
     return seguir;
 }
@@ -1232,7 +1263,42 @@ static void conectar_pares(struct red_trabajador *trabajador)
             }
         }
         aviso = rc != 0;
-    } while (esperar_reintento(red));
+    } while (esperar_reintento(trabajador));
+}
+
+int dsm_red_sondear(dsm_red_t *red, uint32_t plazo_ms)
+{
+    uint64_t plazo;
+    if (red == NULL || plazo_ms == 0) {
+        return error_red(EINVAL);
+    }
+    if (iniciar_plazo(plazo_ms, &plazo) != 0) {
+        return -1;
+    }
+    pthread_mutex_lock(&red->mutex);
+    for (uint16_t i = red->self + 1u; i < red->cfg->cantidad_nodos; i++) {
+        if (red->trabajadores[i].sondear_hasta < plazo) {
+            red->trabajadores[i].sondear_hasta = plazo;
+        }
+    }
+    pthread_cond_broadcast(&red->cambio);
+    int error = 0;
+    while (!red->cerrando) {
+        int ausente = 0;
+        for (uint16_t i = 0; i < red->cfg->cantidad_nodos; i++) {
+            if (i != red->self && !red->pares[i].activo) {
+                ausente = 1;
+                break;
+            }
+        }
+        if (!ausente) break;
+        error = esperar_cambio(red, plazo);
+        if (error != 0) break;
+    }
+    if (red->cerrando) error = ECANCELED;
+    pthread_mutex_unlock(&red->mutex);
+    /* El presupuesto limita el sondeo de todos los ausentes juntos. */
+    return error == 0 || error == ETIMEDOUT ? 0 : error_red(error);
 }
 
 static void aceptar_pares(struct red_trabajador *trabajador)
@@ -1312,10 +1378,45 @@ void dsm_red_observar(dsm_red_t *red, dsm_red_estado_t fn, void *ctx)
     if (red == NULL) {
         return;
     }
+    uint64_t activos = 0;
     pthread_mutex_lock(&red->mutex);
     red->al_estado = fn;
     red->estado_ctx = ctx;
+    for (uint16_t i = 0; i < red->cfg->cantidad_nodos; i++) {
+        if (red->pares[i].activo) {
+            activos |= UINT64_C(1) << i;
+        }
+    }
     pthread_mutex_unlock(&red->mutex);
+    /* El alta puede terminar antes de instalar el observador. Nunca se llama
+     * al cliente manteniendo el mutex de red. El cliente revalida la sesion. */
+    for (uint16_t i = 0; fn != NULL && i < red->cfg->cantidad_nodos; i++) {
+        if ((activos & (UINT64_C(1) << i)) != 0) {
+            fn(ctx, i, DSM_NODO_EN_LINEA);
+        }
+    }
+}
+
+int dsm_red_enlace_par(dsm_red_t *red, uint16_t par, uint64_t *sesion, uint64_t *epoca)
+{
+    if (!par_valido(red, par) || sesion == NULL || epoca == NULL) {
+        return error_red(EINVAL);
+    }
+    pthread_mutex_lock(&red->mutex);
+    int error = !red->pares[par].activo ? ENOTCONN :
+                red->pares[par].sesion == 0 ? EPROTO : 0;
+    if (error == 0) {
+        *sesion = red->pares[par].sesion;
+        *epoca = red->pares[par].epoca;
+    }
+    pthread_mutex_unlock(&red->mutex);
+    return error == 0 ? 0 : error_red(error);
+}
+
+int dsm_red_sesion_par(dsm_red_t *red, uint16_t par, uint64_t *sesion)
+{
+    uint64_t epoca;
+    return dsm_red_enlace_par(red, par, sesion, &epoca);
 }
 
 int dsm_red_estado(dsm_red_t *red, uint16_t par, uint8_t *estado)
@@ -1381,8 +1482,8 @@ void dsm_red_cerrar(dsm_red_t *red)
     free(red);
 }
 
-int dsm_red_iniciar(dsm_red_t **out, const dsm_config_t *cfg, uint16_t self,
-                    dsm_red_trama_t atender, void *ctx)
+int dsm_red_iniciar_sesion(dsm_red_t **out, const dsm_config_t *cfg, uint16_t self,
+                           dsm_red_trama_t atender, void *ctx, uint64_t sesion)
 {
     if (out == NULL) {
         return error_red(EINVAL);
@@ -1400,6 +1501,7 @@ int dsm_red_iniciar(dsm_red_t **out, const dsm_config_t *cfg, uint16_t self,
     }
     red->cfg = cfg;
     red->self = self;
+    red->sesion = sesion;
     red->atender = atender;
     red->ctx = ctx;
     red->escucha = -1;
@@ -1464,4 +1566,10 @@ int dsm_red_iniciar(dsm_red_t **out, const dsm_config_t *cfg, uint16_t self,
 fallo:
     dsm_red_cerrar(red);
     return error_red(error);
+}
+
+int dsm_red_iniciar(dsm_red_t **out, const dsm_config_t *cfg, uint16_t self,
+                    dsm_red_trama_t atender, void *ctx)
+{
+    return dsm_red_iniciar_sesion(out, cfg, self, atender, ctx, 0);
 }

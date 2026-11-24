@@ -230,9 +230,8 @@ struct equipo_pendiente {
     int puerto_fijo;
 };
 
-/* Un equipo es una computadora. Si no se dice cuántos puestos tiene, el rango
- * 27200–27299 se reparte al cargar: el proceso reclama un puerto libre y el
- * resto se consulta por si ya hay alguien escuchando. */
+/* Sin cupos explícitos, se reparten los puestos entre los equipos al cargar.
+ * Solo los endpoints resultantes participan en el descubrimiento. */
 static int leer_equipo(dsm_config_t *cfg, int *presente, struct equipo_pendiente *pendientes,
                        int *npend, char *valor, int linea)
 {

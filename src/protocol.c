@@ -132,7 +132,8 @@ int dsm_hello_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
     if (msg == NULL || out == NULL) {
         return -1;
     }
-    if (preparar(dst, cap, cab, 128) != 0) {
+    uint32_t longitud = msg->sesion == 0 ? 128u : 136u;
+    if (preparar(dst, cap, cab, longitud) != 0) {
         return -1;
     }
     put_u16(dst + 32, msg->node_id);
@@ -142,7 +143,10 @@ int dsm_hello_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
     put_u64(dst + 48, msg->memoria);
     put_u64(dst + 56, msg->base);
     memcpy(dst + 64, msg->nombre, DSM_NOMBRE_MAX);
-    *out = 128;
+    if (msg->sesion != 0) {
+        put_u64(dst + 128, msg->sesion);
+    }
+    *out = longitud;
     return 0;
 }
 
@@ -151,7 +155,8 @@ int dsm_hello_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, dsm
     if (msg == NULL || dsm_cabecera_decodificar(src, n, cab) != 0) {
         return -1;
     }
-    if (cab->tipo != DSM_TIPO_NODE_HELLO || cab->longitud != 128 || n != 128) {
+    if (cab->tipo != DSM_TIPO_NODE_HELLO || (n != 128 && n != 136) ||
+        cab->longitud != n || (n == 136 && get_u64(src + 128) == 0)) {
         return -1;
     }
     memset(msg, 0, sizeof *msg);
@@ -162,6 +167,7 @@ int dsm_hello_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, dsm
     msg->memoria = get_u64(src + 48);
     msg->base = get_u64(src + 56);
     copiar_nombre(msg->nombre, (const char *)(src + 64));
+    msg->sesion = n == 136 ? get_u64(src + 128) : 0;
     return 0;
 }
 
@@ -820,7 +826,7 @@ int dsm_stats_request_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
     if (msg == NULL || out == NULL || cab == NULL || cab->tipo != DSM_TIPO_STATS_REQUEST ||
         cab->banderas != 0 || cab->id_corr != 0 ||
         (msg->seleccion != DSM_STATS_NODOS && msg->seleccion != DSM_STATS_PAGINAS &&
-         msg->seleccion != DSM_STATS_AMBOS) ||
+         msg->seleccion != DSM_STATS_AMBOS && msg->seleccion != DSM_STATS_HOGAR) ||
         preparar(dst, cap, cab, 40) != 0) {
         return -1;
     }
@@ -835,7 +841,8 @@ int dsm_stats_request_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *
     if (msg == NULL || n != 40 || dsm_cabecera_decodificar(src, n, cab) != 0 ||
         cab->tipo != DSM_TIPO_STATS_REQUEST || cab->banderas != 0 || cab->id_corr != 0 ||
         cab->longitud != 40 ||
-        (src[32] != DSM_STATS_NODOS && src[32] != DSM_STATS_PAGINAS && src[32] != DSM_STATS_AMBOS)) {
+        (src[32] != DSM_STATS_NODOS && src[32] != DSM_STATS_PAGINAS && src[32] != DSM_STATS_AMBOS &&
+         src[32] != DSM_STATS_HOGAR)) {
         return -1;
     }
     msg->seleccion = src[32];
@@ -856,6 +863,7 @@ static void escribir_pagina_consulta(uint8_t *p, const dsm_pagina_consulta_t *pa
     p[33] = pag->permiso;
     p[34] = pag->banderas;
     p[35] = pag->copias;
+    put_u32(p + 36, pag->version);
 }
 
 static void leer_pagina_consulta(const uint8_t *p, dsm_pagina_consulta_t *pag)
@@ -872,6 +880,7 @@ static void leer_pagina_consulta(const uint8_t *p, dsm_pagina_consulta_t *pag)
     pag->permiso = p[33];
     pag->banderas = p[34];
     pag->copias = p[35];
+    pag->version = get_u32(p + 36);
 }
 
 int dsm_stats_reply_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
@@ -1017,5 +1026,58 @@ int dsm_anuncio_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, u
         memcpy(datos, src + DSM_ANUNCIO_BASE, bytes);
     }
     *largo = bytes;
+    return 0;
+}
+
+int dsm_anuncio_versionado_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                     const dsm_anuncio_t *msg, size_t *out)
+{
+    if (msg == NULL || out == NULL || !cabecera_pedido(cab, DSM_TIPO_ANUNCIO) ||
+        msg->sesion == 0 || msg->generacion == 0 || msg->banderas > DSM_ANUNCIO_RETIRADO ||
+        msg->largo > DSM_ANUNCIO_DATOS ||
+        (msg->banderas == DSM_ANUNCIO_RETIRADO && msg->largo != 0) ||
+        (msg->largo != 0 && msg->datos == NULL)) {
+        return -1;
+    }
+    size_t clave_n = strnlen(msg->clave, DSM_ANUNCIO_CLAVE);
+    if (clave_n == 0 || clave_n == DSM_ANUNCIO_CLAVE ||
+        preparar(dst, cap, cab, (uint32_t)(DSM_ANUNCIO_VERSIONADO_BASE + msg->largo)) != 0) {
+        return -1;
+    }
+    put_u16(dst + 32, msg->autor);
+    put_u16(dst + 34, (uint16_t)msg->largo);
+    put_u16(dst + 36, msg->banderas);
+    put_u64(dst + 40, msg->sesion);
+    put_u64(dst + 48, msg->generacion);
+    memcpy(dst + 56, msg->clave, clave_n);
+    if (msg->largo != 0) {
+        memcpy(dst + DSM_ANUNCIO_VERSIONADO_BASE, msg->datos, msg->largo);
+    }
+    *out = cab->longitud;
+    return 0;
+}
+
+int dsm_anuncio_versionado_decodificar(const uint8_t *src, size_t n,
+                                       dsm_cabecera_t *cab, dsm_anuncio_t *msg)
+{
+    if (msg == NULL || n < DSM_ANUNCIO_VERSIONADO_BASE ||
+        dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        !cabecera_pedido(cab, DSM_TIPO_ANUNCIO) || cab->longitud != n ||
+        get_u16(src + 38) != 0 || get_u16(src + 36) > DSM_ANUNCIO_RETIRADO ||
+        get_u64(src + 40) == 0 || get_u64(src + 48) == 0 ||
+        get_u16(src + 34) > DSM_ANUNCIO_DATOS ||
+        n != DSM_ANUNCIO_VERSIONADO_BASE + (size_t)get_u16(src + 34) ||
+        src[56] == 0 || memchr(src + 56, 0, DSM_ANUNCIO_CLAVE) == NULL ||
+        (get_u16(src + 36) == DSM_ANUNCIO_RETIRADO && get_u16(src + 34) != 0)) {
+        return -1;
+    }
+    memset(msg, 0, sizeof *msg);
+    msg->autor = get_u16(src + 32);
+    msg->banderas = get_u16(src + 36);
+    msg->sesion = get_u64(src + 40);
+    msg->generacion = get_u64(src + 48);
+    memcpy(msg->clave, src + 56, DSM_ANUNCIO_CLAVE);
+    msg->largo = get_u16(src + 34);
+    msg->datos = msg->largo != 0 ? src + DSM_ANUNCIO_VERSIONADO_BASE : NULL;
     return 0;
 }

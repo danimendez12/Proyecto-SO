@@ -26,20 +26,21 @@ PASO_SRC = src/config.c src/protocol.c src/network.c src/memory.c src/directory.
 API_SRC = $(PASO_SRC) src/dsm.c src/pager.c src/signals.c src/coherence.c src/aviso.c src/pool.c
 MATRICES_CFLAGS ?= -O2
 MERGESORT_CFLAGS ?= -O2
+GRUPO = apps/demanda_grupo.c apps/demanda_grupo.h
 MERGESORT_MOD = $(filter-out apps/mergesort/main.c,$(wildcard apps/mergesort/*.c))
 
-bin/apps/mergesort: $(wildcard apps/mergesort/*.c) $(wildcard apps/mergesort/*.h) \
+bin/apps/mergesort: $(GRUPO) $(wildcard apps/mergesort/*.c) $(wildcard apps/mergesort/*.h) \
 	$(API_SRC) $(wildcard include/*.h)
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(MERGESORT_CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 bin/tests/aceptacion_app_mergesort: tests/aceptacion_app_mergesort.c \
-	$(MERGESORT_MOD) $(wildcard apps/mergesort/*.h) $(API_SRC) $(wildcard include/*.h) \
+	$(GRUPO) $(MERGESORT_MOD) $(wildcard apps/mergesort/*.h) $(API_SRC) $(wildcard include/*.h) \
 	bin/apps/mergesort
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(MERGESORT_CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
-bin/apps/matrices: $(wildcard apps/matrices/*.c) $(wildcard apps/matrices/*.h) \
+bin/apps/matrices: $(GRUPO) $(wildcard apps/matrices/*.c) $(wildcard apps/matrices/*.h) \
 	$(API_SRC) $(wildcard include/*.h)
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(MATRICES_CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
@@ -106,7 +107,16 @@ bin/tests/aceptacion_multihogar_errores: override LDFLAGS += -Wl,--wrap=send
 bin/tests/aceptacion_api_remoto bin/tests/aceptacion_multipagina_remota bin/tests/aceptacion_api_errores \
 bin/tests/aceptacion_multihogar bin/tests/aceptacion_multihogar_errores: tests/api_prueba.h
 
-$(ACEPTACIONES_API): bin/tests/%: tests/%.c $(API_SRC) $(wildcard include/*.h)
+bin/tests/aceptacion_consultas: override LDFLAGS += -Wl,--wrap=dsm_red_enviar
+bin/tests/aceptacion_mascaras: tests/api_prueba.h
+bin/tests/aceptacion_copias: override LDFLAGS += -Wl,--wrap=dsm_coherencia_copiar_controlado \
+	-Wl,--wrap=dsm_coherencia_escribir_respaldo -Wl,--wrap=dsm_directorio_escribir_respaldo
+bin/tests/aceptacion_demanda: $(GRUPO) | apps
+REGRESIONES = bin/tests/aceptacion_copias bin/tests/aceptacion_mascaras \
+	bin/tests/aceptacion_demanda bin/tests/aceptacion_consultas \
+	bin/tests/aceptacion_avisos bin/tests/aceptacion_pool
+aceptacion: $(REGRESIONES)
+$(ACEPTACIONES_API) $(REGRESIONES): bin/tests/%: tests/%.c $(API_SRC) $(wildcard include/*.h)
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 

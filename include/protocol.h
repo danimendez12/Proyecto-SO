@@ -62,6 +62,7 @@ enum {
     DSM_STATS_NODOS = 1,
     DSM_STATS_PAGINAS = 2,
     DSM_STATS_AMBOS = 3,
+    DSM_STATS_HOGAR = 4, /* ficha y páginas cuyo directorio es el emisor */
     DSM_STATS_CONTADORES = 8,
     DSM_STATS_PREF = 104,
     DSM_FICHA_PAGINA = 40,
@@ -70,6 +71,11 @@ enum {
     DSM_ANUNCIO_CLAVE = 32,
     DSM_ANUNCIO_DATOS = 128,
     DSM_ANUNCIO_BASE = 68
+};
+
+enum {
+    DSM_ANUNCIO_VERSIONADO_BASE = 88,
+    DSM_ANUNCIO_RETIRADO = 1
 };
 
 enum {
@@ -136,7 +142,19 @@ typedef struct dsm_hello {
     uint64_t memoria;
     uint64_t base;
     char nombre[DSM_NOMBRE_MAX];
+    /* Cero conserva HELLO de 128 bytes. La extension agrega 8 bytes. */
+    uint64_t sesion;
 } dsm_hello_t;
+
+typedef struct dsm_anuncio {
+    uint16_t autor;
+    uint16_t banderas;
+    uint64_t sesion;
+    uint64_t generacion;
+    char clave[DSM_ANUNCIO_CLAVE];
+    size_t largo;
+    const uint8_t *datos;
+} dsm_anuncio_t;
 
 typedef struct dsm_ficha {
     uint16_t id;
@@ -236,6 +254,7 @@ typedef struct dsm_pagina_consulta {
     uint8_t permiso;
     uint8_t banderas;
     uint8_t copias;
+    uint32_t version;
 } dsm_pagina_consulta_t;
 
 typedef struct dsm_stats_reply {
@@ -372,5 +391,10 @@ int dsm_anuncio_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab, uint16_
                           const char *clave, const void *datos, size_t n, size_t *out);
 int dsm_anuncio_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, uint16_t *autor,
                             char clave[DSM_ANUNCIO_CLAVE], uint8_t *datos, size_t cap, size_t *largo);
+int dsm_anuncio_versionado_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                     const dsm_anuncio_t *msg, size_t *out);
+/* msg->datos es una vista prestada del buffer recibido. */
+int dsm_anuncio_versionado_decodificar(const uint8_t *src, size_t n,
+                                       dsm_cabecera_t *cab, dsm_anuncio_t *msg);
 
 #endif
