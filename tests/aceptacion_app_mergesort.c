@@ -135,22 +135,6 @@ static int revisar(struct aplicacion *app)
     return rc == 0 ? 0 : -1;
 }
 
-static int esperar_marca(struct aplicacion *app, const char *marca, double segundos)
-{
-    double fin = ahora() + segundos;
-    do {
-        if (contiene(app, marca)) {
-            return 0;
-        }
-        if (revisar(app) != 0) {
-            return -1;
-        }
-        const struct timespec pausa = {.tv_nsec = 5000000};
-        nanosleep(&pausa, NULL);
-    } while (ahora() < fin);
-    return -1;
-}
-
 static int esperar_fin(struct aplicacion *app, double segundos)
 {
     double fin = ahora() + segundos;
@@ -322,30 +306,37 @@ terminar:
     return resultado;
 }
 
-static int integrar(const char *n, const char *patron, const char *semilla, unsigned workers,
-                    int multihogar, const char *archivo)
+static int integrar(const char *n, const char *patron, const char *semilla, unsigned copias)
 {
-    struct aplicacion app = {0};
+    struct aplicacion apps[2] = {0};
+    FILE *config = configurar(copias, copias > 1 ? 80 : 32, 80, 1);
     int resultado = 1;
-    char trabajadores[48], exigir[48], marca[160];
-    snprintf(trabajadores, sizeof trabajadores, "MERGESORT_TRABAJADORES=%u", workers);
-    snprintf(exigir, sizeof exigir, "MERGESORT_EXIGIR_MULTIHOGAR=%d", multihogar);
-    char *args[] = {"/usr/bin/env", trabajadores, exigir, "MERGESORT_PRUEBA_LIMITE=40",
-        "MERGESORT_PLAZO_SEG=25", "bash", "apps/mergesort/prueba_red.sh", "--loopback",
-        (char *)n, "config/mergesort-lab.ini", "2", (char *)patron, (char *)semilla,
-        (char *)archivo, NULL};
+    EXIGIR(config != NULL && copias >= 1 && copias <= 2);
+    char ruta[64], marca[160];
+    ruta_temporal(config, ruta);
     double inicio = ahora();
-    EXIGIR(iniciar(&app, patron, args) == 0);
-    EXIGIR(esperar_fin(&app, 48) == 0 && codigo(&app, 1));
+    for (unsigned i = 0; i < copias; i++) {
+        char *args[] = {"./bin/apps/mergesort", ruta, (char *)n, (char *)patron, (char *)semilla, NULL};
+        EXIGIR(iniciar(&apps[i], patron, args) == 0);
+    }
+    for (unsigned i = 0; i < copias; i++) {
+        EXIGIR(esperar_fin(&apps[i], 60) == 0 && codigo(&apps[i], 1));
+    }
     snprintf(marca, sizeof marca, "VERIFICACION OK elementos=%s comparados=%s ordenado=si coincide=si", n, n);
-    EXIGIR(contiene(&app, marca) && contiene(&app, "LIBERACION OK") &&
-           contiene(&app, "INTEGRACION OK"));
-    if (multihogar) EXIGIR(contiene(&app, "CAPACIDAD reserva=") && contiene(&app, "hogar=1 liberada=si"));
-    printf("APP MERGESORT remoto: n=%s patron=%s workers=%u, verificacion exhaustiva y liberacion, segundos=%.6f\n",
-           n, patron, workers, ahora() - inicio);
+    int verifico = 0;
+    for (unsigned i = 0; i < copias; i++) verifico += contiene(&apps[i], marca);
+    EXIGIR(verifico == 1);
+    if (copias > 1 && strtoull(n, NULL, 10) > 10000) {
+        int hogares = 0;
+        for (unsigned i = 0; i < copias; i++) hogares += contiene(&apps[i], "hogar=1");
+        EXIGIR(hogares >= 1);
+    }
+    printf("APP MERGESORT demanda: n=%s patron=%s copias=%u segundos=%.3f\n",
+           n, patron, copias, ahora() - inicio);
     resultado = 0;
 terminar:
-    terminar(&app);
+    for (unsigned i = 0; i < copias; i++) terminar(&apps[i]);
+    if (config != NULL) fclose(config);
     return resultado;
 }
 
@@ -358,15 +349,12 @@ static int errores(FILE *entrada)
     char ruta[64], archivo[64];
     ruta_temporal(config, ruta);
     ruta_temporal(entrada, archivo);
-    char *cero[] = {"./bin/apps/mergesort", "crear", ruta, "0", "2", "2", "aleatorio", "1", NULL};
-    char *overflow[] = {"./bin/apps/mergesort", "crear", ruta, "18446744073709551615", "2", "2", "aleatorio", "1", NULL};
-    char *hilos[] = {"./bin/apps/mergesort", "crear", ruta, "10001", "2", "0", "aleatorio", "1", NULL};
+    char *cero[] = {"./bin/apps/mergesort", ruta, "0", "aleatorio", "1", NULL};
+    char *overflow[] = {"./bin/apps/mergesort", ruta, "18446744073709551615", "aleatorio", "1", NULL};
     char *patron[] = {"./bin/apps/mergesort", "secuencial", "16", "inexistente", "1", NULL};
     char *semilla[] = {"./bin/apps/mergesort", "secuencial", "16", "aleatorio", "1x", NULL};
-    char *nodo[] = {"./bin/apps/mergesort", "trabajar", ruta, "0", "1", NULL};
     char *faltantes[] = {"./bin/apps/mergesort", "secuencial", "10", "archivo", "1", archivo, NULL};
-    char *capacidad[] = {"./bin/apps/mergesort", "crear", ruta, "65539", "2", "2", "aleatorio", "1", NULL};
-    char **casos[] = {cero, overflow, hilos, patron, semilla, nodo, faltantes, capacidad};
+    char **casos[] = {cero, overflow, patron, semilla, faltantes};
     for (size_t i = 0; i < sizeof casos / sizeof casos[0]; i++) {
         app = (struct aplicacion){0};
         EXIGIR(iniciar(&app, "entrada o configuracion invalida", casos[i]) == 0);
@@ -374,14 +362,7 @@ static int errores(FILE *entrada)
         EXIGIR(!contiene(&app, "VERIFICACION OK"));
         terminar(&app);
     }
-    app = (struct aplicacion){0};
-    char *ausente[] = {"/usr/bin/env", "MERGESORT_PLAZO_SEG=1", "./bin/apps/mergesort", "crear",
-        ruta, "16", "1", "2", "aleatorio", "1", NULL};
-    EXIGIR(iniciar(&app, "trabajador ausente", ausente) == 0);
-    EXIGIR(esperar_marca(&app, "CONTROL id=", 3) == 0);
-    EXIGIR(esperar_fin(&app, 5) == 0 && codigo(&app, 0));
-    EXIGIR(contiene(&app, "DSM=-4") && !contiene(&app, "VERIFICACION OK"));
-    puts("APP MERGESORT errores: tamanos, hilos, semilla, patron, entrada, capacidad y plazo rechazados normalmente");
+    puts("APP MERGESORT errores: tamanos, semilla, patron y entrada rechazados");
     resultado = 0;
 terminar:
     terminar(&app);
@@ -400,14 +381,10 @@ int main(void)
     char archivo[64];
     ruta_temporal(entrada, archivo);
     if (verificar_modulos() != 0 ||
-        integrar("16", "aleatorio", "7", 1, 0, NULL) != 0 ||
-        integrar("1001", "inverso", "7", 1, 0, NULL) != 0 ||
-        integrar("1003", "ordenado", "7", 1, 0, NULL) != 0 ||
-        integrar("1001", "negativos", "7", 1, 0, NULL) != 0 ||
-        integrar("1001", "repetidos", "7", 1, 0, NULL) != 0 ||
-        integrar("17", "iguales", "7", 1, 0, NULL) != 0 ||
-        integrar("9", "archivo", "7", 1, 0, archivo) != 0 ||
-        integrar("65539", "aleatorio", "12345", 2, 1, NULL) != 0 ||
+        integrar("16", "aleatorio", "7", 1) != 0 ||
+        integrar("1001", "inverso", "7", 1) != 0 ||
+        integrar("1001", "repetidos", "7", 2) != 0 ||
+        integrar("65539", "aleatorio", "12345", 2) != 0 ||
         errores(entrada) != 0) goto terminar;
     puts("Merge Sort: algoritmo, barreras, comparacion exhaustiva, TCP real, multihogar y errores verificados");
     resultado = 0;

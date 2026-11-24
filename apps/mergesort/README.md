@@ -4,13 +4,11 @@ El creador publica dos reservas de `int32_t`; los trabajadores las abren desde p
 
 ## Demostración de un millón de enteros en tres terminales
 
-Desde la raíz del proyecto, compilá con `make apps` (Linux x86-64, GCC C11, GNU Make y Pthreads). En una sola máquina usá los INI de loopback incluidos. Cada comando de la tabla ocupa una terminal. Iniciá el creador primero y esperá a que imprima `CONTROL id=…` y los dos comandos `EJECUTAR`. Los ejemplos usan el ID 1 de un creador nuevo. Si se anuncia otro, usá ese número en ambos trabajadores.
+La ejecución de laboratorio está en [la guía](../../docs/guia-laboratorio.md). Con las terminales ya abiertas, el ordenamiento se lanza una vez:
 
-| Terminal | Comando |
-| --- | --- |
-| 1 · nodo 0 | `./bin/apps/mergesort crear config/mergesort-grande.ini 1000000 2 2 aleatorio 2026` |
-| 2 · nodo 1 | `./bin/apps/mergesort trabajar config/mergesort-grande.ini 1 1` |
-| 3 · nodo 2 | `./bin/apps/mergesort trabajar config/mergesort-grande.ini 2 1` |
+```bash
+./bin/apps/mergesort config/pool-lab.ini 40000 aleatorio 2026
+```
 
 Cada proceso inicia el servicio DSM de su nodo. Reservá un puerto distinto para cada ID y utilizá una sola instancia por ID. Los dos trabajadores permanecen en ejecución hasta devolver las vistas y los aportes. El creador debe imprimir `comparados=1000000 ordenado=si coincide=si`, `VERIFICACION OK` y `LIBERACION OK`. Cada trabajador debe imprimir `TRABAJADOR OK`. Los tres deben salir con código 0. La traza de páginas del motor puede ser extensa. Para seguir solo los hitos, redirigí la salida del comando a un log, por ejemplo `>nodo0.log 2>&1`, y consultalo con `grep -E '^(CONTROL|EJECUTAR|HOGAR|CALCULO|VERIFICACION|LIBERACION|ERROR)' nodo0.log`.
 
@@ -50,22 +48,7 @@ La sintaxis del creador es `crear INI N TRABAJADORES HILOS PATRON SEMILLA [ARCHI
 make apps aceptacion
 timeout -k 5s 180s ./bin/tests/aceptacion_app_mergesort
 ./bin/apps/mergesort secuencial 1000000 aleatorio 2026
-
-# Tres procesos y dos hogares; los logs quedan en RESULTADOS=…
-bash apps/mergesort/prueba_red.sh --loopback 65539 config/mergesort-lab.ini 2 repetidos 2026
-bash apps/mergesort/prueba_red.sh --loopback 1000000 config/mergesort-grande.ini 2 aleatorio 2026
-bash apps/mergesort/prueba_red.sh --loopback 2000000 config/mergesort-grande.ini 2 aleatorio 2026
-
-# Dos pilas TCP, nodos 0 y 2 en A y nodo 1 en B
-bash apps/mergesort/prueba_red.sh --namespaces 65539 config/mergesort-lab.ini 2 aleatorio 2026
-
-# Dos procesos, una página de datos, archivo con extremos y duplicados
-printf '%s\n' '-2147483648 7 7 0 2147483647' > /tmp/mergesort-entrada.tsv
-MERGESORT_TRABAJADORES=1 MERGESORT_EXIGIR_MULTIHOGAR=0 \
-  bash apps/mergesort/prueba_red.sh --loopback 5 config/mergesort-lab.ini 1 archivo 0 /tmp/mergesort-entrada.tsv
 ```
-
-El guion requiere Bash, iproute2, util-linux y las utilidades usuales de GNU. Para `--namespaces`, si la política de Ubuntu en VirtualBox exige privilegios, se puede invocar el mismo comando con `sudo bash`; la prueba manual de tres terminales sigue disponible sin cambiar la configuración de seguridad. Para casos pequeños que caben en el hogar local, usá `MERGESORT_EXIGIR_MULTIHOGAR=0` en el guion. La aplicación aplica un plazo global de coordinación de 1800 s, ajustable con `MERGESORT_PLAZO_SEG`. Cada operación de red conserva además su propio `rpc_timeout_ms` del INI. El guion también limita la duración de cada proceso a 240 s con `timeout`. Para un ensayo largo, por ejemplo, ejecutá `MERGESORT_PRUEBA_LIMITE=1800 MERGESORT_PLAZO_SEG=1700 bash apps/mergesort/prueba_red.sh --namespaces 2000000 config/mergesort-grande.ini 2 aleatorio 2026`.
 
 Para ejecutar todos los binarios de aceptación en serie y detenerse en el primer fallo:
 

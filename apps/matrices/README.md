@@ -12,15 +12,13 @@ make aceptacion
 timeout -k 2s 90s ./bin/tests/aceptacion_app_matrices
 ```
 
-Para ejecutar una multiplicación de **128 × 128** en una máquina, abrí tres terminales en la raíz. Iniciá el creador y esperá la línea `CONTROL id=…`. Luego iniciá los dos trabajadores. Usá el ID anunciado (en un proceso nuevo es 1).
+La ejecución de laboratorio está en [la guía](../../docs/guia-laboratorio.md). Con las terminales ya abiertas, el cálculo se lanza una vez:
 
-| Terminal | Comando |
-| --- | --- |
-| Nodo 0 | `./bin/apps/matrices creador config/matrices-lab.ini 128 128 128 2 300` |
-| Nodo 1 | `./bin/apps/matrices trabajador config/matrices-lab.ini 1 1 2 300` |
-| Nodo 2 | `./bin/apps/matrices trabajador config/matrices-lab.ini 2 1 2 300` |
+```bash
+./bin/apps/matrices config/pool-lab.ini 32 32 32
+```
 
-El creador imprime los comandos de arranque, los IDs, los bytes y los primeros GPN de cada tramo. Con el INI del ejemplo y las contribuciones libres, A y B ocupan 32 páginas cada una en el nodo 0. La primera mitad de C comienza en GPN 65 del nodo 0 y la segunda en GPN 81 del nodo 1. Los trabajadores 1 y 2 calculan 16 páginas cada uno con dos Pthreads por proceso. Esperá `VERIFICACION OK`, `LIBERACION OK` y `TRABAJADOR OK` en ambos trabajadores. El cierre es automático.
+El proceso que crea las reservas imprime `VERIFICACION OK`. Las terminales que solo prestan memoria no ejecutan este comando.
 
 ### Uso en dos o tres computadoras del TEC
 
@@ -56,16 +54,6 @@ set -o pipefail
 ./bin/apps/matrices creador "$INI" 1000 1000 1000 2 1800 2>&1 |
   tee matrices-nodo0.log |
   grep --line-buffered -E '^(CONTROL|EJECUTAR|MATRIZ|TRAMO|INICIALIZACION|VERIFICACION|LIBERACION|ERROR)'
-```
-
-### Integración en dos redes Linux
-
-El guion crea dos espacios de nombres de red y un par veth. Los nodos 0 y 2 corren en una pila TCP y el nodo 1 en la otra. Usa `bash`, `ip`, `unshare`, `nsenter` y `timeout`. El sistema debe permitir crear espacios de nombres de usuario y red. Deja los INI independientes y las tres trazas en el directorio temporal que imprime al comenzar.
-
-```bash
-make apps
-bash apps/matrices/prueba_red.sh 128 config/matrices-lab.ini 2 2 300
-bash apps/matrices/prueba_red.sh 1000 config/matrices-grande.ini 2 2 1800
 ```
 
 ## Dimensiones, entradas y referencia original
