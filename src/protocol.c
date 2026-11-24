@@ -972,3 +972,50 @@ int dsm_proto_error_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *ca
     msg->texto[DSM_PROTO_TEXTO - 1] = '\0';
     return 0;
 }
+
+int dsm_anuncio_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab, uint16_t autor,
+                          const char *clave, const void *datos, size_t n, size_t *out)
+{
+    size_t clave_n = clave == NULL ? 0 : strlen(clave);
+    if (out == NULL || cab == NULL || cab->tipo != DSM_TIPO_ANUNCIO || cab->banderas != 0 ||
+        cab->id_corr != 0 || clave_n == 0 || clave_n >= DSM_ANUNCIO_CLAVE || n > DSM_ANUNCIO_DATOS ||
+        (n != 0 && datos == NULL)) {
+        return -1;
+    }
+    if (preparar(dst, cap, cab, (uint32_t)(DSM_ANUNCIO_BASE + n)) != 0) {
+        return -1;
+    }
+    put_u16(dst + 32, autor);
+    put_u16(dst + 34, (uint16_t)n);
+    memcpy(dst + 36, clave, clave_n);
+    if (n != 0) {
+        memcpy(dst + DSM_ANUNCIO_BASE, datos, n);
+    }
+    *out = DSM_ANUNCIO_BASE + n;
+    return 0;
+}
+
+int dsm_anuncio_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, uint16_t *autor,
+                            char clave[DSM_ANUNCIO_CLAVE], uint8_t *datos, size_t cap, size_t *largo)
+{
+    if (autor == NULL || clave == NULL || largo == NULL || n < DSM_ANUNCIO_BASE ||
+        dsm_cabecera_decodificar(src, n, cab) != 0 || cab->tipo != DSM_TIPO_ANUNCIO ||
+        cab->banderas != 0 || cab->longitud != n) {
+        return -1;
+    }
+    uint16_t bytes = get_u16(src + 34);
+    if ((size_t)DSM_ANUNCIO_BASE + bytes != n || bytes > cap || (bytes != 0 && datos == NULL)) {
+        return -1;
+    }
+    *autor = get_u16(src + 32);
+    memcpy(clave, src + 36, DSM_ANUNCIO_CLAVE);
+    clave[DSM_ANUNCIO_CLAVE - 1] = '\0';
+    if (clave[0] == '\0') {
+        return -1;
+    }
+    if (bytes != 0) {
+        memcpy(datos, src + DSM_ANUNCIO_BASE, bytes);
+    }
+    *largo = bytes;
+    return 0;
+}

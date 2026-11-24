@@ -1,3 +1,4 @@
+#include "aviso.h"
 #include "coherence.h"
 
 #include "network.h"
@@ -245,6 +246,7 @@ static void estado_par(void *ctx, uint16_t par, uint8_t estado)
         pthread_mutex_unlock(&c->mutex);
     } else if (estado == DSM_NODO_EN_LINEA) {
         dsm_directorio_par_linea(c->directorio, par);
+        dsm_aviso_reenviar(c, par);
     }
 }
 
@@ -414,6 +416,9 @@ static int despachar(void *ctx, uint16_t par, const dsm_cabecera_t *cab,
     }
     if (cab->tipo >= DSM_TIPO_CAP_PREPARE && cab->tipo <= DSM_TIPO_CAP_RELEASE_ACK) {
         return encolar_capacidad(c, par, buf, n);
+    }
+    if (cab->tipo == DSM_TIPO_ANUNCIO) {
+        return dsm_aviso_recibir(c, buf, n) == 0 ? 0 : fallo(EPROTO);
     }
     if (cab->tipo == DSM_TIPO_PAGE_REQUEST || cab->tipo == DSM_TIPO_INVALIDATE ||
         cab->tipo == DSM_TIPO_PAGE_DOWNGRADE || cab->tipo == DSM_TIPO_REGION_CLOSE ||
@@ -1088,4 +1093,27 @@ void dsm_coherencia_cerrar(dsm_coherencia_t *c)
     pthread_cond_destroy(&c->respuesta);
     pthread_mutex_destroy(&c->mutex);
     free(c);
+}
+
+uint16_t dsm_coherencia_nodo(const dsm_coherencia_t *coherencia)
+{
+    return coherencia == NULL ? 0 : coherencia->nodo;
+}
+
+int dsm_coherencia_enviar(dsm_coherencia_t *coherencia, uint16_t destino,
+                          const uint8_t *buf, size_t n)
+{
+    if (coherencia == NULL || buf == NULL || destino == coherencia->nodo) {
+        return fallo(EINVAL);
+    }
+    return dsm_red_enviar(coherencia->red, destino, buf, n);
+}
+
+int dsm_coherencia_destinos(dsm_coherencia_t *coherencia, uint16_t *ids, uint16_t cap,
+                            uint16_t *cantidad)
+{
+    if (coherencia == NULL) {
+        return fallo(EINVAL);
+    }
+    return dsm_red_destinos(coherencia->red, ids, cap, cantidad);
 }

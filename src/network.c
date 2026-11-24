@@ -838,6 +838,27 @@ int dsm_red_esperar(dsm_red_t *red, uint16_t par)
     return dsm_red_esperar_hasta(red, par, &plazo);
 }
 
+int dsm_red_destinos(dsm_red_t *red, uint16_t *ids, uint16_t cap, uint16_t *cantidad)
+{
+    if (red == NULL || cantidad == NULL || (cap != 0 && ids == NULL)) {
+        return error_red(EINVAL);
+    }
+    pthread_mutex_lock(&red->mutex);
+    uint16_t n = 0;
+    for (uint16_t i = 0; i < red->cfg->cantidad_nodos; i++) {
+        if (i == red->self || !red->pares[i].activo || red->pares[i].fd < 0) {
+            continue;
+        }
+        if (n < cap) {
+            ids[n] = i;
+        }
+        n++;
+    }
+    pthread_mutex_unlock(&red->mutex);
+    *cantidad = n;
+    return n <= cap ? 0 : error_red(ENOSPC);
+}
+
 int dsm_red_enviar(dsm_red_t *red, uint16_t par, const uint8_t *buf, size_t n)
 {
     if (!par_valido(red, par) || buf == NULL || n < DSM_CABECERA_BYTES || n > DSM_LONGITUD_MAX) {

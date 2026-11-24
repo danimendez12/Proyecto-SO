@@ -46,5 +46,10 @@ int dsm_coherencia_copiar_controlado(dsm_coherencia_t *coherencia, uint32_t rese
 /* STATS_REQUEST al par indicado. msg->paginas queda en manos del llamador. */
 int dsm_coherencia_stats(dsm_coherencia_t *coherencia, uint16_t par, uint8_t seleccion,
                          dsm_stats_reply_t *msg);
+uint16_t dsm_coherencia_nodo(const dsm_coherencia_t *coherencia);
+int dsm_coherencia_enviar(dsm_coherencia_t *coherencia, uint16_t destino,
+                          const uint8_t *buf, size_t n);
+int dsm_coherencia_destinos(dsm_coherencia_t *coherencia, uint16_t *ids, uint16_t cap,
+                            uint16_t *cantidad);
 
 #endif

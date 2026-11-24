@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 enum {
-    DSM_CONFIG_MAX_NODOS = 16,
+    DSM_CONFIG_MAX_NODOS = 40,
     DSM_CONFIG_NOMBRE = 64,
     DSM_CONFIG_PUERTO_MIN = 27200,
     DSM_CONFIG_PUERTO_MAX = 27299

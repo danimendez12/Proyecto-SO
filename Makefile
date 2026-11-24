@@ -9,7 +9,7 @@ ACEPTACIONES_API = bin/tests/aceptacion_api bin/tests/aceptacion_api_remoto \
 
 .PHONY: all apps examples tests aceptacion clean
 
-all: bin/dsm_node
+all: bin/dsm_node bin/dsm_unir bin/apps/matrices bin/apps/mergesort
 
 apps: bin/apps/matrices bin/apps/matrices_secuencial bin/apps/mergesort
 
@@ -23,7 +23,7 @@ aceptacion: bin/tests/aceptacion_red bin/tests/aceptacion_memoria bin/tests/acep
 	bin/tests/aceptacion_app_matrices bin/tests/aceptacion_app_mergesort
 
 PASO_SRC = src/config.c src/protocol.c src/network.c src/memory.c src/directory.c
-API_SRC = $(PASO_SRC) src/dsm.c src/pager.c src/signals.c src/coherence.c
+API_SRC = $(PASO_SRC) src/dsm.c src/pager.c src/signals.c src/coherence.c src/aviso.c src/pool.c
 MATRICES_CFLAGS ?= -O2
 MERGESORT_CFLAGS ?= -O2
 MERGESORT_MOD = $(filter-out apps/mergesort/main.c,$(wildcard apps/mergesort/*.c))
@@ -35,7 +35,7 @@ bin/apps/mergesort: $(wildcard apps/mergesort/*.c) $(wildcard apps/mergesort/*.h
 
 bin/tests/aceptacion_app_mergesort: tests/aceptacion_app_mergesort.c \
 	$(MERGESORT_MOD) $(wildcard apps/mergesort/*.h) $(API_SRC) $(wildcard include/*.h) \
-	bin/apps/mergesort apps/mergesort/prueba_red.sh config/mergesort-lab.ini
+	bin/apps/mergesort
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(MERGESORT_CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
@@ -54,6 +54,10 @@ bin/tests/aceptacion_app_matrices: tests/aceptacion_app_matrices.c bin/apps/matr
 	bin/apps/matrices_secuencial
 	mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+bin/dsm_unir: tools/dsm_unir.c src/pool.c src/config.c include/dsm.h include/config.h
+	mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tools/dsm_unir.c src/pool.c src/config.c $(LDLIBS)
 
 bin/dsm_node: $(wildcard src/*.c) $(wildcard include/*.h)
 	mkdir -p $(@D)

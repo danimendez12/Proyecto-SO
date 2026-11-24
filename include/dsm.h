@@ -102,6 +102,17 @@ int dsm_consultar_paginas(dsm_context_t *ctx, uint16_t hogar, dsm_pagina_info_t 
                           size_t cap, size_t *cantidad);
 /* global distinto de cero incluye los demás nodos. */
 int dsm_imprimir(dsm_context_t *ctx, FILE *salida, int global);
+
+/* Ocupa el primer puesto del pool cuya IPv4 es local y cuyo puerto está libre.
+ * El candado sigue tomado durante la vida del proceso. */
+int dsm_pool_reclamar(const char *ruta, uint16_t *id);
+/* Publica un aviso y lo inunda a los puestos ya conectados. Un puesto que
+ * entre después lo recibe al completar el HELLO. */
+int dsm_aviso_publicar(dsm_context_t *ctx, const char *clave, const void *datos, size_t n);
+int dsm_aviso_consultar(dsm_context_t *ctx, const char *clave, uint16_t *autor,
+                        void *datos, size_t n);
+int dsm_aviso_participantes(dsm_context_t *ctx, const char *clave, uint16_t *autores,
+                            size_t cap, size_t *cantidad);
 /* Los punteros prestados se usan desde hilos registrados hasta liberar o cerrar. */
 int dsm_traducir(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset, void **salida);
 

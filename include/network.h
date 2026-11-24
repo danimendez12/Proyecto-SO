@@ -60,6 +60,8 @@ int dsm_red_iniciar(dsm_red_t **out, const dsm_config_t *cfg, uint16_t self,
 /* Cierra tras terminar las operaciones externas y espera a los lectores. */
 void dsm_red_cerrar(dsm_red_t *red);
 int dsm_red_enviar(dsm_red_t *red, uint16_t peer, const uint8_t *buf, size_t n);
+/* Copia los pares con conexión activa, sin incluir al propio nodo. */
+int dsm_red_destinos(dsm_red_t *red, uint16_t *ids, uint16_t cap, uint16_t *cantidad);
 uint32_t dsm_red_id(dsm_red_t *red);
 int dsm_red_esperar(dsm_red_t *red, uint16_t peer);
 /* Espera el alta usando el vencimiento CLOCK_MONOTONIC de la operación. */

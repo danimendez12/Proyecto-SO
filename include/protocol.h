@@ -16,9 +16,10 @@ enum {
     DSM_PAGE_REQUEST_MAP_BYTES = 56,
     DSM_PAGE_DATA_BASE = 80,
     DSM_NOMBRE_MAX = 64,
-    DSM_MAX_FICHAS = 16,
+    DSM_MAX_FICHAS = 40,
     DSM_TRAMOS_POR_HOGAR = 16,
-    DSM_MAX_TRAMOS = DSM_TRAMOS_POR_HOGAR * DSM_MAX_FICHAS,
+    /* Un cálculo reparte pocos tramos por hogar. 256 cubre los 40 puestos. */
+    DSM_MAX_TRAMOS = 256,
     DSM_REGION_INFO_MAX = 60 + 16 * DSM_MAX_TRAMOS,
     DSM_CAPACIDAD_BASE_BYTES = 56,
     DSM_CAPACIDAD_MAX = DSM_CAPACIDAD_BASE_BYTES + DSM_REGION_INFO_MAX - DSM_CABECERA_BYTES
@@ -53,7 +54,8 @@ enum {
     DSM_TIPO_STATS_REPLY = 0x31,
     DSM_TIPO_REGION_COPY_CLOSE = 0x48,
     DSM_TIPO_REGION_COPY_CLOSE_ACK = 0x49,
-    DSM_TIPO_PROTO_ERROR = 0x7F
+    DSM_TIPO_PROTO_ERROR = 0x7F,
+    DSM_TIPO_ANUNCIO = 0x60
 };
 
 enum {
@@ -64,7 +66,10 @@ enum {
     DSM_STATS_PREF = 104,
     DSM_FICHA_PAGINA = 40,
     DSM_PROTO_ERROR_BYTES = 104,
-    DSM_PROTO_TEXTO = 64
+    DSM_PROTO_TEXTO = 64,
+    DSM_ANUNCIO_CLAVE = 32,
+    DSM_ANUNCIO_DATOS = 128,
+    DSM_ANUNCIO_BASE = 68
 };
 
 enum {
@@ -363,5 +368,9 @@ int dsm_proto_error_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                               const dsm_proto_error_t *msg, size_t *out);
 int dsm_proto_error_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
                                 dsm_proto_error_t *msg);
+int dsm_anuncio_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab, uint16_t autor,
+                          const char *clave, const void *datos, size_t n, size_t *out);
+int dsm_anuncio_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, uint16_t *autor,
+                            char clave[DSM_ANUNCIO_CLAVE], uint8_t *datos, size_t cap, size_t *largo);
 
 #endif

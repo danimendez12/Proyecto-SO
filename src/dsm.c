@@ -1,5 +1,6 @@
 #include "dsm.h"
 
+#include "aviso.h"
 #include "coherence.h"
 
 #include <errno.h>
@@ -1039,4 +1040,34 @@ int dsm_traducir(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset, void **
         *salida = (unsigned char *)v->base + offset;
     }
     return salir(salida == NULL ? DSM_ERR_INVAL : rc);
+}
+
+int dsm_aviso_publicar(dsm_context_t *ctx, const char *clave, const void *datos, size_t n)
+{
+    int rc = entrar(ctx);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+    rc = dsm_aviso_emitir(ctx->coherencia, ctx->nodo, clave, datos, n);
+    return salir(rc);
+}
+
+int dsm_aviso_consultar(dsm_context_t *ctx, const char *clave, uint16_t *autor,
+                        void *datos, size_t n)
+{
+    int rc = entrar(ctx);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+    return salir(dsm_aviso_leer(clave, autor, datos, n));
+}
+
+int dsm_aviso_participantes(dsm_context_t *ctx, const char *clave, uint16_t *autores,
+                            size_t cap, size_t *cantidad)
+{
+    int rc = entrar(ctx);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+    return salir(dsm_aviso_autores(clave, autores, cap, cantidad));
 }
