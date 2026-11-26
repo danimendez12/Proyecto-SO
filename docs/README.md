@@ -1,9 +1,8 @@
 # Documentación del DSM
 
-Para la versión de entrega consultá la [arquitectura final](arquitectura-final.md),
-la [validación del Paso 13B](validacion-13b.md) y la [guía de laboratorio](guia-laboratorio.md).
-Las secciones siguientes conservan las decisiones y evidencias de los prototipos anteriores.
+La entrega 14D incluye el [informe de validación](validacion-14d.md), la [arquitectura](arquitectura-final.md), el [manual de la consola](manual-consola.md) y el [guion para las computadoras del TEC](pruebas-fisicas-14d.md). Los comandos de instalación están en la [guía de laboratorio](guia-laboratorio.md).
 
+La [validación del Paso 13B](validacion-13b.md) y las secciones siguientes conservan los resultados y decisiones de los prototipos anteriores.
 
 Este directorio reúne las decisiones de arquitectura y las evidencias de prueba.
 

@@ -46,6 +46,7 @@ typedef struct dsm_pagina_desc {
     uint32_t orden;
     uint8_t perdida;
     uint32_t proc;
+    uint8_t publica;
 } dsm_pagina_desc_t;
 
 enum {
@@ -210,5 +211,9 @@ void dsm_directorio_contar(dsm_directorio_t *dir, int indice, uint64_t n);
 int dsm_directorio_exportar(dsm_directorio_t *dir, uint64_t contadores[DSM_CONTA_N],
                             dsm_pagina_desc_t *paginas, size_t capacidad, size_t *cantidad,
                             uint32_t *libres, uint32_t *totales);
+/* Snapshot acotado: inventario del bitmap autoritativo o vistas locales,
+ * ordenado por GPN. paginas se libera por el llamador. Sin RPC bajo mutex. */
+int dsm_directorio_consulta_rango(dsm_directorio_t *dir, const dsm_stats_request_t *pedido,
+                                  dsm_stats_reply_t *salida);
 
 #endif

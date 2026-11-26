@@ -41,6 +41,15 @@ int dsm_reservar(dsm_context_t *ctx, dsm_proc_id_t proceso, size_t bytes,
  * contexto. bytes recibe el tamano logico original. Una apertura repetida
  * conserva una sola vinculacion por nodo y reserva. */
 int dsm_abrir_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, void **base, size_t *bytes);
+/* Estado de la vinculación en este contexto, sin RPC. INVAL si el ID no está
+ * vinculado. Una retirada o preparación conserva la identidad y no presta Ar. */
+typedef struct dsm_reserva_estado {
+    dsm_reserva_id_t id;
+    size_t bytes;
+    void *base;
+    int retirando, provisional;
+} dsm_reserva_estado_t;
+int dsm_consultar_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, dsm_reserva_estado_t *salida);
 /* Consulta el hogar y el numero global de una pagina logica de la vista abierta. */
 int dsm_ubicacion_pagina(dsm_context_t *ctx, dsm_reserva_id_t id, size_t orden,
                          dsm_node_id_t *hogar, uint64_t *gpn);
@@ -69,7 +78,16 @@ int dsm_escribir(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
 enum {
     DSM_CONSULTA_CONTADORES = 8,
     DSM_CONSULTA_NOMBRE = 64,
-    DSM_HOGAR_TODOS = 0xFFFF
+    DSM_HOGAR_TODOS = 0xFFFF,
+    DSM_CONSULTA_RANGO_MAX = 1024,
+    DSM_ASIGNACION_ASIGNADA = 0,
+    DSM_ASIGNACION_LIBRE = 1,
+    DSM_ASIGNACION_PREPARADA = 2,
+    DSM_DISP_VACIO = 0,
+    DSM_DISP_UNION = 1,
+    DSM_DISP_EN_LINEA = 2,
+    DSM_DISP_SOSPECHA = 3,
+    DSM_DISP_FUERA = 4
 };
 
 /* Contadores, en este orden: fallos de lectura, fallos de escritura,
@@ -87,12 +105,13 @@ typedef struct dsm_nodo_info {
     uint32_t aportados;
     char nombre[DSM_CONSULTA_NOMBRE];
     uint64_t contadores[DSM_CONSULTA_CONTADORES];
+    uint8_t respondio; /* ocupacion/counters desconocidos si vale cero */
 } dsm_nodo_info_t;
 
 typedef struct dsm_pagina_info {
     uint64_t gpn;
     uint64_t mascara;
-    uint32_t proc;
+    uint32_t proc; /* ultimo solicitante, no el propietario */
     uint32_t reserva;
     uint32_t orden;
     uint16_t hogar;
@@ -100,19 +119,31 @@ typedef struct dsm_pagina_info {
     uint8_t msi;
     uint8_t permiso;
     uint8_t copias;
-    uint32_t memoria_libre; /* páginas libres en el hogar */
+    uint32_t memoria_libre; /* paginas libres del hogar; UINT32_MAX si desconocidas */
     uint32_t version;
+    uint16_t creador;       /* 0xffff en pagina libre */
+    uint32_t propietario;  /* ID logico estable; 0 en procedencia historica */
+    uint8_t publica;
+    uint8_t asignacion;    /* 0 asignada, 1 libre, 2 preparada; independiente de MSI */
 } dsm_pagina_info_t;
 
 /* Si cap no alcanza, escribe solo las primeras cap entradas, informa el total
  * en cantidad y devuelve DSM_ERR_NOMEM. cap 0 con salida NULL solo cuenta. */
 int dsm_consultar_nodos(dsm_context_t *ctx, dsm_nodo_info_t *salida, size_t cap,
                         size_t *cantidad);
+int dsm_consultar_nodo(dsm_context_t *ctx, uint16_t nodo, dsm_nodo_info_t *salida);
 /* Una fila por página en su hogar. DSM_ERR_PARCIAL con TODOS entrega las
  * filas disponibles si algún puesto está fuera. Un hogar explícito devuelve
  * su error. Las observaciones de distintos hogares no son simultáneas. */
 int dsm_consultar_paginas(dsm_context_t *ctx, uint16_t hogar, dsm_pagina_info_t *salida,
                           size_t cap, size_t *cantidad);
+/* salida admite limite entradas (1..1024). desde y siguiente son GPN. Una
+ * pagina de resultados no es una instantanea de otras consultas. copias=1
+ * solo permite el nodo local; copias=0 incluye bitmap libre/preparado/asignado.
+ * TODOS devuelve PARCIAL si falta un hogar. mas nunca implica truncado oculto. */
+int dsm_consultar_rango(dsm_context_t *ctx, uint16_t hogar, int copias,
+                        uint64_t desde, size_t limite, dsm_pagina_info_t *salida,
+                        size_t *cantidad, uint64_t *siguiente, int *mas);
 /* global distinto de cero incluye los demás nodos. */
 int dsm_imprimir(dsm_context_t *ctx, FILE *salida, int global);
 

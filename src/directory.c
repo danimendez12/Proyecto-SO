@@ -722,7 +722,7 @@ int dsm_directorio_consultar(const dsm_directorio_t *dir, uint32_t reserva_id,
 static int manifiesto_valido(const dsm_directorio_t *dir, const dsm_region_info_t *info,
                               uint16_t *hogar)
 {
-    if (!id_reserva_valido(dir, info->reserva_id) || info->total_tramos == 0 ||
+    if (!id_reserva_valido(dir, info->reserva_id) || info->publica > 1 || info->total_tramos == 0 ||
         info->total_tramos > DSM_MAX_TRAMOS || info->primer_tramo != 0 ||
         info->cantidad_tramos != info->total_tramos || info->total_paginas == 0 ||
         info->tamano_bytes == 0 ||
@@ -758,7 +758,7 @@ static int manifiesto_valido(const dsm_directorio_t *dir, const dsm_region_info_
 
 static int mismo_manifiesto(const dsm_region_info_t *a, const dsm_region_info_t *b)
 {
-    if (a->tamano_bytes != b->tamano_bytes || a->total_paginas != b->total_paginas ||
+    if (a->publica != b->publica || a->tamano_bytes != b->tamano_bytes || a->total_paginas != b->total_paginas ||
         a->cantidad_tramos != b->cantidad_tramos) {
         return 0;
     }
@@ -825,7 +825,7 @@ int dsm_directorio_preparar(dsm_directorio_t *dir, uint32_t id, uint64_t token,
         goto salir;
     }
     size_t cantidad = max_paginas < dir->paginas_libres ? max_paginas : dir->paginas_libres;
-    dsm_region_info_t info = {.reserva_id = id};
+    dsm_region_info_t info = {.reserva_id = id, .publica = 1};
     if (cantidad == 0 || seleccionar_tramos(dir, cantidad, max_tramos, 1, &info) != 0) {
         errno = ENOSPC;
         goto salir;
@@ -897,7 +897,7 @@ int dsm_directorio_confirmar(dsm_directorio_t *dir, uint32_t id, uint64_t token,
     }
     int resultado = -1;
     uint16_t primero;
-    if (!manifiesto_valido(dir, info, &primero) || dir->cerrando) {
+    if (!manifiesto_valido(dir, info, &primero) || !info->publica || dir->cerrando) {
         errno = EPROTO;
         goto salir;
     }
@@ -992,6 +992,7 @@ int dsm_directorio_confirmar(dsm_directorio_t *dir, uint32_t id, uint64_t token,
             int local = hogar == dir->nodo_id;
             dir->paginas[dir->npaginas++] = (dsm_pagina_desc_t){
                 .gpn = tramo->gpn_inicial + k, .hogar = hogar, .reserva = id,
+                .publica = info->publica,
                 .poseedor = local ? dir->nodo_id : DSM_POSEEDOR_NINGUNO,
                 .msi = local ? DSM_MSI_M : DSM_MSI_I, .orden = orden,
                 .mascara_copias = local ? UINT64_C(1) << dir->nodo_id : 0,
@@ -1202,6 +1203,7 @@ int dsm_directorio_instalar(dsm_directorio_t *dir, const dsm_region_info_t *info
             uint32_t orden = tramo->orden_inicial + k;
             dir->paginas[dir->npaginas++] = (dsm_pagina_desc_t){
                 .gpn = tramo->gpn_inicial + k, .hogar = hogar, .reserva = info->reserva_id,
+                .publica = info->publica,
                 .poseedor = DSM_POSEEDOR_NINGUNO, .msi = DSM_MSI_I, .orden = orden,
                 .ubicacion_local = (unsigned char *)reserva->vista.a_r +
                                    (size_t)orden * dir->page_size,
@@ -2098,9 +2100,40 @@ static int cerrar_copia_serializada(dsm_directorio_t *dir, uint16_t par, uint32_
         }
         if (p->perdida && ((p->mascara_copias & bit) ||
                           (p->msi == DSM_MSI_M && p->poseedor == par))) {
+            /* Retirar una copia no recupera su contenido incierto. El hogar
+             * permanece aislado y no obtiene permisos: solo puede olvidar al
+             * cliente despues de revocar Ar y recibir un ACK de ese enlace.
+             * Esto permite cerrar una concesion M abandonada sin fabricar
+             * una imagen autoritativa ni dejar el pin ocupado para siempre. */
+            if (proteger(dir, i, PROT_NONE) != 0) {
+                pthread_mutex_unlock(&dir->mutex);
+                return -1;
+            }
+            dsm_pagina_desc_t perdida = *p;
             pthread_mutex_unlock(&dir->mutex);
-            errno = ENOTCONN;
-            return -1;
+            if (par != dir->nodo_id) {
+                uint32_t solicitud = dir->nuevo_id(dir->envio_ctx);
+                if (solicitud == 0 || pedir_invalidacion_plazo(
+                        dir, par, perdida.gpn, solicitud, dir->nodo_id, &limite) != 0) {
+                    return -1;
+                }
+            }
+            pthread_mutex_lock(&dir->mutex);
+            p = &dir->paginas[i];
+            if (p->reserva != id || p->gpn != perdida.gpn || !p->perdida ||
+                p->version != perdida.version || p->msi != perdida.msi ||
+                p->poseedor != perdida.poseedor) {
+                pthread_mutex_unlock(&dir->mutex);
+                errno = EPROTO;
+                return -1;
+            }
+            p->mascara_copias &= ~bit;
+            if (p->msi == DSM_MSI_M && p->poseedor == par) {
+                p->msi = DSM_MSI_I;
+                p->poseedor = DSM_POSEEDOR_NINGUNO;
+            }
+            pthread_mutex_unlock(&dir->mutex);
+            continue;
         }
         if (par == dir->nodo_id) {
             if (p->msi == DSM_MSI_M && p->poseedor == par && p->version == UINT32_MAX) {
@@ -3171,6 +3204,29 @@ static int atender_stats(dsm_directorio_t *dir, uint16_t par, const uint8_t *tra
         errno = EPROTO;
         return -1;
     }
+    if (pedido_stats.seleccion == DSM_STATS_INVENTARIO ||
+        pedido_stats.seleccion == DSM_STATS_COPIAS_RANGO) {
+        dsm_stats_reply_t rango;
+        if (dsm_directorio_consulta_rango(dir, &pedido_stats, &rango) != 0) {
+            return rechazar_stats(dir, par, pedido.id_msg, estado_errno(errno));
+        }
+        size_t cap = DSM_STATS_RANGO_PREF + 104u + (size_t)rango.p * DSM_FICHA_PAGINA;
+        uint8_t *buf = malloc(cap);
+        if (buf == NULL) {
+            free(rango.paginas);
+            return rechazar_stats(dir, par, pedido.id_msg, DSM_ESTADO_SIN_TRAMO);
+        }
+        dsm_cabecera_t cab = cabecera_de(dir, DSM_TIPO_STATS_REPLY, par,
+                                          dir->nuevo_id(dir->envio_ctx));
+        cab.banderas = DSM_FLAG_RESPUESTA;
+        cab.id_corr = pedido.id_msg;
+        size_t out = 0;
+        int rc = dsm_stats_reply_codificar(buf, cap, &cab, &rango, &out);
+        if (rc == 0) rc = enviar_fuera(dir, par, buf, out);
+        free(buf);
+        free(rango.paginas);
+        return rc;
+    }
     int con_paginas = pedido_stats.seleccion != DSM_STATS_NODOS;
     int con_nodos = pedido_stats.seleccion != DSM_STATS_PAGINAS;
     int canonicas = pedido_stats.seleccion == DSM_STATS_HOGAR;
@@ -3204,6 +3260,7 @@ static int atender_stats(dsm_directorio_t *dir, uint16_t par, const uint8_t *tra
             .permiso = !local ? 0 : p->msi == DSM_MSI_M ? DSM_PAGE_PERMISO_ESCRIBIR :
                        p->msi == DSM_MSI_S ? DSM_PAGE_PERMISO_LEER : 0,
             .copias = copias_de(p->mascara_copias),
+            .banderas = p->publica ? DSM_PAGINA_PUBLICA : 0,
         };
     }
     uint32_t libres = dir->paginas_libres, totales = dir->paginas_totales;
@@ -3244,6 +3301,159 @@ static int atender_stats(dsm_directorio_t *dir, uint16_t par, const uint8_t *tra
     free(buf);
     free(msg.paginas);
     return rc;
+}
+
+static dsm_pagina_consulta_t fila_consulta(dsm_directorio_t *dir, const dsm_pagina_desc_t *p)
+{
+    const struct dsm_reserva_dir *r = buscar_reserva(dir, p->reserva);
+    int local = r && r->vinculada && bit_de(p->mascara_copias, dir->nodo_id);
+    return (dsm_pagina_consulta_t){
+        .gpn = p->gpn, .mascara = p->mascara_copias, .proc = p->proc,
+        .reserva = p->reserva, .orden = p->orden, .hogar = p->hogar,
+        .poseedor = p->poseedor, .msi = p->msi, .version = p->version,
+        .permiso = !local ? 0 : p->msi == DSM_MSI_M ? DSM_PAGE_PERMISO_ESCRIBIR :
+                   p->msi == DSM_MSI_S ? DSM_PAGE_PERMISO_LEER : 0,
+        .copias = copias_de(p->mascara_copias),
+        .banderas = p->publica ? DSM_PAGINA_PUBLICA : 0,
+    };
+}
+
+struct candidata_consulta { uint64_t gpn; size_t indice; };
+
+static void hundir_candidata(struct candidata_consulta *a, size_t n, size_t i)
+{
+    for (;;) {
+        size_t hijo = 2 * i + 1;
+        if (hijo >= n) return;
+        if (hijo + 1 < n && a[hijo + 1].gpn > a[hijo].gpn) hijo++;
+        if (a[i].gpn >= a[hijo].gpn) return;
+        struct candidata_consulta tmp = a[i]; a[i] = a[hijo]; a[hijo] = tmp;
+        i = hijo;
+    }
+}
+
+static int comparar_candidata(const void *a, const void *b)
+{
+    uint64_t x = ((const struct candidata_consulta *)a)->gpn;
+    uint64_t y = ((const struct candidata_consulta *)b)->gpn;
+    return (x > y) - (x < y);
+}
+
+int dsm_directorio_consulta_rango(dsm_directorio_t *dir, const dsm_stats_request_t *pedido,
+                                  dsm_stats_reply_t *salida)
+{
+    if (pedido == NULL || salida == NULL || pedido->limite == 0 ||
+        pedido->limite > DSM_STATS_RANGO_MAX ||
+        (pedido->seleccion != DSM_STATS_INVENTARIO && pedido->seleccion != DSM_STATS_COPIAS_RANGO) ||
+        dir == NULL || !dir->inicializado) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(salida, 0, sizeof *salida);
+    salida->paginas = calloc(pedido->limite, sizeof *salida->paginas);
+    struct candidata_consulta *candidatas = pedido->seleccion == DSM_STATS_COPIAS_RANGO ?
+        malloc(((size_t)pedido->limite + 1u) * sizeof *candidatas) : NULL;
+    if (salida->paginas == NULL ||
+        (pedido->seleccion == DSM_STATS_COPIAS_RANGO && candidatas == NULL)) {
+        free(salida->paginas); free(candidatas);
+        memset(salida, 0, sizeof *salida);
+        errno = ENOMEM;
+        return -1;
+    }
+    pthread_mutex_lock(&dir->mutex);
+    int error = 0;
+    if (pedido->seleccion == DSM_STATS_INVENTARIO) {
+        uint64_t base = dir->limites_gpn[dir->nodo_id], fin = dir->limites_gpn[dir->nodo_id + 1];
+        uint64_t inicio = pedido->desde < base ? base : pedido->desde;
+        if (inicio > fin) inicio = fin;
+        uint64_t hasta = fin - inicio > pedido->limite ? inicio + pedido->limite : fin;
+        salida->p = (uint32_t)(hasta - inicio);
+        salida->siguiente = hasta;
+        salida->mas = hasta < fin;
+        for (uint32_t i = 0; i < salida->p; i++) {
+            uint64_t gpn = inicio + i;
+            salida->paginas[i] = (dsm_pagina_consulta_t){
+                .gpn = gpn, .hogar = dir->nodo_id, .poseedor = DSM_POSEEDOR_NINGUNO,
+                .orden = UINT32_MAX,
+                .banderas = dir->ocupadas[gpn - base] ? DSM_PAGINA_PREPARADA : DSM_PAGINA_LIBRE,
+            };
+        }
+        for (size_t i = 0; i < dir->npaginas; i++) {
+            const dsm_pagina_desc_t *p = &dir->paginas[i];
+            if (p->hogar == dir->nodo_id && p->gpn >= inicio && p->gpn < hasta) {
+                if (!dir->ocupadas[p->gpn - base]) { error = EPROTO; break; }
+                salida->paginas[p->gpn - inicio] = fila_consulta(dir, p);
+            }
+        }
+        for (const struct dsm_reserva_dir *r = dir->reservas; r != NULL && !error; r = r->siguiente) {
+            if (r->confirmada) continue;
+            for (uint32_t t = 0; t < r->aporte.cantidad_tramos; t++) {
+                const dsm_tramo_t *tramo = &r->aporte.tramos[t];
+                uint64_t a = tramo->gpn_inicial > inicio ? tramo->gpn_inicial : inicio;
+                uint64_t z = tramo->gpn_inicial + tramo->cantidad;
+                if (z > hasta) z = hasta;
+                for (uint64_t gpn = a; gpn < z; gpn++) {
+                    dsm_pagina_consulta_t *p = &salida->paginas[gpn - inicio];
+                    if ((p->banderas & DSM_PAGINA_ESTADO) != DSM_PAGINA_PREPARADA || p->reserva != 0) {
+                        error = EPROTO; break;
+                    }
+                    p->reserva = r->info.reserva_id;
+                    p->orden = tramo->orden_inicial + (uint32_t)(gpn - tramo->gpn_inicial);
+                    p->banderas |= r->aporte.publica ? DSM_PAGINA_PUBLICA : 0;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < salida->p && !error; i++) {
+            if ((salida->paginas[i].banderas & DSM_PAGINA_ESTADO) == DSM_PAGINA_PREPARADA &&
+                salida->paginas[i].reserva == 0) error = EPROTO;
+        }
+    } else {
+        size_t n = 0, capacidad = (size_t)pedido->limite + 1u;
+        for (size_t i = 0; i < dir->npaginas; i++) {
+            if (dir->paginas[i].gpn < pedido->desde) continue;
+            const struct dsm_reserva_dir *r = buscar_reserva(dir, dir->paginas[i].reserva);
+            if (r == NULL || !r->vinculada) continue;
+            struct candidata_consulta c = {.gpn = dir->paginas[i].gpn, .indice = i};
+            if (n < capacidad) {
+                size_t k = n++;
+                candidatas[k] = c;
+                while (k && candidatas[k].gpn > candidatas[(k - 1u) / 2u].gpn) {
+                    struct candidata_consulta tmp = candidatas[k];
+                    candidatas[k] = candidatas[(k - 1u) / 2u];
+                    k = (k - 1u) / 2u; candidatas[k] = tmp;
+                }
+            } else if (c.gpn < candidatas[0].gpn) {
+                candidatas[0] = c; hundir_candidata(candidatas, n, 0);
+            }
+        }
+        qsort(candidatas, n, sizeof *candidatas, comparar_candidata);
+        salida->mas = n > pedido->limite;
+        salida->p = (uint32_t)(n > pedido->limite ? pedido->limite : n);
+        salida->siguiente = pedido->desde;
+        for (uint32_t i = 0; i < salida->p; i++) {
+            salida->paginas[i] = fila_consulta(dir, &dir->paginas[candidatas[i].indice]);
+            salida->siguiente = candidatas[i].gpn + 1u;
+        }
+    }
+    salida->emisor = dir->nodo_id;
+    salida->n = 1;
+    salida->rango = 1;
+    salida->fichas[0] = (dsm_ficha_t){
+        .id = dir->nodo_id, .estado = DSM_NODO_EN_LINEA,
+        .ipv4_host = dir->local.ipv4_host, .puerto = dir->local.puerto,
+        .memoria = dir->local.memoria,
+        .base = dir->limites_gpn[dir->nodo_id] * (uint64_t)dir->page_size,
+        .libres = dir->paginas_libres, .totales = dir->paginas_totales,
+    };
+    memcpy(salida->fichas[0].nombre, dir->local.nombre, DSM_NOMBRE_MAX);
+    for (int i = 0; i < DSM_CONTA_N; i++)
+        salida->contadores[i] = atomic_load_explicit(&dir->contadores[i], memory_order_relaxed);
+    pthread_mutex_unlock(&dir->mutex);
+    free(candidatas);
+    if (error) {
+        free(salida->paginas); memset(salida, 0, sizeof *salida); errno = error; return -1;
+    }
+    return 0;
 }
 
 /* Se llama con mutex: solo una copia M local vigente puede respaldarse o

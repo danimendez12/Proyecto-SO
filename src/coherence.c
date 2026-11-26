@@ -402,7 +402,9 @@ static int despachar(void *ctx, uint16_t par, const dsm_cabecera_t *cab,
     if (par >= c->cfg->cantidad_nodos || cab->origen != par || cab->destino != c->nodo) {
         return fallo(EPROTO);
     }
-    if (cab->banderas == DSM_FLAG_RESPUESTA && cab->id_corr != 0) {
+    if ((cab->banderas == DSM_FLAG_RESPUESTA ||
+         (cab->tipo == DSM_TIPO_STATS_REPLY &&
+          cab->banderas == (DSM_FLAG_RESPUESTA | DSM_FLAG_STATS_RANGO))) && cab->id_corr != 0) {
         if (dsm_directorio_completar(c->directorio, par, buf, n) == 0) {
             return 0;
         }
@@ -971,18 +973,17 @@ int dsm_coherencia_escribir_respaldo(dsm_coherencia_t *c, uint32_t reserva,
     return copiar_controlado(c, reserva, gpn, offset, scratch, bytes, 1, previo, version, plazo);
 }
 
-int dsm_coherencia_stats(dsm_coherencia_t *c, uint16_t par, uint8_t seleccion,
-                         dsm_stats_reply_t *msg)
+int dsm_coherencia_stats_rango(dsm_coherencia_t *c, uint16_t par,
+                               const dsm_stats_request_t *pedido, dsm_stats_reply_t *msg)
 {
-    if (c == NULL || msg == NULL || par >= c->cfg->cantidad_nodos ||
-        (seleccion != DSM_STATS_NODOS && seleccion != DSM_STATS_PAGINAS &&
-         seleccion != DSM_STATS_AMBOS && seleccion != DSM_STATS_HOGAR)) {
+    if (c == NULL || msg == NULL || pedido == NULL || par >= c->cfg->cantidad_nodos) {
         return fallo(EINVAL);
     }
     memset(msg, 0, sizeof *msg);
     dsm_cabecera_t cab = cabecera(c, DSM_TIPO_STATS_REQUEST, par);
-    dsm_stats_request_t pedido = {.seleccion = seleccion};
-    uint8_t envio[40];
+    uint8_t seleccion = pedido->seleccion;
+    int rango = seleccion == DSM_STATS_INVENTARIO || seleccion == DSM_STATS_COPIAS_RANGO;
+    uint8_t envio[DSM_STATS_RANGO_BYTES];
     size_t n = 0;
     uint8_t *respuesta = malloc(DSM_LONGITUD_MAX);
     if (respuesta == NULL) {
@@ -996,7 +997,7 @@ int dsm_coherencia_stats(dsm_coherencia_t *c, uint16_t par, uint8_t seleccion,
     };
     int rc = -1;
     if (plazo_nuevo(c, &p.plazo) == 0 &&
-        dsm_stats_request_codificar(envio, sizeof envio, &cab, &pedido, &n) == 0 &&
+        dsm_stats_request_codificar(envio, sizeof envio, &cab, pedido, &n) == 0 &&
         intercambiar(c, par, envio, n, &p) == 0) {
         dsm_cabecera_t recibida;
         if (p.bytes == DSM_CABECERA_BYTES &&
@@ -1007,8 +1008,55 @@ int dsm_coherencia_stats(dsm_coherencia_t *c, uint16_t par, uint8_t seleccion,
             recibida.estado == DSM_ESTADO_OK && recibida.id_corr == cab.id_msg &&
             msg->emisor == par && msg->n == (seleccion != DSM_STATS_PAGINAS) &&
             (msg->n == 0 || msg->fichas[0].id == par) &&
+            (msg->n == 0 || msg->fichas[0].libres <= msg->fichas[0].totales) &&
+            msg->rango == rango && (!rango || msg->p <= pedido->limite) &&
             (seleccion != DSM_STATS_NODOS || msg->p == 0)) {
             rc = 0;
+            for (uint32_t i = 0; rango && i < msg->p; i++) {
+                const dsm_pagina_consulta_t *p = &msg->paginas[i];
+                uint64_t base = p->hogar < c->cfg->cantidad_nodos ?
+                    dsm_config_base(c->cfg, p->hogar) / c->cfg->page_size : UINT64_MAX;
+                uint64_t fin = p->hogar < c->cfg->cantidad_nodos ?
+                    dsm_config_base(c->cfg, (uint16_t)(p->hogar + 1u)) / c->cfg->page_size : 0;
+                uint64_t admitidos = (UINT64_C(1) << c->cfg->cantidad_nodos) - 1u;
+                if (p->gpn < pedido->desde || p->gpn < base || p->gpn >= fin ||
+                    (i && p->gpn <= msg->paginas[i - 1].gpn) ||
+                    (p->banderas & ~(DSM_PAGINA_ESTADO | DSM_PAGINA_PUBLICA)) ||
+                    (p->banderas & DSM_PAGINA_ESTADO) > DSM_PAGINA_PREPARADA ||
+                    (p->mascara & ~admitidos) ||
+                    (p->poseedor != UINT16_MAX && p->poseedor >= c->cfg->cantidad_nodos) ||
+                    ((p->banderas & DSM_PAGINA_ESTADO) != DSM_PAGINA_LIBRE &&
+                     ((uint16_t)p->reserva == 0 || (p->reserva >> 16) >= c->cfg->cantidad_nodos)) ||
+                    (p->proc && ((uint16_t)p->proc == 0 || (p->proc >> 16) >= c->cfg->cantidad_nodos)) ||
+                    (seleccion == DSM_STATS_INVENTARIO && p->hogar != par) ||
+                    (seleccion == DSM_STATS_COPIAS_RANGO &&
+                     (p->banderas & DSM_PAGINA_ESTADO) != DSM_PAGINA_ASIGNADA)) {
+                    rc = fallo(EPROTO);
+                    break;
+                }
+            }
+            if (rango && msg->p && msg->siguiente <= msg->paginas[msg->p - 1].gpn) {
+                rc = fallo(EPROTO);
+            }
+            if (rango && rc == 0 && seleccion == DSM_STATS_INVENTARIO) {
+                uint64_t base = dsm_config_base(c->cfg, par) / c->cfg->page_size;
+                uint64_t fin = dsm_config_base(c->cfg, (uint16_t)(par + 1u)) / c->cfg->page_size;
+                uint64_t inicio = pedido->desde < base ? base : pedido->desde;
+                if (inicio > fin) inicio = fin;
+                uint64_t esperadas = fin - inicio < pedido->limite ? fin - inicio : pedido->limite;
+                if (msg->p != esperadas || msg->siguiente != inicio + esperadas ||
+                    msg->mas != (inicio + esperadas < fin)) rc = fallo(EPROTO);
+                for (uint32_t i = 0; i < msg->p && rc == 0; i++)
+                    if (msg->paginas[i].gpn != inicio + i) rc = fallo(EPROTO);
+            }
+            if (rango && rc == 0 && seleccion == DSM_STATS_COPIAS_RANGO &&
+                ((msg->mas && msg->p != pedido->limite) ||
+                 (msg->p && msg->siguiente != msg->paginas[msg->p - 1].gpn + 1u) ||
+                 (!msg->p && (msg->mas || msg->siguiente != pedido->desde)))) rc = fallo(EPROTO);
+            if (rc != 0) {
+                free(msg->paginas);
+                memset(msg, 0, sizeof *msg);
+            }
         } else {
             free(msg->paginas);
             memset(msg, 0, sizeof *msg);
@@ -1017,6 +1065,13 @@ int dsm_coherencia_stats(dsm_coherencia_t *c, uint16_t par, uint8_t seleccion,
     }
     free(respuesta);
     return rc;
+}
+
+int dsm_coherencia_stats(dsm_coherencia_t *c, uint16_t par, uint8_t seleccion,
+                         dsm_stats_reply_t *msg)
+{
+    dsm_stats_request_t pedido = {.seleccion = seleccion};
+    return dsm_coherencia_stats_rango(c, par, &pedido, msg);
 }
 
 static int token_sesion(uint64_t *token)

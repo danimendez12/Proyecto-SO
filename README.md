@@ -15,11 +15,21 @@ el hogar de la página coordina por TCP sus permisos MSI.
 Cada terminal reclama un puesto del INI común. Para iniciar un donante usá
 `./bin/dsm_unir config/pool-lab.ini`. Matrices y Merge Sort también reclaman su
 puesto y acuerdan los participantes. La plantilla contempla 20 equipos y
-40 puestos; reemplazá las IP de ejemplo antes de ejecutarla en el laboratorio.
+60 puestos, tres por IP. Reemplazá las IP de ejemplo antes de ejecutarla en el laboratorio.
 
 [Guía de instalación y demostración](docs/guia-laboratorio.md) ·
 [Arquitectura, MSI y protocolo](docs/arquitectura-final.md) ·
-[Validación del Paso 13B](docs/validacion-13b.md)
+[Manual de la consola](docs/manual-consola.md) · [Validación de 14D](docs/validacion-14d.md) ·
+[Guion físico en el TEC](docs/pruebas-fisicas-14d.md) · [Resultados históricos de 13B](docs/validacion-13b.md)
+
+Al arrancar, la consola aporta 8 MiB con sus 2048 páginas libres. Permite reservar memoria local y remota, procesarla con Pthreads y volver al prompt. Las aplicaciones independientes reclaman otro puesto para cada proceso de cálculo.
+
+```bash
+make
+./bin/dsm_unir config/pool-lab.ini
+```
+
+Dentro de la consola usá `ayuda`, `estado` y `memoria` para comprobar la incorporación. Con un segundo hogar activo, probá `reservar 15M` y usá el ID devuelto con `mapa ID`. Las IPv4 de la plantilla son ejemplos.
 
 ## Organización
 
@@ -59,11 +69,11 @@ los ejecutables correspondientes.
 
 | Comando | Resultado |
 | --- | --- |
-| `make` | Compila el nodo, `dsm_unir` y ambas aplicaciones. |
+| `make` | Compila el nodo histórico, el lanzador, la consola persistente y ambas aplicaciones. |
 | `make examples` | Genera los ejemplos en `bin/examples/`. |
 | `make apps` | Compila matrices, su referencia secuencial original y Merge Sort con sus modos distribuido y secuencial. |
 | `make tests` | Genera los programas de prueba en `bin/tests/`. |
-| `make aceptacion` | Compila las 17 aceptaciones previas y las regresiones del Paso 13B. |
+| `make aceptacion` | Prepara las aceptaciones de los prototipos y de 13B y 14D. La aceptación de consola usa Python 3 estándar. |
 | `make clean` | Elimina el directorio de salida `bin/`. |
 
 ## Demostración de paginación remota
@@ -108,7 +118,7 @@ nodo = id nombre IPv4 puerto [memoria_bytes]
 
 Si omitís la contribución, se usa `memoria_inicial`. Las bases lógicas se
 calculan sumando los aportes de los IDs anteriores. La capacidad de
-configuración es de hasta 40 nodos, limitada en cada archivo por `max_nodos`.
+configuración es de hasta 60 nodos, limitada en cada archivo por `max_nodos`.
 El menor ID inicia cada conexión y reintenta el alta. El mayor conserva su
 puerto de escucha para sus pares.
 
@@ -215,7 +225,7 @@ puede quedar indisponible.
 
 El manifiesto contiene tramos de GPN con su ordinal inicial. Cada tramo
 pertenece a un solo hogar y puede cubrir miles de páginas. Una reserva admite
-hasta 16 tramos por hogar, hasta 40 hogares configurados y 256 tramos en total. Cada hogar administra
+hasta 16 tramos por hogar, hasta 60 hogares configurados y 256 tramos en total. Cada hogar administra
 su capacidad y el MSI de sus páginas. El creador publica el mapa completo
 después de que todos hayan confirmado la asignación.
 

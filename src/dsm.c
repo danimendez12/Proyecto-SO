@@ -10,6 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+_Static_assert((int)DSM_CONSULTA_RANGO_MAX == (int)DSM_STATS_RANGO_MAX,
+               "El limite publico de consultas coincide con el protocolo");
+_Static_assert((int)DSM_ASIGNACION_PREPARADA == (int)DSM_PAGINA_PREPARADA,
+               "Estado de asignacion independiente de MSI");
+
 struct vinculacion {
     dsm_reserva_id_t id;
     void *base;
@@ -239,58 +244,74 @@ static void reintentar_cancelaciones(dsm_context_t *ctx)
     }
 }
 
+static int preparar_hogar(dsm_context_t *ctx, struct vinculacion *v, dsm_region_info_t *mapa,
+                           uint16_t hogar, uint32_t *orden)
+{
+    uint32_t max_tramos = DSM_MAX_TRAMOS - mapa->cantidad_tramos;
+    if (max_tramos == 0) return DSM_ERR_NOMEM;
+    if (max_tramos > DSM_TRAMOS_POR_HOGAR) max_tramos = DSM_TRAMOS_POR_HOGAR;
+    uint64_t bit = UINT64_C(1) << hogar;
+    v->aportantes |= bit;
+    dsm_region_info_t parcial;
+    if (dsm_coherencia_preparar(ctx->coherencia, hogar, v->id, *orden,
+                               mapa->total_paginas - *orden, max_tramos, &parcial) != 0) {
+        if (errno == ENOSPC) {
+            if (hogar != ctx->nodo) v->aportantes &= ~bit;
+            return DSM_OK;
+        }
+        /* Conserva el bit ante una respuesta ambigua: cancelar() debe poder
+         * retirar tambien una preparacion cuyo ACK no llego. */
+        return error_api(errno);
+    }
+    if (parcial.reserva_id != v->id || parcial.publica != 1 || parcial.cantidad_tramos == 0 ||
+        parcial.cantidad_tramos > max_tramos) return DSM_ERR_PROTO;
+    uint64_t base = ctx->directorio.limites_gpn[hogar];
+    uint64_t fin = ctx->directorio.limites_gpn[hogar + 1];
+    for (uint32_t i = 0; i < parcial.cantidad_tramos; i++) {
+        const dsm_tramo_t *tramo = &parcial.tramos[i];
+        if (tramo->orden_inicial != *orden || tramo->cantidad == 0 ||
+            tramo->cantidad > mapa->total_paginas - *orden ||
+            tramo->gpn_inicial < base || tramo->gpn_inicial >= fin ||
+            tramo->cantidad > fin - tramo->gpn_inicial) return DSM_ERR_PROTO;
+        mapa->tramos[mapa->cantidad_tramos++] = *tramo;
+        *orden += tramo->cantidad;
+    }
+    return DSM_OK;
+}
+
 static int preparar_mapa(dsm_context_t *ctx, struct vinculacion *v, dsm_region_info_t *mapa)
 {
     uint32_t orden = 0;
-    int inalcanzable = 0;
-    /* Primero el creador, despues los demas IDs en orden ascendente. */
-    for (uint16_t paso = 0; paso < ctx->cfg.cantidad_nodos && orden < mapa->total_paginas; paso++) {
-        uint16_t hogar = paso == 0 ? ctx->nodo : paso - 1;
-        if (paso != 0 && hogar >= ctx->nodo) {
-            hogar++;
-        }
-        if (hogar != ctx->nodo && dsm_coherencia_esperar(ctx->coherencia, hogar) != 0) {
-            inalcanzable = 1;
-            continue;
-        }
-        uint64_t bit = UINT64_C(1) << hogar;
-        v->aportantes |= bit;
-        dsm_region_info_t parcial;
-        uint32_t max_tramos = DSM_MAX_TRAMOS - mapa->cantidad_tramos;
-        if (max_tramos > DSM_TRAMOS_POR_HOGAR) {
-            max_tramos = DSM_TRAMOS_POR_HOGAR;
-        }
-        if (dsm_coherencia_preparar(ctx->coherencia, hogar, v->id, orden,
-                                   mapa->total_paginas - orden, max_tramos, &parcial) != 0) {
-            if (errno == ENOSPC) {
-                if (hogar != ctx->nodo) {
-                    v->aportantes &= ~bit;
-                }
-                continue;
-            }
+    uint64_t visitados = UINT64_C(1) << ctx->nodo;
+    int rc = preparar_hogar(ctx, v, mapa, ctx->nodo, &orden);
+    if (rc != DSM_OK) return rc;
+    /* Primero capacidad local, despues hogares ya conectados. Si no alcanza,
+     * una sola ronda con plazo comun permite entrar a donantes tardios; nunca
+     * se acumula un timeout por cada puesto ausente. PREPARE sigue siendo la
+     * autoridad de capacidad, sin fiarse de estadisticas potencialmente viejas. */
+    for (unsigned ronda = 0; ronda < 2 && orden < mapa->total_paginas; ronda++) {
+        if (ronda != 0 && dsm_coherencia_sondear(ctx->coherencia, ctx->cfg.rpc_timeout_ms) != 0)
             return error_api(errno);
+        uint16_t ids[DSM_CONFIG_MAX_NODOS], cantidad = 0;
+        if (dsm_coherencia_destinos(ctx->coherencia, ids, DSM_CONFIG_MAX_NODOS, &cantidad) != 0)
+            return error_api(errno);
+        uint64_t disponibles = 0;
+        for (uint16_t i = 0; i < cantidad; i++) {
+            if (ids[i] >= ctx->cfg.cantidad_nodos) return DSM_ERR_PROTO;
+            disponibles |= UINT64_C(1) << ids[i];
         }
-        if (parcial.reserva_id != v->id || parcial.cantidad_tramos == 0 ||
-            parcial.cantidad_tramos > max_tramos) {
-            return DSM_ERR_PROTO;
-        }
-        uint64_t base = ctx->directorio.limites_gpn[hogar];
-        uint64_t fin = ctx->directorio.limites_gpn[hogar + 1];
-        for (uint32_t i = 0; i < parcial.cantidad_tramos; i++) {
-            const dsm_tramo_t *tramo = &parcial.tramos[i];
-            if (tramo->orden_inicial != orden || tramo->cantidad == 0 ||
-                tramo->cantidad > mapa->total_paginas - orden ||
-                tramo->gpn_inicial < base || tramo->gpn_inicial >= fin ||
-                tramo->cantidad > fin - tramo->gpn_inicial) {
-                return DSM_ERR_PROTO;
-            }
-            mapa->tramos[mapa->cantidad_tramos++] = *tramo;
-            orden += tramo->cantidad;
+        for (uint16_t hogar = 0; hogar < ctx->cfg.cantidad_nodos && orden < mapa->total_paginas; hogar++) {
+            uint64_t bit = UINT64_C(1) << hogar;
+            if (!(disponibles & bit) || (visitados & bit)) continue;
+            visitados |= bit;
+            rc = preparar_hogar(ctx, v, mapa, hogar, &orden);
+            if (rc != DSM_OK) return rc;
         }
     }
     mapa->total_tramos = mapa->cantidad_tramos;
     if (orden != mapa->total_paginas) {
-        return inalcanzable ? DSM_ERR_NODO : DSM_ERR_NOMEM;
+        uint64_t todos = (UINT64_C(1) << ctx->cfg.cantidad_nodos) - 1u;
+        return visitados != todos ? DSM_ERR_NODO : DSM_ERR_NOMEM;
     }
     return DSM_OK;
 }
@@ -345,6 +366,7 @@ int dsm_reservar(dsm_context_t *ctx, dsm_proc_id_t proceso, size_t bytes,
     dsm_region_info_t mapa = {
         .reserva_id = v->id, .tamano_bytes = bytes,
         .total_paginas = (uint32_t)(1 + (bytes - 1) / ctx->cfg.page_size),
+        .publica = 1,
     };
     rc = preparar_mapa(ctx, v, &mapa);
     if (rc == DSM_OK) {
@@ -429,6 +451,21 @@ int dsm_abrir_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, void **base, size
     }
     *base = (*pos)->base;
     *bytes = (*pos)->bytes;
+    return salir(DSM_OK);
+}
+
+int dsm_consultar_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, dsm_reserva_estado_t *salida)
+{
+    int rc = entrar(ctx);
+    if (rc != DSM_OK) return rc;
+    if (salida == NULL) return salir(DSM_ERR_INVAL);
+    struct vinculacion *v = *posicion(ctx, id);
+    if (v == NULL) return salir(DSM_ERR_INVAL);
+    *salida = (dsm_reserva_estado_t){
+        .id = v->id, .bytes = v->bytes, .retirando = v->retirando,
+        .provisional = v->provisional,
+        .base = v->retirando || v->provisional ? NULL : v->base,
+    };
     return salir(DSM_OK);
 }
 
@@ -919,6 +956,7 @@ static void llenar_nodo(dsm_nodo_info_t *info, const dsm_ficha_t *ficha, const u
     info->aportados = ficha->totales >= ficha->libres ? ficha->totales - ficha->libres : 0;
     memcpy(info->nombre, ficha->nombre, DSM_CONSULTA_NOMBRE - 1);
     memcpy(info->contadores, contadores, sizeof info->contadores);
+    info->respondio = 1;
 }
 
 static int publicar(void *salida, size_t cap, size_t tam, size_t total, const void *origen,
@@ -952,6 +990,36 @@ static int fin_consulta(dsm_context_t *ctx, int rc)
     pthread_mutex_lock(&mutex);
     ctx->consultas--;
     return salir(rc);
+}
+
+static dsm_pagina_info_t pagina_publica(const dsm_pagina_consulta_t *p, uint32_t libres)
+{
+    return (dsm_pagina_info_t){
+        .gpn = p->gpn, .mascara = p->mascara, .proc = p->proc,
+        .reserva = p->reserva, .orden = p->orden, .version = p->version,
+        .hogar = p->hogar, .poseedor = p->poseedor, .msi = p->msi,
+        .permiso = p->permiso, .copias = p->copias, .memoria_libre = libres,
+        .creador = p->reserva ? (uint16_t)(p->reserva >> 16) : UINT16_MAX,
+        .propietario = (p->banderas & DSM_PAGINA_PUBLICA) && p->reserva ?
+            (p->reserva & UINT32_C(0xffff0000)) | 1u : 0,
+        .publica = (p->banderas & DSM_PAGINA_PUBLICA) != 0,
+        .asignacion = p->banderas & DSM_PAGINA_ESTADO,
+    };
+}
+
+int dsm_consultar_nodo(dsm_context_t *ctx, uint16_t nodo, dsm_nodo_info_t *salida)
+{
+    int rc = comenzar_consulta(ctx);
+    if (rc != DSM_OK) return rc;
+    if (salida == NULL || nodo >= ctx->cfg.cantidad_nodos)
+        return fin_consulta(ctx, DSM_ERR_INVAL);
+    dsm_stats_reply_t msg;
+    rc = pedir_stats(ctx, nodo, DSM_STATS_NODOS, &msg);
+    if (rc == DSM_OK) {
+        llenar_nodo(salida, &msg.fichas[0], msg.contadores);
+        free(msg.paginas);
+    }
+    return fin_consulta(ctx, rc);
 }
 
 int dsm_consultar_nodos(dsm_context_t *ctx, dsm_nodo_info_t *salida, size_t cap, size_t *cantidad)
@@ -1022,20 +1090,7 @@ int dsm_consultar_paginas(dsm_context_t *ctx, uint16_t hogar, dsm_pagina_info_t 
             tabla = nueva;
             for (uint32_t i = 0; i < msg.p; i++) {
                 const dsm_pagina_consulta_t *p = &msg.paginas[i];
-                tabla[total + i] = (dsm_pagina_info_t){
-                    .gpn = p->gpn,
-                    .mascara = p->mascara,
-                    .proc = p->proc,
-                    .reserva = p->reserva,
-                    .orden = p->orden,
-                    .version = p->version,
-                    .hogar = p->hogar,
-                    .poseedor = p->poseedor,
-                    .msi = p->msi,
-                    .permiso = p->permiso,
-                    .copias = p->copias,
-                    .memoria_libre = libres,
-                };
+                tabla[total + i] = pagina_publica(p, libres);
             }
             total += msg.p;
         }
@@ -1044,6 +1099,57 @@ int dsm_consultar_paginas(dsm_context_t *ctx, uint16_t hogar, dsm_pagina_info_t 
     rc = publicar(salida, cap, sizeof *salida, total, tabla, cantidad);
     free(tabla);
     return fin_consulta(ctx, rc == DSM_OK && parcial ? DSM_ERR_PARCIAL : rc);
+}
+
+int dsm_consultar_rango(dsm_context_t *ctx, uint16_t hogar, int copias,
+                        uint64_t desde, size_t limite, dsm_pagina_info_t *salida,
+                        size_t *cantidad, uint64_t *siguiente, int *mas)
+{
+    int rc = comenzar_consulta(ctx);
+    if (rc != DSM_OK) return rc;
+    if (salida == NULL || cantidad == NULL || siguiente == NULL || mas == NULL ||
+        limite == 0 || limite > DSM_STATS_RANGO_MAX || (copias != 0 && copias != 1) ||
+        (hogar != DSM_HOGAR_TODOS && hogar >= ctx->cfg.cantidad_nodos) ||
+        (copias && hogar != ctx->nodo)) return fin_consulta(ctx, DSM_ERR_INVAL);
+    *cantidad = 0; *siguiente = desde; *mas = 0;
+    uint16_t inicio = hogar == DSM_HOGAR_TODOS ? 0 : hogar;
+    uint16_t fin = hogar == DSM_HOGAR_TODOS ? ctx->cfg.cantidad_nodos : (uint16_t)(hogar + 1u);
+    uint64_t total_gpn = ctx->directorio.limites_gpn[ctx->cfg.cantidad_nodos];
+    int parcial = 0;
+    for (uint16_t id = inicio; id < fin; id++) {
+        uint64_t fin_hogar = ctx->directorio.limites_gpn[id + 1u];
+        if (!copias && fin_hogar <= desde) continue;
+        dsm_stats_reply_t msg;
+        if (*cantidad == limite) {
+            /* Cobertura global explicita aun cuando el limite de presentacion
+             * ya se alcanzo; no descargar las tablas de los otros hogares. */
+            rc = pedir_stats(ctx, id, DSM_STATS_NODOS, &msg);
+        } else {
+            dsm_stats_request_t pedido = {
+                .seleccion = copias ? DSM_STATS_COPIAS_RANGO : DSM_STATS_INVENTARIO,
+                .desde = *siguiente, .limite = (uint32_t)(limite - *cantidad),
+            };
+            rc = dsm_coherencia_stats_rango(ctx->coherencia, id, &pedido, &msg) == 0 ?
+                DSM_OK : error_api(errno);
+        }
+        if (par_mudo(rc) && hogar == DSM_HOGAR_TODOS) {
+            parcial = 1;
+            if (*cantidad < limite) *siguiente = fin_hogar;
+            continue;
+        }
+        if (rc != DSM_OK) return fin_consulta(ctx, rc);
+        if (*cantidad < limite) {
+            for (uint32_t i = 0; i < msg.p; i++)
+                salida[(*cantidad)++] = pagina_publica(&msg.paginas[i],
+                    copias && msg.paginas[i].hogar != ctx->nodo ? UINT32_MAX : msg.fichas[0].libres);
+            *siguiente = msg.siguiente;
+            *mas = msg.mas;
+            if (!copias && *cantidad == limite && hogar == DSM_HOGAR_TODOS)
+                *mas = *mas || *siguiente < total_gpn;
+        }
+        free(msg.paginas);
+    }
+    return fin_consulta(ctx, parcial ? DSM_ERR_PARCIAL : DSM_OK);
 }
 
 static char letra_msi(uint8_t msi)

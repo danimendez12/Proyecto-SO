@@ -10,17 +10,19 @@ enum {
     DSM_MAGIC = 0x44534D31,
     DSM_PROTO_VERSION = 1,
     DSM_FLAG_RESPUESTA = 0x0001,
+    DSM_FLAG_STATS_RANGO = 0x0002,
     DSM_CABECERA_BYTES = 32,
     DSM_LONGITUD_MAX = 1048576,
     DSM_PAGE_REQUEST_BYTES = 48,
     DSM_PAGE_REQUEST_MAP_BYTES = 56,
     DSM_PAGE_DATA_BASE = 80,
     DSM_NOMBRE_MAX = 64,
-    DSM_MAX_FICHAS = 40,
+    DSM_MAX_FICHAS = 60,
     DSM_TRAMOS_POR_HOGAR = 16,
-    /* Un cálculo reparte pocos tramos por hogar. 256 cubre los 40 puestos. */
+    /* Hasta 60 hogares; la fragmentacion sigue limitada a 256 tramos totales. */
     DSM_MAX_TRAMOS = 256,
-    DSM_REGION_INFO_MAX = 60 + 16 * DSM_MAX_TRAMOS,
+    DSM_REGION_PUBLICA = 0x50554231, /* PUB1: procedencia publica explicita */
+    DSM_REGION_INFO_MAX = 64 + 16 * DSM_MAX_TRAMOS,
     DSM_CAPACIDAD_BASE_BYTES = 56,
     DSM_CAPACIDAD_MAX = DSM_CAPACIDAD_BASE_BYTES + DSM_REGION_INFO_MAX - DSM_CABECERA_BYTES
 };
@@ -63,6 +65,16 @@ enum {
     DSM_STATS_PAGINAS = 2,
     DSM_STATS_AMBOS = 3,
     DSM_STATS_HOGAR = 4, /* ficha y páginas cuyo directorio es el emisor */
+    DSM_STATS_INVENTARIO = 5,
+    DSM_STATS_COPIAS_RANGO = 6,
+    DSM_STATS_RANGO_BYTES = 48,
+    DSM_STATS_RANGO_PREF = 120,
+    DSM_STATS_RANGO_MAX = 1024,
+    DSM_PAGINA_ASIGNADA = 0,
+    DSM_PAGINA_LIBRE = 1,
+    DSM_PAGINA_PREPARADA = 2,
+    DSM_PAGINA_ESTADO = 3,
+    DSM_PAGINA_PUBLICA = 4,
     DSM_STATS_CONTADORES = 8,
     DSM_STATS_PREF = 104,
     DSM_FICHA_PAGINA = 40,
@@ -240,6 +252,8 @@ typedef struct dsm_invalidate_ack {
 
 typedef struct dsm_stats_request {
     uint8_t seleccion;
+    uint32_t limite;
+    uint64_t desde;
 } dsm_stats_request_t;
 
 typedef struct dsm_pagina_consulta {
@@ -265,6 +279,9 @@ typedef struct dsm_stats_reply {
     dsm_ficha_t fichas[DSM_MAX_FICHAS];
     /* Al decodificar, paginas es memoria propia que el llamador libera. */
     dsm_pagina_consulta_t *paginas;
+    uint8_t rango;
+    uint8_t mas;
+    uint64_t siguiente;
 } dsm_stats_reply_t;
 
 typedef struct dsm_proto_error {
@@ -297,6 +314,8 @@ typedef struct dsm_region_info {
     uint32_t cantidad_tramos;
     uint32_t total_paginas;
     dsm_tramo_t tramos[DSM_MAX_TRAMOS];
+    /* Cero es procedencia historica: nunca implica proceso publico. */
+    uint8_t publica;
 } dsm_region_info_t;
 
 /* El token identifica la sesion del creador. Un ID no se puede recuperar ni

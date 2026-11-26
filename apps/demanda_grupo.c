@@ -1,4 +1,5 @@
 #include "demanda_grupo.h"
+#include "demanda_grupo_privado.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -8,17 +9,6 @@
 #include <sys/random.h>
 #include <unistd.h>
 
-enum { GRUPO_MAGIC = 0x44475232, FASE_MAGIC = 0x44465332,
-       ENTRAR = 1, PROPONER, ACEPTAR, CONFIRMAR, CONFIRMADO, EJECUTAR, FALLAR };
-
-struct miembro {
-    uint64_t nonce, token, digest;
-    uint32_t magic;
-    int32_t resultado;
-    uint16_t etapa, lider, cantidad;
-    uint16_t ids[DSM_CONFIG_MAX_NODOS];
-};
-
 struct recursos {
     uint64_t token;
     uint32_t magic, largo;
@@ -27,7 +17,6 @@ struct recursos {
 
 struct marca { uint32_t generacion; int32_t resultado; };
 
-_Static_assert(sizeof(struct miembro) <= DSM_ANUNCIO_DATOS, "Grupo excede aviso");
 _Static_assert(sizeof(struct recursos) == DSM_ANUNCIO_DATOS, "Sobre de recursos");
 _Static_assert(sizeof(demanda_fase_t) + DSM_CONFIG_MAX_NODOS * sizeof(struct marca) <= 4096,
                "Las marcas deben caber en una pagina");
@@ -84,28 +73,74 @@ static int aleatorio(uint64_t *valor)
     return DSM_OK;
 }
 
-static void miembro_propio(const demanda_grupo_t *g, struct miembro *m, unsigned etapa)
+static int miembro_valido(const struct miembro *m)
 {
-    memset(m, 0, sizeof *m);
-    m->magic = GRUPO_MAGIC; m->nonce = g->nonce; m->token = g->token;
-    m->digest = g->digest; m->lider = g->lider; m->cantidad = g->cantidad;
-    m->etapa = (uint16_t)etapa;
-    memcpy(m->ids, g->ids, g->cantidad * sizeof g->ids[0]);
+    if (m->magic != GRUPO_MAGIC || !m->nonce || m->cantidad > DSM_CONFIG_MAX_NODOS ||
+        m->lider >= DSM_CONFIG_MAX_NODOS || m->etapa < ENTRAR || m->etapa > FALLAR) return 0;
+    for (uint16_t i = 0; i < m->cantidad; i++)
+        if (m->ids[i] >= DSM_CONFIG_MAX_NODOS || (i && m->ids[i - 1] >= m->ids[i])) return 0;
+    if (m->etapa >= PROPONER && m->etapa <= EJECUTAR &&
+        (!m->token || !m->cantidad || m->ids[0] != m->lider)) return 0;
+    return 1;
+}
+
+int demanda_miembro_desde_grupo(const demanda_grupo_t *g, unsigned etapa, struct miembro *m)
+{
+    if (g == NULL || m == NULL || g->yo >= DSM_CONFIG_MAX_NODOS ||
+        g->cantidad > DSM_CONFIG_MAX_NODOS || etapa < ENTRAR || etapa > FALLAR) return DSM_ERR_INVAL;
+    struct miembro tmp = {0};
+    tmp.magic = GRUPO_MAGIC; tmp.nonce = g->nonce; tmp.token = g->token;
+    tmp.digest = g->digest; tmp.lider = g->lider; tmp.cantidad = g->cantidad;
+    tmp.etapa = (uint16_t)etapa;
+    for (uint16_t i = 0; i < g->cantidad; i++) {
+        if (g->ids[i] >= DSM_CONFIG_MAX_NODOS || (i && g->ids[i - 1] >= g->ids[i])) return DSM_ERR_INVAL;
+        tmp.ids[i] = (uint8_t)g->ids[i];
+    }
+    if (!miembro_valido(&tmp)) return DSM_ERR_PROTO;
+    *m = tmp;
+    return DSM_OK;
+}
+
+int demanda_miembro_codificar(const struct miembro *m, void *salida, size_t cap, size_t *bytes)
+{
+    if (m == NULL || salida == NULL || bytes == NULL || cap < sizeof *m) return DSM_ERR_INVAL;
+    if (!miembro_valido(m)) return DSM_ERR_PROTO;
+    struct miembro limpio;
+    memset(&limpio, 0, sizeof limpio);
+    limpio.nonce = m->nonce; limpio.token = m->token; limpio.digest = m->digest;
+    limpio.magic = m->magic; limpio.resultado = m->resultado;
+    limpio.etapa = m->etapa; limpio.lider = m->lider; limpio.cantidad = m->cantidad;
+    memcpy(limpio.ids, m->ids, m->cantidad * sizeof m->ids[0]);
+    memcpy(salida, &limpio, sizeof limpio);
+    *bytes = sizeof limpio;
+    return DSM_OK;
+}
+
+int demanda_miembro_decodificar(const void *datos, size_t bytes, struct miembro *m)
+{
+    if (datos == NULL || m == NULL) return DSM_ERR_INVAL;
+    if (bytes != sizeof *m) return DSM_ERR_PROTO;
+    struct miembro tmp;
+    memcpy(&tmp, datos, sizeof tmp);
+    if (!miembro_valido(&tmp)) return DSM_ERR_PROTO;
+    *m = tmp;
+    return DSM_OK;
 }
 
 static int publicar(demanda_grupo_t *g, const struct miembro *m)
-{ return dsm_aviso_publicar(g->ctx, g->clave, m, sizeof *m); }
+{
+    uint8_t datos[sizeof *m];
+    size_t bytes;
+    int rc = demanda_miembro_codificar(m, datos, sizeof datos, &bytes);
+    return rc == DSM_OK ? dsm_aviso_publicar(g->ctx, g->clave, datos, bytes) : rc;
+}
 
 static int leer(demanda_grupo_t *g, uint16_t autor, struct miembro *m)
 {
-    int rc = dsm_aviso_consultar_autor(g->ctx, g->clave, autor, m, sizeof *m);
+    uint8_t datos[sizeof *m];
+    int rc = dsm_aviso_consultar_autor(g->ctx, g->clave, autor, datos, sizeof datos);
     if (rc != DSM_OK) return rc;
-    if (m->magic != GRUPO_MAGIC || !m->nonce || m->cantidad > DSM_CONFIG_MAX_NODOS ||
-        m->etapa < ENTRAR || m->etapa > FALLAR) return DSM_ERR_PROTO;
-    for (uint16_t i = 0; i < m->cantidad; i++)
-        if (m->ids[i] >= DSM_CONFIG_MAX_NODOS || (i && m->ids[i - 1] >= m->ids[i]))
-            return DSM_ERR_PROTO;
-    return DSM_OK;
+    return demanda_miembro_decodificar(datos, sizeof datos, m);
 }
 
 static int mismo(const struct miembro *a, const struct miembro *b)
@@ -145,8 +180,8 @@ int demanda_grupo_iniciar(demanda_grupo_t *g, dsm_context_t *ctx, uint16_t yo,
     if (nombre && (!*nombre || strlen(nombre) > 64)) return DSM_ERR_INVAL;
     uint64_t h = huella(UINT64_C(14695981039346656037), parametros, strlen(parametros) + 1);
     if (nombre) h = huella(h, nombre, strlen(nombre));
-    snprintf(g->clave, sizeof g->clave, "dg:%016" PRIx64, h);
-    snprintf(g->recursos, sizeof g->recursos, "dr:%016" PRIx64, h);
+    snprintf(g->clave, sizeof g->clave, "dg3:%016" PRIx64, h);
+    snprintf(g->recursos, sizeof g->recursos, "dr3:%016" PRIx64, h);
     rc = aleatorio(&g->nonce);
     if (rc != DSM_OK) return rc;
     uint64_t inicio = demanda_ahora_ms(), estable = inicio;
@@ -154,8 +189,8 @@ int demanda_grupo_iniciar(demanda_grupo_t *g, dsm_context_t *ctx, uint16_t yo,
     uint64_t limite_grupo = inicio + espera + 30000u;
     if (limite_grupo > g->limite) limite_grupo = g->limite;
     struct miembro propio;
-    miembro_propio(g, &propio, ENTRAR);
-    rc = publicar(g, &propio);
+    rc = demanda_miembro_desde_grupo(g, ENTRAR, &propio);
+    if (rc == DSM_OK) rc = publicar(g, &propio);
     if (rc != DSM_OK) return rc;
     /* El JOIN existe durante una ronda real de reconexion. La quietud local
      * nunca reemplaza ni el sondeo ni las confirmaciones de la propuesta. */
@@ -196,14 +231,19 @@ int demanda_grupo_iniciar(demanda_grupo_t *g, dsm_context_t *ctx, uint16_t yo,
                 fprintf(stderr, "DEMANDA llegada tardia puesto=%u grupo ya cerrado\n", yo);
                 return DSM_ERR_OCUPADA;
             }
-            rc = digest_grupo(g, propuesta.ids, propuesta.cantidad, &digest);
+            uint16_t ids_propuestos[DSM_CONFIG_MAX_NODOS];
+            for (uint16_t i = 0; i < propuesta.cantidad; i++)
+                ids_propuestos[i] = (uint16_t)propuesta.ids[i];
+            /* El digest conserva la representacion canonica de IDs uint16_t,
+             * independientemente del arreglo compacto del anuncio. */
+            rc = digest_grupo(g, ids_propuestos, propuesta.cantidad, &digest);
             if (rc == DSM_OK && digest == propuesta.digest && propuesta.cantidad &&
                 propuesta.ids[0] == autor_propuesta) {
                 g->lider = autor_propuesta; g->token = propuesta.token; g->digest = digest;
                 g->cantidad = propuesta.cantidad; g->rango = (uint16_t)rango;
-                memcpy(g->ids, propuesta.ids, g->cantidad * sizeof g->ids[0]);
-                miembro_propio(g, &propio, ACEPTAR);
-                rc = publicar(g, &propio);
+                for (uint16_t i = 0; i < g->cantidad; i++) g->ids[i] = (uint16_t)propuesta.ids[i];
+                rc = demanda_miembro_desde_grupo(g, ACEPTAR, &propio);
+                if (rc == DSM_OK) rc = publicar(g, &propio);
                 if (rc != DSM_OK) return rc;
             } else if (rc != DSM_OK && rc != DSM_ERR_ESTADO && rc != DSM_ERR_NODO) return rc;
         } else if (propio.etapa == ENTRAR && nc && candidatos[0] == yo) {
@@ -216,8 +256,8 @@ int demanda_grupo_iniciar(demanda_grupo_t *g, dsm_context_t *ctx, uint16_t yo,
                 if (ahora - estable >= espera) {
                     g->token = g->nonce; g->digest = digest; g->cantidad = (uint16_t)nc;
                     memcpy(g->ids, candidatos, nc * sizeof candidatos[0]);
-                    miembro_propio(g, &propio, PROPONER);
-                    rc = publicar(g, &propio);
+                    rc = demanda_miembro_desde_grupo(g, PROPONER, &propio);
+                    if (rc == DSM_OK) rc = publicar(g, &propio);
                     if (rc != DSM_OK) return rc;
                 }
             }
@@ -276,7 +316,8 @@ void demanda_grupo_error(demanda_grupo_t *g, int resultado)
     if (!g->ctx || !g->clave[0] || resultado == DSM_OK) return;
     fprintf(stderr, "DEMANDA ERROR puesto=%u DSM=%d\n", g->yo, resultado);
     struct miembro m;
-    miembro_propio(g, &m, FALLAR); m.resultado = resultado;
+    if (demanda_miembro_desde_grupo(g, FALLAR, &m) != DSM_OK) return;
+    m.resultado = resultado;
     (void)publicar(g, &m);
 }
 

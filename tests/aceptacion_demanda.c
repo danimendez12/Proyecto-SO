@@ -175,6 +175,34 @@ static int donante(struct proceso *p, const char *ini, uint16_t id)
             do { recibidos = read(a[0], &orden, 1); } while (recibidos < 0 && errno == EINTR);
             if (recibidos != 1) break;
             if (orden == 'P') rc = probar_capacidad(ctx, proc, id);
+            else if (orden == 'S') {
+                uint64_t esperados;
+                if (transferir(a[0], &esperados, sizeof esperados, 0) != 0) _exit(124);
+                uint64_t anteriores[NODOS] = {0};
+                for (uint16_t par = 0; par < NODOS; par++) if (esperados & (UINT64_C(1) << par))
+                    (void)dsm_aviso_sesion(ctx, par, &anteriores[par]);
+                int armado = DSM_OK;
+                if (transferir(b[1], &armado, sizeof armado, 1) != 0) _exit(124);
+                uint64_t limite = demanda_ahora_ms() + 2000;
+                int todos = 0;
+                do {
+                    uint64_t ahora = demanda_ahora_ms();
+                    if (ahora >= limite) break;
+                    uint32_t restante = (uint32_t)(limite - ahora);
+                    rc = dsm_sondear(ctx, restante < 100 ? restante : 100);
+                    if (rc != DSM_OK) break;
+                    todos = 1;
+                    for (uint16_t par = 0; par < NODOS; par++) {
+                        if (!(esperados & (UINT64_C(1) << par))) continue;
+                        uint64_t actual = 0;
+                        if (dsm_aviso_sesion(ctx, par, &actual) != DSM_OK ||
+                            actual == 0 || actual == anteriores[par]) todos = 0;
+                    }
+                    if (!todos) pausa();
+                } while (!todos);
+                if (rc == DSM_OK && !todos) rc = DSM_ERR_TIEMPO;
+                printf("DEMANDA FIXTURE donante=%u enlaces_confirmados=%" PRIu64 " rc=%d\n", id, esperados, rc);
+            }
             else if (orden == 'X') rc = demanda_contexto_cerrar(&ctx, demanda_ahora_ms() + 5000);
             else rc = DSM_ERR_INVAL;
             if (transferir(b[1], &rc, sizeof rc, 1)) _exit(124);
@@ -201,15 +229,37 @@ static int token(const struct proceso *p, uint64_t *salida)
     free(s); return rc;
 }
 
-static int sesion(const char *ini, int matriz, unsigned n, uint64_t *anterior)
+static int sesion(const char *ini, int matriz, unsigned n, uint64_t *anterior,
+                   struct proceso donantes[2])
 {
     struct proceso p[3] = {0};
     int rc = 1;
     uint64_t inicio = demanda_ahora_ms();
     EXIGIR(n >= 2 && n <= 3);
+    /* Este escenario exige expresamente el hogar0. Los donantes de prueba
+     * ya existen, pero que escuchen no implica que hayan enlazado a una app
+     * nueva. Se adelanta su ronda y se acredita el enlace por la sesion real;
+     * no se modifica el orden de asignacion de produccion ni los casos de
+     * incorporacion tardia/fallo que siguen usando su aislamiento original. */
+    uint64_t esperados = (UINT64_C(1) << 1) | (UINT64_C(1) << 3);
+    if (n == 3) esperados |= UINT64_C(1) << 4;
+    char sondear = 'S';
+    for (size_t i = 0; i < 2; i++) {
+        EXIGIR(transferir(donantes[i].entrada, &sondear, 1, 1) == 0 &&
+               transferir(donantes[i].entrada, &esperados, sizeof esperados, 1) == 0);
+    }
+    for (size_t i = 0; i < 2; i++) {
+        int armado;
+        EXIGIR(transferir(donantes[i].salida, &armado, sizeof armado, 0) == 0 && armado == DSM_OK);
+    }
     EXIGIR(lanzar(&p[0], ini, matriz, NULL, 15, 0) == 0);
     EXIGIR(esperar(&p[0], "PUESTO id=1", 3000) == 0);
     for (unsigned i = 1; i < n; i++) EXIGIR(lanzar(&p[i], ini, matriz, NULL, 15, 0) == 0);
+    for (size_t i = 0; i < 2; i++) {
+        int enlace;
+        EXIGIR(transferir(donantes[i].salida, &enlace, sizeof enlace, 0) == 0 && enlace == DSM_OK);
+    }
+    printf("DEMANDA FIXTURE barrera de sesiones confirmada mascara=%" PRIu64 "\n", esperados);
     uint64_t comun = 0;
     for (unsigned i = 0; i < n; i++) {
         EXIGIR(esperar(&p[i], NULL, 20000) == 0 && codigo(&p[i], 1));
@@ -444,9 +494,9 @@ int main(int argc, char **argv)
     EXIGIR(orden(&d[0], 'P') == 0 && orden(&d[1], 'P') == 0);
     uint64_t anterior_mx = 0, anterior_ms = 0;
     for (unsigned repeticion = 0; repeticion < 2; repeticion++) {
-        EXIGIR(sesion(ini, 1, 2, &anterior_mx) == 0);
-        EXIGIR(sesion(ini, 1, 3, &anterior_mx) == 0);
-        EXIGIR(sesion(ini, 0, 3, &anterior_ms) == 0);
+        EXIGIR(sesion(ini, 1, 2, &anterior_mx, d) == 0);
+        EXIGIR(sesion(ini, 1, 3, &anterior_mx, d) == 0);
+        EXIGIR(sesion(ini, 0, 3, &anterior_ms, d) == 0);
         EXIGIR(orden(&d[0], 'P') == 0 && orden(&d[1], 'P') == 0);
     }
     EXIGIR(independientes(ini) == 0);
