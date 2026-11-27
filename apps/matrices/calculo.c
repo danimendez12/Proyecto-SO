@@ -140,6 +140,29 @@ struct tarea {
     int rc;
 };
 
+static int traer(dsm_context_t *ctx, dsm_reserva_id_t id, size_t bytes, size_t page_size,
+                 double **salida)
+{
+    double *destino = malloc(bytes);
+    if (destino == NULL) {
+        return DSM_ERR_NOMEM;
+    }
+    for (size_t offset = 0; offset < bytes;) {
+        size_t n = bytes - offset;
+        if (n > page_size) {
+            n = page_size;
+        }
+        int rc = dsm_leer(ctx, id, offset, (unsigned char *)destino + offset, n);
+        if (rc != DSM_OK) {
+            free(destino);
+            return rc;
+        }
+        offset += n;
+    }
+    *salida = destino;
+    return DSM_OK;
+}
+
 static void *worker(void *arg)
 {
     struct tarea *t = arg;
@@ -147,11 +170,16 @@ static void *worker(void *arg)
     if (t->rc != DSM_OK) {
         return NULL;
     }
-    void *base_a = NULL, *base_b = NULL;
+    size_t bytes[3];
+    double *a = NULL;
+    double *bt = NULL;
     double *pagina = NULL;
-    t->rc = dsm_traducir(t->ctx, t->m->a, 0, &base_a);
+    t->rc = validar(t->m, bytes);
     if (t->rc == DSM_OK) {
-        t->rc = dsm_traducir(t->ctx, t->m->b, 0, &base_b);
+        t->rc = traer(t->ctx, t->m->a, bytes[0], t->m->page_size, &a);
+    }
+    if (t->rc == DSM_OK) {
+        t->rc = traer(t->ctx, t->m->b, bytes[1], t->m->page_size, &bt);
     }
     if (t->rc == DSM_OK) {
         pagina = malloc(t->m->page_size);
@@ -159,8 +187,6 @@ static void *worker(void *arg)
             t->rc = DSM_ERR_NOMEM;
         }
     }
-    const double *a = base_a;
-    const double *bt = base_b;
     size_t por_pagina = t->m->page_size / sizeof(double);
     size_t elementos = t->m->filas * t->m->columnas;
     for (size_t bloque = t->inicio; bloque < t->fin && t->rc == DSM_OK; bloque++) {
@@ -175,8 +201,7 @@ static void *worker(void *arg)
             const double *fila_a = a + i * t->m->interior;
             const double *columna_b = bt + j * t->m->interior;
             double suma = 0.0;
-            /* El producto i,j,k de thread2. B_t evita recorrer B con stride
-             * sin copiar A/B fuera del DSM durante el calculo. */
+            /* El producto i,j,k de thread2. B_t evita recorrer B con stride. */
             for (size_t k = 0; k < t->m->interior; k++) {
                 suma += fila_a[k] * columna_b[k];
             }
@@ -186,6 +211,8 @@ static void *worker(void *arg)
                               pagina, cantidad * sizeof(double));
     }
     free(pagina);
+    free(bt);
+    free(a);
     int rc = dsm_hilo_desregistrar(t->ctx);
     if (t->rc == DSM_OK) {
         t->rc = rc;

@@ -1,5 +1,6 @@
 #include "protocol.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static void put_u16(uint8_t *p, uint16_t v)
@@ -131,7 +132,8 @@ int dsm_hello_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
     if (msg == NULL || out == NULL) {
         return -1;
     }
-    if (preparar(dst, cap, cab, 128) != 0) {
+    uint32_t longitud = msg->sesion == 0 ? 128u : 136u;
+    if (preparar(dst, cap, cab, longitud) != 0) {
         return -1;
     }
     put_u16(dst + 32, msg->node_id);
@@ -141,7 +143,10 @@ int dsm_hello_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
     put_u64(dst + 48, msg->memoria);
     put_u64(dst + 56, msg->base);
     memcpy(dst + 64, msg->nombre, DSM_NOMBRE_MAX);
-    *out = 128;
+    if (msg->sesion != 0) {
+        put_u64(dst + 128, msg->sesion);
+    }
+    *out = longitud;
     return 0;
 }
 
@@ -150,7 +155,8 @@ int dsm_hello_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, dsm
     if (msg == NULL || dsm_cabecera_decodificar(src, n, cab) != 0) {
         return -1;
     }
-    if (cab->tipo != DSM_TIPO_NODE_HELLO || cab->longitud != 128 || n != 128) {
+    if (cab->tipo != DSM_TIPO_NODE_HELLO || (n != 128 && n != 136) ||
+        cab->longitud != n || (n == 136 && get_u64(src + 128) == 0)) {
         return -1;
     }
     memset(msg, 0, sizeof *msg);
@@ -161,6 +167,7 @@ int dsm_hello_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, dsm
     msg->memoria = get_u64(src + 48);
     msg->base = get_u64(src + 56);
     copiar_nombre(msg->nombre, (const char *)(src + 64));
+    msg->sesion = n == 136 ? get_u64(src + 128) : 0;
     return 0;
 }
 
@@ -667,15 +674,20 @@ static void escribir_info(uint8_t *p, const dsm_region_info_t *msg)
         put_u32(tramo + 4, msg->tramos[i].cantidad);
         put_u64(tramo + 8, msg->tramos[i].gpn_inicial);
     }
+    if (msg->publica) {
+        put_u32(p + 28u + 16u * msg->cantidad_tramos, DSM_REGION_PUBLICA);
+    }
 }
 
 static int leer_info(const uint8_t *p, size_t n, dsm_region_info_t *msg)
 {
-    if (n < 28 || (n - 28u) % 16u != 0) {
+    if (n < 28) {
         return -1;
     }
-    size_t cantidad = (n - 28u) / 16u;
-    if (cantidad > DSM_MAX_TRAMOS || get_u32(p + 20) != cantidad) {
+    size_t cantidad = get_u32(p + 20);
+    size_t base = 28u + 16u * cantidad;
+    if (cantidad > DSM_MAX_TRAMOS ||
+        (n != base && (n != base + 4u || get_u32(p + base) != DSM_REGION_PUBLICA))) {
         return -1;
     }
     memset(msg, 0, sizeof *msg);
@@ -685,6 +697,7 @@ static int leer_info(const uint8_t *p, size_t n, dsm_region_info_t *msg)
     msg->primer_tramo = get_u32(p + 16);
     msg->cantidad_tramos = (uint32_t)cantidad;
     msg->total_paginas = get_u32(p + 24);
+    msg->publica = n == base + 4u;
     for (size_t i = 0; i < cantidad; i++) {
         const uint8_t *tramo = p + 28 + i * 16u;
         msg->tramos[i].orden_inicial = get_u32(tramo + 0);
@@ -697,10 +710,10 @@ static int leer_info(const uint8_t *p, size_t n, dsm_region_info_t *msg)
 int dsm_region_info_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                               const dsm_region_info_t *msg, size_t *out)
 {
-    if (msg == NULL || out == NULL || msg->cantidad_tramos > DSM_MAX_TRAMOS) {
+    if (msg == NULL || out == NULL || msg->cantidad_tramos > DSM_MAX_TRAMOS || msg->publica > 1) {
         return -1;
     }
-    uint32_t longitud = 60u + 16u * msg->cantidad_tramos;
+    uint32_t longitud = 60u + 16u * msg->cantidad_tramos + (msg->publica ? 4u : 0u);
     if (preparar(dst, cap, cab, longitud) != 0) {
         return -1;
     }
@@ -755,7 +768,8 @@ static int capacidad_valida(const dsm_cabecera_t *cab, const dsm_capacidad_t *ms
         (cab->tipo == DSM_TIPO_CAP_COMMIT || cab->tipo == DSM_TIPO_CAP_PREPARE_ACK)) {
         return msg->info.reserva_id == msg->reserva_id &&
                msg->info.cantidad_tramos <= DSM_MAX_TRAMOS &&
-               msg->info.cantidad_tramos != 0 && msg->info.total_paginas != 0;
+               msg->info.cantidad_tramos != 0 && msg->info.total_paginas != 0 &&
+               msg->info.publica <= 1;
     }
     return 1;
 }
@@ -770,7 +784,7 @@ int dsm_capacidad_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                      (cab->tipo == DSM_TIPO_CAP_COMMIT || cab->tipo == DSM_TIPO_CAP_PREPARE_ACK);
     uint32_t longitud = DSM_CAPACIDAD_BASE_BYTES;
     if (manifiesto) {
-        longitud += 28u + 16u * msg->info.cantidad_tramos;
+        longitud += 28u + 16u * msg->info.cantidad_tramos + (msg->info.publica ? 4u : 0u);
     }
     if (preparar(dst, cap, cab, longitud) != 0) {
         return -1;
@@ -811,4 +825,333 @@ int dsm_capacidad_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
         return -1;
     }
     return capacidad_valida(cab, msg) ? 0 : -1;
+}
+
+int dsm_stats_request_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                const dsm_stats_request_t *msg, size_t *out)
+{
+    int rango = msg != NULL && (msg->seleccion == DSM_STATS_INVENTARIO ||
+                                msg->seleccion == DSM_STATS_COPIAS_RANGO);
+    if (msg == NULL || out == NULL || cab == NULL || cab->tipo != DSM_TIPO_STATS_REQUEST ||
+        cab->banderas != 0 || cab->id_corr != 0 ||
+        (msg->seleccion != DSM_STATS_NODOS && msg->seleccion != DSM_STATS_PAGINAS &&
+         msg->seleccion != DSM_STATS_AMBOS && msg->seleccion != DSM_STATS_HOGAR && !rango) ||
+        (rango && (msg->limite == 0 || msg->limite > DSM_STATS_RANGO_MAX)) ||
+        preparar(dst, cap, cab, rango ? DSM_STATS_RANGO_BYTES : 40) != 0) {
+        return -1;
+    }
+    dst[32] = msg->seleccion;
+    if (rango) {
+        dst[33] = 1;
+        put_u32(dst + 36, msg->limite);
+        put_u64(dst + 40, msg->desde);
+    }
+    *out = cab->longitud;
+    return 0;
+}
+
+int dsm_stats_request_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                  dsm_stats_request_t *msg)
+{
+    if (msg == NULL || (n != 40 && n != DSM_STATS_RANGO_BYTES) ||
+        dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        cab->tipo != DSM_TIPO_STATS_REQUEST || cab->banderas != 0 || cab->id_corr != 0 ||
+        cab->longitud != n) {
+        return -1;
+    }
+    int rango = src[32] == DSM_STATS_INVENTARIO || src[32] == DSM_STATS_COPIAS_RANGO;
+    if (rango ? (n != DSM_STATS_RANGO_BYTES || src[33] != 1 || get_u16(src + 34) != 0 ||
+                  get_u32(src + 36) == 0 || get_u32(src + 36) > DSM_STATS_RANGO_MAX) :
+                (n != 40 || (src[32] != DSM_STATS_NODOS && src[32] != DSM_STATS_PAGINAS &&
+                              src[32] != DSM_STATS_AMBOS && src[32] != DSM_STATS_HOGAR))) {
+        return -1;
+    }
+    *msg = (dsm_stats_request_t){.seleccion = src[32]};
+    if (rango) {
+        msg->limite = get_u32(src + 36);
+        msg->desde = get_u64(src + 40);
+    }
+    return 0;
+}
+
+static void escribir_pagina_consulta(uint8_t *p, const dsm_pagina_consulta_t *pag)
+{
+    memset(p, 0, DSM_FICHA_PAGINA);
+    put_u64(p + 0, pag->gpn);
+    put_u64(p + 8, pag->mascara);
+    put_u32(p + 16, pag->proc);
+    put_u32(p + 20, pag->reserva);
+    put_u32(p + 24, pag->orden);
+    put_u16(p + 28, pag->hogar);
+    put_u16(p + 30, pag->poseedor);
+    p[32] = pag->msi;
+    p[33] = pag->permiso;
+    p[34] = pag->banderas;
+    p[35] = pag->copias;
+    put_u32(p + 36, pag->version);
+}
+
+static void leer_pagina_consulta(const uint8_t *p, dsm_pagina_consulta_t *pag)
+{
+    memset(pag, 0, sizeof *pag);
+    pag->gpn = get_u64(p + 0);
+    pag->mascara = get_u64(p + 8);
+    pag->proc = get_u32(p + 16);
+    pag->reserva = get_u32(p + 20);
+    pag->orden = get_u32(p + 24);
+    pag->hogar = get_u16(p + 28);
+    pag->poseedor = get_u16(p + 30);
+    pag->msi = p[32];
+    pag->permiso = p[33];
+    pag->banderas = p[34];
+    pag->copias = p[35];
+    pag->version = get_u32(p + 36);
+}
+
+static int pagina_rango_valida(const dsm_pagina_consulta_t *p)
+{
+    unsigned asignacion = p->banderas & DSM_PAGINA_ESTADO;
+    if ((p->banderas & ~(DSM_PAGINA_ESTADO | DSM_PAGINA_PUBLICA)) ||
+        asignacion > DSM_PAGINA_PREPARADA || p->hogar >= DSM_MAX_FICHAS ||
+        p->msi > DSM_MSI_M ||
+        (p->permiso != 0 && p->permiso != DSM_PAGE_PERMISO_LEER &&
+         p->permiso != DSM_PAGE_PERMISO_ESCRIBIR) ||
+        (p->poseedor != UINT16_MAX && p->poseedor >= DSM_MAX_FICHAS)) return 0;
+    if (asignacion == DSM_PAGINA_LIBRE)
+        return p->banderas == DSM_PAGINA_LIBRE && p->reserva == 0 && p->proc == 0 &&
+               p->orden == UINT32_MAX && p->mascara == 0 && p->permiso == 0 &&
+               p->copias == 0 && p->version == 0 && p->poseedor == UINT16_MAX;
+    if ((uint16_t)p->reserva == 0 || (p->reserva >> 16) >= DSM_MAX_FICHAS) return 0;
+    if (asignacion == DSM_PAGINA_PREPARADA)
+        return p->msi == DSM_MSI_I && p->mascara == 0 && p->permiso == 0 &&
+               p->copias == 0 && p->version == 0 && p->poseedor == UINT16_MAX;
+    return (p->permiso != DSM_PAGE_PERMISO_ESCRIBIR || p->msi == DSM_MSI_M) &&
+           (p->permiso != DSM_PAGE_PERMISO_LEER || p->msi == DSM_MSI_S);
+}
+
+int dsm_stats_reply_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                              const dsm_stats_reply_t *msg, size_t *out)
+{
+    if (msg == NULL || out == NULL || cab == NULL || cab->tipo != DSM_TIPO_STATS_REPLY ||
+        (cab->banderas & DSM_FLAG_RESPUESTA) == 0 || cab->id_corr == 0 ||
+        msg->n > DSM_MAX_FICHAS || (msg->p != 0 && msg->paginas == NULL) ||
+        msg->rango > 1 || msg->mas > 1 || (msg->rango && msg->p > DSM_STATS_RANGO_MAX)) {
+        return -1;
+    }
+    for (uint32_t i = 0; msg->rango && i < msg->p; i++)
+        if (!pagina_rango_valida(&msg->paginas[i])) return -1;
+    size_t prefijo = msg->rango ? DSM_STATS_RANGO_PREF : DSM_STATS_PREF;
+    cab->banderas = DSM_FLAG_RESPUESTA | (msg->rango ? DSM_FLAG_STATS_RANGO : 0);
+    uint64_t longitud = (uint64_t)prefijo + (uint64_t)msg->n * 104u +
+                        (uint64_t)msg->p * DSM_FICHA_PAGINA;
+    if (longitud > DSM_LONGITUD_MAX || preparar(dst, cap, cab, (uint32_t)longitud) != 0) {
+        return -1;
+    }
+    put_u16(dst + 32, msg->emisor);
+    put_u16(dst + 34, msg->n);
+    put_u32(dst + 36, msg->p);
+    if (msg->rango) {
+        put_u64(dst + 104, msg->siguiente);
+        dst[112] = msg->mas;
+    }
+    for (int i = 0; i < DSM_STATS_CONTADORES; i++) {
+        put_u64(dst + 40 + (size_t)i * 8u, msg->contadores[i]);
+    }
+    for (uint16_t i = 0; i < msg->n; i++) {
+        escribir_ficha(dst + prefijo + (size_t)i * 104u, &msg->fichas[i]);
+    }
+    uint8_t *base = dst + prefijo + (size_t)msg->n * 104u;
+    for (uint32_t i = 0; i < msg->p; i++) {
+        escribir_pagina_consulta(base + (size_t)i * DSM_FICHA_PAGINA, &msg->paginas[i]);
+    }
+    *out = (size_t)longitud;
+    return 0;
+}
+
+int dsm_stats_reply_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                dsm_stats_reply_t *msg)
+{
+    if (msg == NULL || n < DSM_STATS_PREF || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        cab->tipo != DSM_TIPO_STATS_REPLY || (cab->banderas & DSM_FLAG_RESPUESTA) == 0 ||
+        (cab->banderas & ~(DSM_FLAG_RESPUESTA | DSM_FLAG_STATS_RANGO)) != 0 ||
+        cab->id_corr == 0 || n != cab->longitud) {
+        return -1;
+    }
+    uint16_t cantidad_nodos = get_u16(src + 34);
+    uint32_t cantidad_paginas = get_u32(src + 36);
+    int rango = (cab->banderas & DSM_FLAG_STATS_RANGO) != 0;
+    size_t prefijo = rango ? DSM_STATS_RANGO_PREF : DSM_STATS_PREF;
+    if (rango && (n < prefijo || src[112] > 1 || cantidad_paginas > DSM_STATS_RANGO_MAX)) {
+        return -1;
+    }
+    if (rango) {
+        for (size_t i = 113; i < DSM_STATS_RANGO_PREF; i++) {
+            if (src[i] != 0) return -1;
+        }
+    }
+    uint64_t esperada = (uint64_t)prefijo + (uint64_t)cantidad_nodos * 104u +
+                        (uint64_t)cantidad_paginas * DSM_FICHA_PAGINA;
+    if (cantidad_nodos > DSM_MAX_FICHAS || esperada != n) {
+        return -1;
+    }
+    dsm_pagina_consulta_t *paginas = NULL;
+    if (cantidad_paginas != 0) {
+        paginas = calloc(cantidad_paginas, sizeof *paginas);
+        if (paginas == NULL) {
+            return -1;
+        }
+    }
+    memset(msg, 0, sizeof *msg);
+    msg->emisor = get_u16(src + 32);
+    msg->n = cantidad_nodos;
+    msg->p = cantidad_paginas;
+    msg->rango = (uint8_t)rango;
+    if (rango) {
+        msg->mas = src[112];
+        msg->siguiente = get_u64(src + 104);
+    }
+    for (int i = 0; i < DSM_STATS_CONTADORES; i++) {
+        msg->contadores[i] = get_u64(src + 40 + (size_t)i * 8u);
+    }
+    for (uint16_t i = 0; i < cantidad_nodos; i++) {
+        leer_ficha(src + prefijo + (size_t)i * 104u, &msg->fichas[i]);
+    }
+    const uint8_t *base = src + prefijo + (size_t)cantidad_nodos * 104u;
+    for (uint32_t i = 0; i < cantidad_paginas; i++) {
+        leer_pagina_consulta(base + (size_t)i * DSM_FICHA_PAGINA, &paginas[i]);
+        if (rango && !pagina_rango_valida(&paginas[i])) {
+            free(paginas); memset(msg, 0, sizeof *msg); return -1;
+        }
+    }
+    msg->paginas = paginas;
+    return 0;
+}
+
+int dsm_proto_error_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                              const dsm_proto_error_t *msg, size_t *out)
+{
+    if (msg == NULL || out == NULL || cab == NULL || cab->tipo != DSM_TIPO_PROTO_ERROR ||
+        cab->banderas != 0 || preparar(dst, cap, cab, DSM_PROTO_ERROR_BYTES) != 0) {
+        return -1;
+    }
+    put_u16(dst + 32, msg->codigo);
+    put_u32(dst + 36, msg->id_causante);
+    memcpy(dst + 40, msg->texto, DSM_PROTO_TEXTO);
+    *out = DSM_PROTO_ERROR_BYTES;
+    return 0;
+}
+
+int dsm_proto_error_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                dsm_proto_error_t *msg)
+{
+    if (msg == NULL || n != DSM_PROTO_ERROR_BYTES || dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        cab->tipo != DSM_TIPO_PROTO_ERROR || cab->longitud != DSM_PROTO_ERROR_BYTES) {
+        return -1;
+    }
+    memset(msg, 0, sizeof *msg);
+    msg->codigo = get_u16(src + 32);
+    msg->id_causante = get_u32(src + 36);
+    memcpy(msg->texto, src + 40, DSM_PROTO_TEXTO);
+    msg->texto[DSM_PROTO_TEXTO - 1] = '\0';
+    return 0;
+}
+
+int dsm_anuncio_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab, uint16_t autor,
+                          const char *clave, const void *datos, size_t n, size_t *out)
+{
+    size_t clave_n = clave == NULL ? 0 : strlen(clave);
+    if (out == NULL || cab == NULL || cab->tipo != DSM_TIPO_ANUNCIO || cab->banderas != 0 ||
+        cab->id_corr != 0 || clave_n == 0 || clave_n >= DSM_ANUNCIO_CLAVE || n > DSM_ANUNCIO_DATOS ||
+        (n != 0 && datos == NULL)) {
+        return -1;
+    }
+    if (preparar(dst, cap, cab, (uint32_t)(DSM_ANUNCIO_BASE + n)) != 0) {
+        return -1;
+    }
+    put_u16(dst + 32, autor);
+    put_u16(dst + 34, (uint16_t)n);
+    memcpy(dst + 36, clave, clave_n);
+    if (n != 0) {
+        memcpy(dst + DSM_ANUNCIO_BASE, datos, n);
+    }
+    *out = DSM_ANUNCIO_BASE + n;
+    return 0;
+}
+
+int dsm_anuncio_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, uint16_t *autor,
+                            char clave[DSM_ANUNCIO_CLAVE], uint8_t *datos, size_t cap, size_t *largo)
+{
+    if (autor == NULL || clave == NULL || largo == NULL || n < DSM_ANUNCIO_BASE ||
+        dsm_cabecera_decodificar(src, n, cab) != 0 || cab->tipo != DSM_TIPO_ANUNCIO ||
+        cab->banderas != 0 || cab->longitud != n) {
+        return -1;
+    }
+    uint16_t bytes = get_u16(src + 34);
+    if ((size_t)DSM_ANUNCIO_BASE + bytes != n || bytes > cap || (bytes != 0 && datos == NULL)) {
+        return -1;
+    }
+    *autor = get_u16(src + 32);
+    memcpy(clave, src + 36, DSM_ANUNCIO_CLAVE);
+    clave[DSM_ANUNCIO_CLAVE - 1] = '\0';
+    if (clave[0] == '\0') {
+        return -1;
+    }
+    if (bytes != 0) {
+        memcpy(datos, src + DSM_ANUNCIO_BASE, bytes);
+    }
+    *largo = bytes;
+    return 0;
+}
+
+int dsm_anuncio_versionado_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                     const dsm_anuncio_t *msg, size_t *out)
+{
+    if (msg == NULL || out == NULL || !cabecera_pedido(cab, DSM_TIPO_ANUNCIO) ||
+        msg->sesion == 0 || msg->generacion == 0 || msg->banderas > DSM_ANUNCIO_RETIRADO ||
+        msg->largo > DSM_ANUNCIO_DATOS ||
+        (msg->banderas == DSM_ANUNCIO_RETIRADO && msg->largo != 0) ||
+        (msg->largo != 0 && msg->datos == NULL)) {
+        return -1;
+    }
+    size_t clave_n = strnlen(msg->clave, DSM_ANUNCIO_CLAVE);
+    if (clave_n == 0 || clave_n == DSM_ANUNCIO_CLAVE ||
+        preparar(dst, cap, cab, (uint32_t)(DSM_ANUNCIO_VERSIONADO_BASE + msg->largo)) != 0) {
+        return -1;
+    }
+    put_u16(dst + 32, msg->autor);
+    put_u16(dst + 34, (uint16_t)msg->largo);
+    put_u16(dst + 36, msg->banderas);
+    put_u64(dst + 40, msg->sesion);
+    put_u64(dst + 48, msg->generacion);
+    memcpy(dst + 56, msg->clave, clave_n);
+    if (msg->largo != 0) {
+        memcpy(dst + DSM_ANUNCIO_VERSIONADO_BASE, msg->datos, msg->largo);
+    }
+    *out = cab->longitud;
+    return 0;
+}
+
+int dsm_anuncio_versionado_decodificar(const uint8_t *src, size_t n,
+                                       dsm_cabecera_t *cab, dsm_anuncio_t *msg)
+{
+    if (msg == NULL || n < DSM_ANUNCIO_VERSIONADO_BASE ||
+        dsm_cabecera_decodificar(src, n, cab) != 0 ||
+        !cabecera_pedido(cab, DSM_TIPO_ANUNCIO) || cab->longitud != n ||
+        get_u16(src + 38) != 0 || get_u16(src + 36) > DSM_ANUNCIO_RETIRADO ||
+        get_u64(src + 40) == 0 || get_u64(src + 48) == 0 ||
+        get_u16(src + 34) > DSM_ANUNCIO_DATOS ||
+        n != DSM_ANUNCIO_VERSIONADO_BASE + (size_t)get_u16(src + 34) ||
+        src[56] == 0 || memchr(src + 56, 0, DSM_ANUNCIO_CLAVE) == NULL ||
+        (get_u16(src + 36) == DSM_ANUNCIO_RETIRADO && get_u16(src + 34) != 0)) {
+        return -1;
+    }
+    memset(msg, 0, sizeof *msg);
+    msg->autor = get_u16(src + 32);
+    msg->banderas = get_u16(src + 36);
+    msg->sesion = get_u64(src + 40);
+    msg->generacion = get_u64(src + 48);
+    memcpy(msg->clave, src + 56, DSM_ANUNCIO_CLAVE);
+    msg->largo = get_u16(src + 34);
+    msg->datos = msg->largo != 0 ? src + DSM_ANUNCIO_VERSIONADO_BASE : NULL;
+    return 0;
 }

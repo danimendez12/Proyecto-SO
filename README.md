@@ -10,6 +10,27 @@ independientes en Linux x86-64. Varios nodos pueden aportar páginas a la
 misma reserva. Un fallo en la vista de aplicación activa al paginador y
 el hogar de la página coordina por TCP sus permisos MSI.
 
+## Entrega final
+
+Cada terminal reclama un puesto del INI común. Para iniciar un donante usá
+`./bin/dsm_unir config/pool-lab.ini`. Matrices y Merge Sort también reclaman su
+puesto y acuerdan los participantes. La plantilla contempla 20 equipos y
+60 puestos, tres por IP. Reemplazá las IP de ejemplo antes de ejecutarla en el laboratorio.
+
+[Guía de instalación y demostración](docs/guia-laboratorio.md) ·
+[Arquitectura, MSI y protocolo](docs/arquitectura-final.md) ·
+[Manual de la consola](docs/manual-consola.md) · [Validación de 14D](docs/validacion-14d.md) ·
+[Guion físico en el TEC](docs/pruebas-fisicas-14d.md) · [Resultados históricos de 13B](docs/validacion-13b.md)
+
+Al arrancar, la consola aporta 8 MiB con sus 2048 páginas libres. Permite reservar memoria local y remota, procesarla con Pthreads y volver al prompt. Las aplicaciones independientes reclaman otro puesto para cada proceso de cálculo.
+
+```bash
+make
+./bin/dsm_unir config/pool-lab.ini
+```
+
+Dentro de la consola usá `ayuda`, `estado` y `memoria` para comprobar la incorporación. Con un segundo hogar activo, probá `reservar 15M` y usá el ID devuelto con `mapa ID`. Las IPv4 de la plantilla son ejemplos.
+
 ## Organización
 
 | Directorio | Contenido |
@@ -20,7 +41,7 @@ el hogar de la página coordina por TCP sus permisos MSI.
 | `apps/matrices/` | Multiplicación de matrices con Pthreads, reservas DSM multihogar y verificación numérica. |
 | `apps/mergesort/` | Merge Sort con Pthreads, fusión por niveles en DSM y comparación exhaustiva con una referencia independiente. |
 | `tests/` | Pruebas de aceptación de red, memoria, directorio y paginación. |
-| `config/` | Configuraciones locales de dos y tres nodos y plantilla para ocho nodos. |
+| `config/` | INI común del laboratorio y configuraciones internas de aceptación. |
 | `docs/` | Documentación técnica y evidencias del laboratorio. |
 | `bin/` | Ejecutables generados durante la compilación. |
 
@@ -29,7 +50,9 @@ el hogar de la página coordina por TCP sus permisos MSI.
 | Módulo | Responsabilidad |
 | --- | --- |
 | `dsm` | Coordinar el ciclo de vida del nodo y sus módulos. |
-| `config` | Cargar y validar los parámetros del laboratorio. |
+| `config` | Cargar y validar el INI y expandir los equipos a puestos. |
+| `pool` | Reclamar un puesto cuyo endpoint sea local. |
+| `aviso` | Publicar, retirar y reproducir anuncios de la sesión del autor. |
 | `protocol` | Definir el formato y la codificación de los mensajes entre nodos. |
 | `network` | Gestionar las conexiones TCP, los latidos y las reincorporaciones. |
 | `coherence` | Correlacionar las solicitudes del paginador con el hogar y aplicar las respuestas al directorio local. |
@@ -46,11 +69,11 @@ los ejecutables correspondientes.
 
 | Comando | Resultado |
 | --- | --- |
-| `make` | Genera `bin/dsm_node`. |
+| `make` | Compila el nodo histórico, el lanzador, la consola persistente y ambas aplicaciones. |
 | `make examples` | Genera los ejemplos en `bin/examples/`. |
 | `make apps` | Compila matrices, su referencia secuencial original y Merge Sort con sus modos distribuido y secuencial. |
 | `make tests` | Genera los programas de prueba en `bin/tests/`. |
-| `make aceptacion` | Compila las quince aceptaciones del DSM y las dos aceptaciones de aplicaciones. |
+| `make aceptacion` | Prepara las aceptaciones de los prototipos y de 13B y 14D. La aceptación de consola usa Python 3 estándar. |
 | `make clean` | Elimina el directorio de salida `bin/`. |
 
 ## Demostración de paginación remota
@@ -84,13 +107,10 @@ su ID global y escucha en la IPv4 y el puerto de su entrada. Una misma IPv4
 puede corresponder a varios procesos con puertos distintos. Los puertos de
 origen de las conexiones salientes los elige Linux.
 
-`config/lab.ini` es el caso local de dos procesos. Para el laboratorio, copiá
-`config/lab-ocho.ini`, sustituí los marcadores `<IPv4_A>` a `<IPv4_E>`
-por las direcciones reales y descomentá las ocho entradas. Usá el mismo
-archivo en todos los equipos y elegí el ID al arrancar. El ejemplo asigna los
-nodos 0–2 a A, 3–4 a B, 5 a C, 6 a D y 7 a E, con puertos 27200–27207.
-Comprobá que los puertos estén libres y que el firewall permita TCP entre
-los equipos. El formato de cada entrada es:
+La plantilla oficial es `config/pool-lab.ini`. Incluye las IPv4 potenciales
+y asigna puestos al inicio de cada proceso. Los archivos `lab.ini` y
+`lab-ocho.ini` conservan el formato de puestos explícitos para pruebas
+internas. En ese formato cada entrada se escribe así.
 
 ~~~text
 nodo = id nombre IPv4 puerto [memoria_bytes]
@@ -98,7 +118,7 @@ nodo = id nombre IPv4 puerto [memoria_bytes]
 
 Si omitís la contribución, se usa `memoria_inicial`. Las bases lógicas se
 calculan sumando los aportes de los IDs anteriores. La capacidad de
-configuración es de hasta 16 nodos, limitada en cada archivo por `max_nodos`.
+configuración es de hasta 60 nodos, limitada en cada archivo por `max_nodos`.
 El menor ID inicia cada conexión y reintenta el alta. El mayor conserva su
 puerto de escucha para sus pares.
 
@@ -178,7 +198,7 @@ de página. Hay un contexto por proceso. Cada contexto admite varias reservas.
 | Abrir | `dsm_abrir_reserva` consulta al creador por TCP, recibe el manifiesto y crea vistas locales. Las páginas remotas comienzan en I. Reabrir el mismo ID devuelve la misma Ar y el tamaño lógico. Basta una desvinculación por nodo. |
 | Acceder | Registrá el hilo antes de usar directamente Ar o el puntero de `dsm_traducir`. Cada fallo resuelve el GPN de esa página. La aplicación sincroniza los accesos directos concurrentes a los mismos datos. |
 | Consultar el mapa | `dsm_ubicacion_pagina(ctx, id, orden, &hogar, &gpn)` devuelve el hogar y el GPN del ordinal lógico, empezando en cero. Está disponible al crear o abrir la reserva. |
-| Copiar | `dsm_leer` y `dsm_escribir` validan el rango lógico y adquieren los permisos MSI por página. Admiten cruces y solapamiento. Un error de comunicación se devuelve al llamador. Una copia de varias páginas puede haberse completado parcialmente si falla una página posterior. |
+| Copiar | `dsm_leer` y `dsm_escribir` validan el rango lógico y adquieren permisos MSI por página; admiten cruces, solapamiento como `memmove` y registro temporal del hilo. Una lectura a memoria ordinaria conserva el destino si falla el DSM. Una escritura intenta restaurar localmente cada trozo solo si conserva M, la misma versión y los bytes que escribió, sin RPC ni recuperar permisos; si hubo invalidación, pérdida o cambios ajenos puede quedar una copia parcial y se devuelve el fallo original. Leer hacia otra vista DSM también puede dejar trozos modificados al fallar. Las operaciones no son transacciones ni instantáneas distribuidas. La aplicación debe sincronizar los accesos directos Ar locales solapados y los buffers ordinarios durante toda la operación, incluida su restauración. |
 | Desvincular | `dsm_desvincular_reserva` devuelve las copias S o M a sus respectivos hogares y confirma el cierre con el creador. El nodo que también aportó páginas continúa sirviéndolas. |
 | Liberar | Solo el creador puede llamar a `dsm_liberar`. Una apertura remota vigente devuelve `DSM_ERR_OCUPADA`. Después de despublicar, el creador espera la devolución de capacidad en cada hogar. Ante un timeout, reintentá con el mismo ID. |
 | Cerrar | Desregistrá los trabajadores y llamá a `dsm_cerrar`. El contexto desvincula las vistas de cliente y libera las reservas propias. Si el nodo aún aporta páginas a otro creador, devuelve `DSM_ERR_OCUPADA`. Un cierre parcial puede haber retirado otras reservas. Al completar el cierre se detienen los hilos y se restauran las señales. |
@@ -195,6 +215,7 @@ obtener un código de error de la operación, usá las funciones de copia.
 | `DSM_ERR_NOMEM` | La capacidad o los tramos disponibles entre los participantes son insuficientes, o falla la creación de las vistas. |
 | `DSM_ERR_NODO` | El par está desconectado o la página quedó aislada al perder el hogar. |
 | `DSM_ERR_TIEMPO` | Una solicitud enviada quedó sin respuesta dentro del plazo. |
+| `DSM_ERR_PARCIAL` | Una consulta global de páginas o impresión solo pudo observar una parte de los puestos configurados. |
 | `DSM_ERR_OCUPADA` | Hay trabajadores o aperturas que impiden retirar la reserva. |
 
 Después de perder el hogar, una vista antigua permanece protegida aunque se
@@ -204,7 +225,7 @@ puede quedar indisponible.
 
 El manifiesto contiene tramos de GPN con su ordinal inicial. Cada tramo
 pertenece a un solo hogar y puede cubrir miles de páginas. Una reserva admite
-hasta 16 tramos por hogar y hasta 16 hogares según el INI. Cada hogar administra
+hasta 16 tramos por hogar, hasta 60 hogares configurados y 256 tramos en total. Cada hogar administra
 su capacidad y el MSI de sus páginas. El creador publica el mapa completo
 después de que todos hayan confirmado la asignación.
 

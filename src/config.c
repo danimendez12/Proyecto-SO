@@ -164,7 +164,8 @@ static int validar(dsm_config_t *cfg, const int presente[])
             return -1;
         }
         for (uint16_t j = 0; j < i; j++) {
-            if (cfg->nodos[j].puerto == cfg->nodos[i].puerto) {
+            if (cfg->nodos[j].puerto == cfg->nodos[i].puerto &&
+                cfg->nodos[j].ipv4_host == cfg->nodos[i].ipv4_host) {
                 fallo(0, "puerto de nodo repetido");
                 return -1;
             }
@@ -221,6 +222,86 @@ static int leer_nodo(dsm_config_t *cfg, int *presente, char *valor, int linea)
     return 0;
 }
 
+struct equipo_pendiente {
+    uint32_t ip;
+    uint16_t cantidad;
+    uint16_t puerto;
+    int cantidad_fija;
+    int puerto_fijo;
+};
+
+/* Sin cupos explícitos, se reparten los puestos entre los equipos al cargar.
+ * Solo los endpoints resultantes participan en el descubrimiento. */
+static int leer_equipo(dsm_config_t *cfg, int *presente, struct equipo_pendiente *pendientes,
+                       int *npend, char *valor, int linea)
+{
+    const char separadores[] = " \t\r\n";
+    char *resto = NULL;
+    const char *ip = strtok_r(valor, separadores, &resto);
+    const char *cantidad_texto = strtok_r(NULL, separadores, &resto);
+    const char *puerto_texto = strtok_r(NULL, separadores, &resto);
+    if (ip == NULL || strtok_r(NULL, separadores, &resto) != NULL) {
+        fallo(linea, "equipo mal formado");
+        return -1;
+    }
+    uint16_t cantidad = 0;
+    uint16_t puerto = cfg->puerto_rango_inicio;
+    int cantidad_fija = cantidad_texto != NULL;
+    if (cantidad_fija && (asignar_u16(cantidad_texto, &cantidad) != 0 || cantidad == 0)) {
+        fallo(linea, "cantidad de puestos invalida");
+        return -1;
+    }
+    if (puerto_texto != NULL && asignar_u16(puerto_texto, &puerto) != 0) {
+        fallo(linea, "puerto inicial invalido");
+        return -1;
+    }
+    if (!cantidad_fija) {
+        if (*npend >= DSM_CONFIG_MAX_NODOS) {
+            fallo(linea, "demasiados equipos");
+            return -1;
+        }
+        uint8_t octetos_ip[4];
+        if (inet_pton(AF_INET, ip, octetos_ip) != 1) {
+            fallo(linea, "IPv4 invalida");
+            return -1;
+        }
+        struct equipo_pendiente *pend = &pendientes[*npend];
+        pend->ip = ((uint32_t)octetos_ip[0] << 24) | ((uint32_t)octetos_ip[1] << 16) |
+                   ((uint32_t)octetos_ip[2] << 8) | (uint32_t)octetos_ip[3];
+        pend->cantidad = 0;
+        pend->puerto = puerto;
+        pend->cantidad_fija = 0;
+        pend->puerto_fijo = puerto_texto != NULL;
+        *npend += 1;
+        (void)cfg;
+        (void)presente;
+        return 0;
+    }
+    uint8_t octetos[4];
+    if (inet_pton(AF_INET, ip, octetos) != 1) {
+        fallo(linea, "IPv4 invalida");
+        return -1;
+    }
+    uint32_t ipv4 = ((uint32_t)octetos[0] << 24) | ((uint32_t)octetos[1] << 16) |
+                    ((uint32_t)octetos[2] << 8) | (uint32_t)octetos[3];
+    if ((uint32_t)cfg->cantidad_nodos + cantidad > DSM_CONFIG_MAX_NODOS ||
+        (uint32_t)puerto + cantidad - 1u > UINT16_MAX) {
+        fallo(linea, "equipo fuera de rango");
+        return -1;
+    }
+    for (uint16_t i = 0; i < cantidad; i++) {
+        uint16_t id = cfg->cantidad_nodos;
+        cfg->nodos[id].id = id;
+        cfg->nodos[id].puerto = (uint16_t)(puerto + i);
+        cfg->nodos[id].ipv4_host = ipv4;
+        cfg->nodos[id].memoria = 0;
+        snprintf(cfg->nodos[id].nombre, sizeof cfg->nodos[id].nombre, "puesto-%u", id);
+        presente[id] = 1;
+        cfg->cantidad_nodos++;
+    }
+    return 0;
+}
+
 int dsm_config_cargar(const char *ruta, dsm_config_t *salida)
 {
     if (ruta == NULL || salida == NULL) {
@@ -230,8 +311,11 @@ int dsm_config_cargar(const char *ruta, dsm_config_t *salida)
     predeterminados(&cfg);
     int visto[V_COUNT];
     int presente[DSM_CONFIG_MAX_NODOS];
+    struct equipo_pendiente pendientes[DSM_CONFIG_MAX_NODOS];
+    int npend = 0;
     memset(visto, 0, sizeof visto);
     memset(presente, 0, sizeof presente);
+    memset(pendientes, 0, sizeof pendientes);
 
     FILE *archivo = fopen(ruta, "r");
     if (archivo == NULL) {
@@ -286,6 +370,12 @@ int dsm_config_cargar(const char *ruta, dsm_config_t *salida)
                 return -1;
             }
             continue;
+        } else if (strcmp(clave, "equipo") == 0) {
+            if (leer_equipo(&cfg, presente, pendientes, &npend, valor, numero) != 0) {
+                fclose(archivo);
+                return -1;
+            }
+            continue;
         } else {
             fallo(numero, "clave desconocida");
             fclose(archivo);
@@ -324,6 +414,37 @@ int dsm_config_cargar(const char *ruta, dsm_config_t *salida)
         }
     }
     fclose(archivo);
+    if (npend > 0 && cfg.cantidad_nodos != 0) {
+        fallo(0, "equipo sin cantidad no se mezcla con nodos explicitos");
+        return -1;
+    }
+    if (npend > 0 && cfg.cantidad_nodos == 0) {
+        uint16_t rango = (uint16_t)(cfg.puerto_rango_fin - cfg.puerto_rango_inicio + 1u);
+        uint16_t cupo = cfg.max_nodos < DSM_CONFIG_MAX_NODOS ? cfg.max_nodos : DSM_CONFIG_MAX_NODOS;
+        if (cupo > rango) {
+            cupo = rango;
+        }
+        uint16_t por = (uint16_t)(cupo / npend);
+        uint16_t resto = (uint16_t)(cupo % npend);
+        if (por == 0) {
+            fallo(0, "no alcanzan los puestos del rango para los equipos");
+            return -1;
+        }
+        for (int e = 0; e < npend; e++) {
+            uint16_t cantidad = (uint16_t)(por + (e < resto));
+            uint16_t puerto = pendientes[e].puerto_fijo ? pendientes[e].puerto : cfg.puerto_rango_inicio;
+            for (uint16_t i = 0; i < cantidad; i++) {
+                uint16_t id = cfg.cantidad_nodos;
+                cfg.nodos[id].id = id;
+                cfg.nodos[id].puerto = (uint16_t)(puerto + i);
+                cfg.nodos[id].ipv4_host = pendientes[e].ip;
+                cfg.nodos[id].memoria = 0;
+                snprintf(cfg.nodos[id].nombre, sizeof cfg.nodos[id].nombre, "puesto-%u", id);
+                presente[id] = 1;
+                cfg.cantidad_nodos++;
+            }
+        }
+    }
     if (validar(&cfg, presente) != 0) {
         return -1;
     }

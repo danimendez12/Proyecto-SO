@@ -1,3 +1,4 @@
+#include "aviso.h"
 #include "coherence.h"
 
 #include "network.h"
@@ -55,6 +56,7 @@ struct dsm_coherencia {
     pthread_t capacidad_hilo;
     int capacidad_activa;
     uint64_t token;
+    dsm_avisos_t *avisos;
     int cerrando;
 };
 
@@ -152,11 +154,10 @@ static int enviar(void *ctx, uint16_t destino, const uint8_t *buf, size_t n)
  * mismo enlace la siguiente invalidacion. El paginador solo espera el resultado.
  */
 static int aplicar_respuesta(dsm_coherencia_t *c, struct pendiente *p,
-                             const uint8_t *buf, size_t n)
+                             const uint8_t *buf, size_t n, dsm_page_data_t *datos)
 {
     dsm_cabecera_t cab;
-    dsm_page_data_t datos;
-    if (dsm_page_data_decodificar(buf, n, &cab, &datos) != 0) {
+    if (dsm_page_data_decodificar(buf, n, &cab, datos) != 0) {
         return fallo(EPROTO);
     }
     if (cab.estado != DSM_ESTADO_OK) {
@@ -164,29 +165,26 @@ static int aplicar_respuesta(dsm_coherencia_t *c, struct pendiente *p,
     }
     int escritura = p->acceso == DSM_FALLO_ESCRITURA;
     uint64_t bit = UINT64_C(1) << c->nodo;
-    if (datos.gpn != p->pagina.gpn || datos.reserva_id != p->pagina.reserva ||
-        datos.orden != p->pagina.orden || datos.hogar != p->pagina.hogar ||
-        datos.proc_id != p->proceso || datos.version < p->pagina.version ||
-        (escritura && datos.version <= p->pagina.version) ||
-        datos.msi != (escritura ? DSM_MSI_M : DSM_MSI_S) ||
-        datos.poseedor != (escritura ? c->nodo : DSM_POSEEDOR_NINGUNO) ||
-        !(datos.mascara_copias & bit) ||
-        (escritura && datos.mascara_copias != bit) ||
-        (datos.page_nbytes != 0 && datos.page_nbytes != c->cfg->page_size) ||
-        (!escritura && datos.page_nbytes != c->cfg->page_size) ||
-        (p->pagina.msi == DSM_MSI_I && datos.page_nbytes != c->cfg->page_size)) {
+    if (datos->gpn != p->pagina.gpn || datos->reserva_id != p->pagina.reserva ||
+        datos->orden != p->pagina.orden || datos->hogar != p->pagina.hogar ||
+        datos->proc_id != p->proceso || datos->version < p->pagina.version ||
+        (escritura && datos->version <= p->pagina.version) ||
+        datos->msi != (escritura ? DSM_MSI_M : DSM_MSI_S) ||
+        datos->poseedor != (escritura ? c->nodo : DSM_POSEEDOR_NINGUNO) ||
+        !(datos->mascara_copias & bit) ||
+        (escritura && datos->mascara_copias != bit) ||
+        (datos->page_nbytes != 0 && datos->page_nbytes != c->cfg->page_size) ||
+        (!escritura && datos->page_nbytes != c->cfg->page_size) ||
+        (p->pagina.msi == DSM_MSI_I && datos->page_nbytes != c->cfg->page_size)) {
         return fallo(EPROTO);
     }
-    if (datos.hogar != c->nodo && dsm_directorio_aplicar_pagina(c->directorio, &datos) != 0) {
+    if (datos->hogar != c->nodo && dsm_directorio_aplicar_pagina(c->directorio, datos) != 0) {
         return -1;
     }
-    printf("nodo %u PAGE_DATA recibido hogar %u reserva %" PRIu32 " gpn %" PRIu64
-           " bytes %" PRIu32 " trama %zu corr %" PRIu32 "\n",
-           c->nodo, datos.hogar, datos.reserva_id, datos.gpn,
-           datos.page_nbytes, n, cab.id_corr);
-    printf("nodo %u reserva %" PRIu32 " gpn %" PRIu64 " MSI %s -> %s version %" PRIu32 "\n",
-           c->nodo, datos.reserva_id, datos.gpn, p->pagina.msi == DSM_MSI_I ? "I" : "S",
-           escritura ? "M" : "S", datos.version);
+    if (datos->hogar != c->nodo && datos->page_nbytes != 0) {
+        dsm_directorio_contar(c->directorio, DSM_CONTA_PAG_REC, 1);
+        dsm_directorio_contar(c->directorio, DSM_CONTA_BYTES_REC, datos->page_nbytes);
+    }
     return 0;
 }
 
@@ -203,13 +201,15 @@ static int recibir_respuesta(dsm_coherencia_t *c, uint16_t par,
         /* Una concesion abandonada no puede convertirse en permiso local. */
         return cab->tipo == DSM_TIPO_PAGE_DATA ? fallo(EPROTO) : 0;
     }
+    dsm_page_data_t datos;
+    uint8_t msi_previa = p->pagina.msi;
     int error = 0;
     if (cab->tipo != p->tipo || n > p->capacidad) {
         error = EPROTO;
     } else if (!vigente(&p->plazo)) {
         error = ETIMEDOUT;
     } else if (cab->tipo == DSM_TIPO_PAGE_DATA &&
-               aplicar_respuesta(c, p, buf, n) != 0) {
+               aplicar_respuesta(c, p, buf, n, &datos) != 0) {
         error = errno;
     }
     if (error == 0 && p->respuesta != NULL) {
@@ -220,6 +220,15 @@ static int recibir_respuesta(dsm_coherencia_t *c, uint16_t par,
     p->lista = 1;
     pthread_cond_broadcast(&c->respuesta);
     pthread_mutex_unlock(&c->mutex);
+    if (cab->tipo == DSM_TIPO_PAGE_DATA && error == 0) {
+        printf("nodo %u PAGE_DATA recibido hogar %u reserva %" PRIu32 " gpn %" PRIu64
+               " bytes %" PRIu32 " trama %zu corr %" PRIu32 "\n",
+               c->nodo, datos.hogar, datos.reserva_id, datos.gpn,
+               datos.page_nbytes, n, cab->id_corr);
+        printf("nodo %u reserva %" PRIu32 " gpn %" PRIu64 " MSI %s -> %s version %" PRIu32 "\n",
+               c->nodo, datos.reserva_id, datos.gpn, msi_previa == DSM_MSI_I ? "I" : "S",
+               datos.msi == DSM_MSI_M ? "M" : "S", datos.version);
+    }
     if (cab->tipo == DSM_TIPO_PAGE_DATA &&
         ((cab->estado == DSM_ESTADO_OK && error != 0) || error == EPROTO)) {
         return fallo(error);
@@ -244,6 +253,7 @@ static void estado_par(void *ctx, uint16_t par, uint8_t estado)
     } else if (estado == DSM_NODO_EN_LINEA) {
         dsm_directorio_par_linea(c->directorio, par);
     }
+    dsm_aviso_estado(c, par, estado);
 }
 
 static uint16_t estado_capacidad_error(int error)
@@ -366,6 +376,25 @@ static int encolar_capacidad(dsm_coherencia_t *c, uint16_t par, const uint8_t *b
     return 0;
 }
 
+static int enviar_proto_error(dsm_coherencia_t *c, uint16_t par, const dsm_cabecera_t *causa)
+{
+    dsm_cabecera_t cab = cabecera(c, DSM_TIPO_PROTO_ERROR, par);
+    dsm_proto_error_t msg;
+    memset(&msg, 0, sizeof msg);
+    msg.codigo = DSM_ESTADO_TIPO;
+    msg.id_causante = causa->id_msg;
+    snprintf(msg.texto, sizeof msg.texto, "tipo desconocido");
+    uint8_t buf[DSM_PROTO_ERROR_BYTES];
+    size_t n = 0;
+    if (dsm_proto_error_codificar(buf, sizeof buf, &cab, &msg, &n) != 0) {
+        return 0;
+    }
+    fprintf(stderr, "nodo %u PROTO_ERROR par %u tipo %u id %" PRIu32 "\n",
+            c->nodo, par, causa->tipo, causa->id_msg);
+    (void)enviar(c, par, buf, n);
+    return 0;
+}
+
 static int despachar(void *ctx, uint16_t par, const dsm_cabecera_t *cab,
                      const uint8_t *buf, size_t n)
 {
@@ -373,11 +402,32 @@ static int despachar(void *ctx, uint16_t par, const dsm_cabecera_t *cab,
     if (par >= c->cfg->cantidad_nodos || cab->origen != par || cab->destino != c->nodo) {
         return fallo(EPROTO);
     }
-    if (cab->banderas == DSM_FLAG_RESPUESTA && cab->id_corr != 0) {
+    if ((cab->banderas == DSM_FLAG_RESPUESTA ||
+         (cab->tipo == DSM_TIPO_STATS_REPLY &&
+          cab->banderas == (DSM_FLAG_RESPUESTA | DSM_FLAG_STATS_RANGO))) && cab->id_corr != 0) {
         if (dsm_directorio_completar(c->directorio, par, buf, n) == 0) {
             return 0;
         }
         return recibir_respuesta(c, par, cab, buf, n);
+    }
+    if (cab->tipo == DSM_TIPO_PROTO_ERROR) {
+        dsm_cabecera_t copia;
+        dsm_proto_error_t err;
+        if (dsm_proto_error_decodificar(buf, n, &copia, &err) == 0) {
+            pthread_mutex_lock(&c->mutex);
+            for (struct pendiente *p = c->pendientes; p != NULL; p = p->siguiente) {
+                if (p->par == par && p->id == err.id_causante && !p->lista) {
+                    p->error = EPROTO;
+                    p->lista = 1;
+                    pthread_cond_broadcast(&c->respuesta);
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&c->mutex);
+            fprintf(stderr, "nodo %u PROTO_ERROR recibido par %u codigo %u id %" PRIu32 " %s\n",
+                    c->nodo, par, err.codigo, err.id_causante, err.texto);
+        }
+        return 0;
     }
     if (cab->banderas != 0 || cab->id_corr != 0 || cab->estado != DSM_ESTADO_OK) {
         return fallo(EPROTO);
@@ -385,12 +435,16 @@ static int despachar(void *ctx, uint16_t par, const dsm_cabecera_t *cab,
     if (cab->tipo >= DSM_TIPO_CAP_PREPARE && cab->tipo <= DSM_TIPO_CAP_RELEASE_ACK) {
         return encolar_capacidad(c, par, buf, n);
     }
+    if (cab->tipo == DSM_TIPO_ANUNCIO) {
+        return dsm_aviso_recibir(c, buf, n) == 0 ? 0 : fallo(EPROTO);
+    }
     if (cab->tipo == DSM_TIPO_PAGE_REQUEST || cab->tipo == DSM_TIPO_INVALIDATE ||
         cab->tipo == DSM_TIPO_PAGE_DOWNGRADE || cab->tipo == DSM_TIPO_REGION_CLOSE ||
-        cab->tipo == DSM_TIPO_REGION_LOOKUP || cab->tipo == DSM_TIPO_REGION_COPY_CLOSE) {
+        cab->tipo == DSM_TIPO_REGION_LOOKUP || cab->tipo == DSM_TIPO_REGION_COPY_CLOSE ||
+        cab->tipo == DSM_TIPO_STATS_REQUEST) {
         return dsm_directorio_ofrecer(c->directorio, par, buf, n);
     }
-    return fallo(EPROTO);
+    return enviar_proto_error(c, par, cab);
 }
 
 static int intercambiar(dsm_coherencia_t *c, uint16_t par, const uint8_t *buf, size_t n,
@@ -417,6 +471,7 @@ static int intercambiar(dsm_coherencia_t *c, uint16_t par, const uint8_t *buf, s
         printf("nodo %u PAGE_REQUEST enviado hogar %u bytes %zu id %" PRIu32 "\n",
                c->nodo, par, n, peticion->id);
     } else if (peticion->tipo == DSM_TIPO_INVALIDATE_ACK) {
+        dsm_directorio_contar(c->directorio, DSM_CONTA_INV_ENV, 1);
         printf("nodo %u INVALIDATE enviado par %u gpn %" PRIu64 " id %" PRIu32 "\n",
                c->nodo, par, peticion->pagina.gpn, peticion->id);
     }
@@ -763,6 +818,10 @@ static int resolver_sin_espera_local(const dsm_pager_peticion_t *peticion, void 
         (pagina.msi == DSM_MSI_S && peticion->acceso == DSM_FALLO_LECTURA)) {
         return 0;
     }
+    dsm_directorio_contar(c->directorio,
+                          peticion->acceso == DSM_FALLO_ESCRITURA ? DSM_CONTA_ESCRITURA
+                                                                  : DSM_CONTA_LECTURA,
+                          1);
     /* REGION_LOOKUP solo establece que el creador está accesible.
      * El enlace con el hogar de esta página puede seguir en el alta. */
     if (pagina.hogar != c->nodo &&
@@ -862,9 +921,10 @@ int dsm_coherencia_resolver(const dsm_pager_peticion_t *peticion, void *contexto
     return resolver_peticion(peticion, contexto);
 }
 
-int dsm_coherencia_copiar_controlado(dsm_coherencia_t *c, uint32_t reserva,
-                                     uint64_t gpn, size_t offset, void *scratch, size_t bytes,
-                                     int escritura, const struct timespec *plazo)
+static int copiar_controlado(dsm_coherencia_t *c, uint32_t reserva,
+                              uint64_t gpn, size_t offset, void *scratch, size_t bytes,
+                              int escritura, void *previo, uint32_t *version,
+                              const struct timespec *plazo)
 {
     if (c == NULL || plazo == NULL || scratch == NULL || (escritura != 0 && escritura != 1)) {
         return fallo(EINVAL);
@@ -876,8 +936,12 @@ int dsm_coherencia_copiar_controlado(dsm_coherencia_t *c, uint32_t reserva,
         .plazo = *plazo,
     };
     for (;;) {
-        if (dsm_directorio_copiar_controlado(c->directorio, reserva, gpn, offset,
-                                             scratch, bytes, escritura) == 0) {
+        int rc = previo == NULL ?
+            dsm_directorio_copiar_controlado(c->directorio, reserva, gpn, offset,
+                                              scratch, bytes, escritura) :
+            dsm_directorio_escribir_respaldo(c->directorio, reserva, gpn, offset,
+                                              scratch, previo, bytes, version);
+        if (rc == 0) {
             return 0;
         }
         if (errno != EAGAIN) {
@@ -890,6 +954,124 @@ int dsm_coherencia_copiar_controlado(dsm_coherencia_t *c, uint32_t reserva,
             return -1;
         }
     }
+}
+
+int dsm_coherencia_copiar_controlado(dsm_coherencia_t *c, uint32_t reserva,
+                                     uint64_t gpn, size_t offset, void *scratch, size_t bytes,
+                                     int escritura, const struct timespec *plazo)
+{
+    return copiar_controlado(c, reserva, gpn, offset, scratch, bytes, escritura, NULL, NULL, plazo);
+}
+
+int dsm_coherencia_escribir_respaldo(dsm_coherencia_t *c, uint32_t reserva,
+                                     uint64_t gpn, size_t offset, void *scratch, void *previo,
+                                     size_t bytes, uint32_t *version, const struct timespec *plazo)
+{
+    if (previo == NULL || version == NULL) {
+        return fallo(EINVAL);
+    }
+    return copiar_controlado(c, reserva, gpn, offset, scratch, bytes, 1, previo, version, plazo);
+}
+
+int dsm_coherencia_stats_rango(dsm_coherencia_t *c, uint16_t par,
+                               const dsm_stats_request_t *pedido, dsm_stats_reply_t *msg)
+{
+    if (c == NULL || msg == NULL || pedido == NULL || par >= c->cfg->cantidad_nodos) {
+        return fallo(EINVAL);
+    }
+    memset(msg, 0, sizeof *msg);
+    dsm_cabecera_t cab = cabecera(c, DSM_TIPO_STATS_REQUEST, par);
+    uint8_t seleccion = pedido->seleccion;
+    int rango = seleccion == DSM_STATS_INVENTARIO || seleccion == DSM_STATS_COPIAS_RANGO;
+    uint8_t envio[DSM_STATS_RANGO_BYTES];
+    size_t n = 0;
+    uint8_t *respuesta = malloc(DSM_LONGITUD_MAX);
+    if (respuesta == NULL) {
+        return -1;
+    }
+    struct pendiente p = {
+        .id = cab.id_msg,
+        .tipo = DSM_TIPO_STATS_REPLY,
+        .respuesta = respuesta,
+        .capacidad = DSM_LONGITUD_MAX,
+    };
+    int rc = -1;
+    if (plazo_nuevo(c, &p.plazo) == 0 &&
+        dsm_stats_request_codificar(envio, sizeof envio, &cab, pedido, &n) == 0 &&
+        intercambiar(c, par, envio, n, &p) == 0) {
+        dsm_cabecera_t recibida;
+        if (p.bytes == DSM_CABECERA_BYTES &&
+            dsm_cabecera_decodificar(respuesta, p.bytes, &recibida) == 0 &&
+            recibida.estado != DSM_ESTADO_OK) {
+            rc = fallo(error_estado(recibida.estado));
+        } else if (dsm_stats_reply_decodificar(respuesta, p.bytes, &recibida, msg) == 0 &&
+            recibida.estado == DSM_ESTADO_OK && recibida.id_corr == cab.id_msg &&
+            msg->emisor == par && msg->n == (seleccion != DSM_STATS_PAGINAS) &&
+            (msg->n == 0 || msg->fichas[0].id == par) &&
+            (msg->n == 0 || msg->fichas[0].libres <= msg->fichas[0].totales) &&
+            msg->rango == rango && (!rango || msg->p <= pedido->limite) &&
+            (seleccion != DSM_STATS_NODOS || msg->p == 0)) {
+            rc = 0;
+            for (uint32_t i = 0; rango && i < msg->p; i++) {
+                const dsm_pagina_consulta_t *p = &msg->paginas[i];
+                uint64_t base = p->hogar < c->cfg->cantidad_nodos ?
+                    dsm_config_base(c->cfg, p->hogar) / c->cfg->page_size : UINT64_MAX;
+                uint64_t fin = p->hogar < c->cfg->cantidad_nodos ?
+                    dsm_config_base(c->cfg, (uint16_t)(p->hogar + 1u)) / c->cfg->page_size : 0;
+                uint64_t admitidos = (UINT64_C(1) << c->cfg->cantidad_nodos) - 1u;
+                if (p->gpn < pedido->desde || p->gpn < base || p->gpn >= fin ||
+                    (i && p->gpn <= msg->paginas[i - 1].gpn) ||
+                    (p->banderas & ~(DSM_PAGINA_ESTADO | DSM_PAGINA_PUBLICA)) ||
+                    (p->banderas & DSM_PAGINA_ESTADO) > DSM_PAGINA_PREPARADA ||
+                    (p->mascara & ~admitidos) ||
+                    (p->poseedor != UINT16_MAX && p->poseedor >= c->cfg->cantidad_nodos) ||
+                    ((p->banderas & DSM_PAGINA_ESTADO) != DSM_PAGINA_LIBRE &&
+                     ((uint16_t)p->reserva == 0 || (p->reserva >> 16) >= c->cfg->cantidad_nodos)) ||
+                    (p->proc && ((uint16_t)p->proc == 0 || (p->proc >> 16) >= c->cfg->cantidad_nodos)) ||
+                    (seleccion == DSM_STATS_INVENTARIO && p->hogar != par) ||
+                    (seleccion == DSM_STATS_COPIAS_RANGO &&
+                     (p->banderas & DSM_PAGINA_ESTADO) != DSM_PAGINA_ASIGNADA)) {
+                    rc = fallo(EPROTO);
+                    break;
+                }
+            }
+            if (rango && msg->p && msg->siguiente <= msg->paginas[msg->p - 1].gpn) {
+                rc = fallo(EPROTO);
+            }
+            if (rango && rc == 0 && seleccion == DSM_STATS_INVENTARIO) {
+                uint64_t base = dsm_config_base(c->cfg, par) / c->cfg->page_size;
+                uint64_t fin = dsm_config_base(c->cfg, (uint16_t)(par + 1u)) / c->cfg->page_size;
+                uint64_t inicio = pedido->desde < base ? base : pedido->desde;
+                if (inicio > fin) inicio = fin;
+                uint64_t esperadas = fin - inicio < pedido->limite ? fin - inicio : pedido->limite;
+                if (msg->p != esperadas || msg->siguiente != inicio + esperadas ||
+                    msg->mas != (inicio + esperadas < fin)) rc = fallo(EPROTO);
+                for (uint32_t i = 0; i < msg->p && rc == 0; i++)
+                    if (msg->paginas[i].gpn != inicio + i) rc = fallo(EPROTO);
+            }
+            if (rango && rc == 0 && seleccion == DSM_STATS_COPIAS_RANGO &&
+                ((msg->mas && msg->p != pedido->limite) ||
+                 (msg->p && msg->siguiente != msg->paginas[msg->p - 1].gpn + 1u) ||
+                 (!msg->p && (msg->mas || msg->siguiente != pedido->desde)))) rc = fallo(EPROTO);
+            if (rc != 0) {
+                free(msg->paginas);
+                memset(msg, 0, sizeof *msg);
+            }
+        } else {
+            free(msg->paginas);
+            memset(msg, 0, sizeof *msg);
+            rc = fallo(EPROTO);
+        }
+    }
+    free(respuesta);
+    return rc;
+}
+
+int dsm_coherencia_stats(dsm_coherencia_t *c, uint16_t par, uint8_t seleccion,
+                         dsm_stats_reply_t *msg)
+{
+    dsm_stats_request_t pedido = {.seleccion = seleccion};
+    return dsm_coherencia_stats_rango(c, par, &pedido, msg);
 }
 
 static int token_sesion(uint64_t *token)
@@ -960,11 +1142,15 @@ int dsm_coherencia_iniciar(dsm_coherencia_t **salida, const dsm_config_t *cfg,
         free(c);
         return fallo(error);
     }
+    if (dsm_avisos_crear(&c->avisos, c, nodo, cfg->cantidad_nodos, c->token) != 0) {
+        error = errno;
+        goto fallo_cond;
+    }
     if (dsm_directorio_activar(directorio, enviar, nuevo_id, c) != 0) {
         error = errno;
         goto fallo_cond;
     }
-    if (dsm_red_iniciar(&c->red, cfg, nodo, despachar, c) != 0) {
+    if (dsm_red_iniciar_sesion(&c->red, cfg, nodo, despachar, c, c->token) != 0) {
         error = errno;
         dsm_directorio_desactivar(directorio);
         goto fallo_cond;
@@ -977,10 +1163,12 @@ int dsm_coherencia_iniciar(dsm_coherencia_t **salida, const dsm_config_t *cfg,
         goto fallo_cond;
     }
     c->capacidad_activa = 1;
+    dsm_avisos_activar(c->avisos);
     *salida = c;
     return 0;
 
 fallo_cond:
+    dsm_avisos_destruir(c->avisos);
     liberar_solicitudes_capacidad(c);
     pthread_cond_destroy(&c->respuesta);
     pthread_mutex_destroy(&c->mutex);
@@ -1004,10 +1192,74 @@ void dsm_coherencia_cerrar(dsm_coherencia_t *c)
     if (c->capacidad_activa) {
         pthread_join(c->capacidad_hilo, NULL);
     }
+    dsm_avisos_parar(c->avisos);
     dsm_directorio_desactivar(c->directorio);
     dsm_red_cerrar(c->red);
+    dsm_avisos_destruir(c->avisos);
     liberar_solicitudes_capacidad(c);
     pthread_cond_destroy(&c->respuesta);
     pthread_mutex_destroy(&c->mutex);
     free(c);
+}
+
+uint16_t dsm_coherencia_nodo(const dsm_coherencia_t *coherencia)
+{
+    return coherencia == NULL ? 0 : coherencia->nodo;
+}
+
+int dsm_coherencia_enviar(dsm_coherencia_t *coherencia, uint16_t destino,
+                          const uint8_t *buf, size_t n)
+{
+    if (coherencia == NULL || buf == NULL || destino == coherencia->nodo) {
+        return fallo(EINVAL);
+    }
+    return dsm_red_enviar(coherencia->red, destino, buf, n);
+}
+
+int dsm_coherencia_destinos(dsm_coherencia_t *coherencia, uint16_t *ids, uint16_t cap,
+                            uint16_t *cantidad)
+{
+    if (coherencia == NULL) {
+        return fallo(EINVAL);
+    }
+    return dsm_red_destinos(coherencia->red, ids, cap, cantidad);
+}
+
+struct dsm_avisos *dsm_coherencia_avisos(dsm_coherencia_t *c)
+{
+    return c == NULL ? NULL : c->avisos;
+}
+
+int dsm_coherencia_sesion(dsm_coherencia_t *c, uint16_t autor, uint64_t *sesion)
+{
+    if (c == NULL || sesion == NULL || autor >= c->cfg->cantidad_nodos) {
+        return fallo(EINVAL);
+    }
+    if (autor == c->nodo) {
+        *sesion = c->token;
+        return 0;
+    }
+    return dsm_red_sesion_par(c->red, autor, sesion);
+}
+
+uint32_t dsm_coherencia_nuevo_id(dsm_coherencia_t *c)
+{
+    return c == NULL ? 0 : dsm_red_id(c->red);
+}
+
+int dsm_coherencia_enlace(dsm_coherencia_t *c, uint16_t par,
+                           uint64_t *sesion, uint64_t *epoca)
+{
+    return c == NULL ? fallo(EINVAL) : dsm_red_enlace_par(c->red, par, sesion, epoca);
+}
+
+int dsm_coherencia_enviar_enlace(dsm_coherencia_t *c, uint16_t par, uint64_t epoca,
+                                  const uint8_t *buf, size_t n)
+{
+    return c == NULL ? fallo(EINVAL) : dsm_red_enviar_enlace(c->red, par, epoca, buf, n);
+}
+
+int dsm_coherencia_sondear(dsm_coherencia_t *c, uint32_t plazo_ms)
+{
+    return c == NULL ? fallo(EINVAL) : dsm_red_sondear(c->red, plazo_ms);
 }

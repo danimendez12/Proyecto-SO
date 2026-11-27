@@ -10,16 +10,19 @@ enum {
     DSM_MAGIC = 0x44534D31,
     DSM_PROTO_VERSION = 1,
     DSM_FLAG_RESPUESTA = 0x0001,
+    DSM_FLAG_STATS_RANGO = 0x0002,
     DSM_CABECERA_BYTES = 32,
     DSM_LONGITUD_MAX = 1048576,
     DSM_PAGE_REQUEST_BYTES = 48,
     DSM_PAGE_REQUEST_MAP_BYTES = 56,
     DSM_PAGE_DATA_BASE = 80,
     DSM_NOMBRE_MAX = 64,
-    DSM_MAX_FICHAS = 16,
+    DSM_MAX_FICHAS = 60,
     DSM_TRAMOS_POR_HOGAR = 16,
-    DSM_MAX_TRAMOS = DSM_TRAMOS_POR_HOGAR * DSM_MAX_FICHAS,
-    DSM_REGION_INFO_MAX = 60 + 16 * DSM_MAX_TRAMOS,
+    /* Hasta 60 hogares; la fragmentacion sigue limitada a 256 tramos totales. */
+    DSM_MAX_TRAMOS = 256,
+    DSM_REGION_PUBLICA = 0x50554231, /* PUB1: procedencia publica explicita */
+    DSM_REGION_INFO_MAX = 64 + 16 * DSM_MAX_TRAMOS,
     DSM_CAPACIDAD_BASE_BYTES = 56,
     DSM_CAPACIDAD_MAX = DSM_CAPACIDAD_BASE_BYTES + DSM_REGION_INFO_MAX - DSM_CABECERA_BYTES
 };
@@ -49,8 +52,42 @@ enum {
     DSM_TIPO_CAP_CANCEL_ACK = 0x45,
     DSM_TIPO_CAP_RELEASE = 0x46,
     DSM_TIPO_CAP_RELEASE_ACK = 0x47,
+    DSM_TIPO_STATS_REQUEST = 0x30,
+    DSM_TIPO_STATS_REPLY = 0x31,
     DSM_TIPO_REGION_COPY_CLOSE = 0x48,
-    DSM_TIPO_REGION_COPY_CLOSE_ACK = 0x49
+    DSM_TIPO_REGION_COPY_CLOSE_ACK = 0x49,
+    DSM_TIPO_PROTO_ERROR = 0x7F,
+    DSM_TIPO_ANUNCIO = 0x60
+};
+
+enum {
+    DSM_STATS_NODOS = 1,
+    DSM_STATS_PAGINAS = 2,
+    DSM_STATS_AMBOS = 3,
+    DSM_STATS_HOGAR = 4, /* ficha y páginas cuyo directorio es el emisor */
+    DSM_STATS_INVENTARIO = 5,
+    DSM_STATS_COPIAS_RANGO = 6,
+    DSM_STATS_RANGO_BYTES = 48,
+    DSM_STATS_RANGO_PREF = 120,
+    DSM_STATS_RANGO_MAX = 1024,
+    DSM_PAGINA_ASIGNADA = 0,
+    DSM_PAGINA_LIBRE = 1,
+    DSM_PAGINA_PREPARADA = 2,
+    DSM_PAGINA_ESTADO = 3,
+    DSM_PAGINA_PUBLICA = 4,
+    DSM_STATS_CONTADORES = 8,
+    DSM_STATS_PREF = 104,
+    DSM_FICHA_PAGINA = 40,
+    DSM_PROTO_ERROR_BYTES = 104,
+    DSM_PROTO_TEXTO = 64,
+    DSM_ANUNCIO_CLAVE = 32,
+    DSM_ANUNCIO_DATOS = 128,
+    DSM_ANUNCIO_BASE = 68
+};
+
+enum {
+    DSM_ANUNCIO_VERSIONADO_BASE = 88,
+    DSM_ANUNCIO_RETIRADO = 1
 };
 
 enum {
@@ -117,7 +154,19 @@ typedef struct dsm_hello {
     uint64_t memoria;
     uint64_t base;
     char nombre[DSM_NOMBRE_MAX];
+    /* Cero conserva HELLO de 128 bytes. La extension agrega 8 bytes. */
+    uint64_t sesion;
 } dsm_hello_t;
+
+typedef struct dsm_anuncio {
+    uint16_t autor;
+    uint16_t banderas;
+    uint64_t sesion;
+    uint64_t generacion;
+    char clave[DSM_ANUNCIO_CLAVE];
+    size_t largo;
+    const uint8_t *datos;
+} dsm_anuncio_t;
 
 typedef struct dsm_ficha {
     uint16_t id;
@@ -201,6 +250,46 @@ typedef struct dsm_invalidate_ack {
     uint16_t resultado;
 } dsm_invalidate_ack_t;
 
+typedef struct dsm_stats_request {
+    uint8_t seleccion;
+    uint32_t limite;
+    uint64_t desde;
+} dsm_stats_request_t;
+
+typedef struct dsm_pagina_consulta {
+    uint64_t gpn;
+    uint64_t mascara;
+    uint32_t proc;
+    uint32_t reserva;
+    uint32_t orden;
+    uint16_t hogar;
+    uint16_t poseedor;
+    uint8_t msi;
+    uint8_t permiso;
+    uint8_t banderas;
+    uint8_t copias;
+    uint32_t version;
+} dsm_pagina_consulta_t;
+
+typedef struct dsm_stats_reply {
+    uint16_t emisor;
+    uint16_t n;
+    uint32_t p;
+    uint64_t contadores[DSM_STATS_CONTADORES];
+    dsm_ficha_t fichas[DSM_MAX_FICHAS];
+    /* Al decodificar, paginas es memoria propia que el llamador libera. */
+    dsm_pagina_consulta_t *paginas;
+    uint8_t rango;
+    uint8_t mas;
+    uint64_t siguiente;
+} dsm_stats_reply_t;
+
+typedef struct dsm_proto_error {
+    uint16_t codigo;
+    uint32_t id_causante;
+    char texto[DSM_PROTO_TEXTO];
+} dsm_proto_error_t;
+
 typedef struct dsm_region_lookup {
     uint32_t reserva_id;
     uint32_t primer_tramo;
@@ -225,6 +314,8 @@ typedef struct dsm_region_info {
     uint32_t cantidad_tramos;
     uint32_t total_paginas;
     dsm_tramo_t tramos[DSM_MAX_TRAMOS];
+    /* Cero es procedencia historica: nunca implica proceso publico. */
+    uint8_t publica;
 } dsm_region_info_t;
 
 /* El token identifica la sesion del creador. Un ID no se puede recuperar ni
@@ -301,5 +392,28 @@ int dsm_region_info_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
                               const dsm_region_info_t *msg, size_t *out);
 int dsm_region_info_decodificar(const uint8_t *src, size_t n,
                                 dsm_cabecera_t *cab, dsm_region_info_t *msg);
+
+int dsm_stats_request_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                const dsm_stats_request_t *msg, size_t *out);
+int dsm_stats_request_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                  dsm_stats_request_t *msg);
+int dsm_stats_reply_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                              const dsm_stats_reply_t *msg, size_t *out);
+/* paginas queda en memoria propia. Liberarla si el retorno es 0. */
+int dsm_stats_reply_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                dsm_stats_reply_t *msg);
+int dsm_proto_error_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                              const dsm_proto_error_t *msg, size_t *out);
+int dsm_proto_error_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab,
+                                dsm_proto_error_t *msg);
+int dsm_anuncio_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab, uint16_t autor,
+                          const char *clave, const void *datos, size_t n, size_t *out);
+int dsm_anuncio_decodificar(const uint8_t *src, size_t n, dsm_cabecera_t *cab, uint16_t *autor,
+                            char clave[DSM_ANUNCIO_CLAVE], uint8_t *datos, size_t cap, size_t *largo);
+int dsm_anuncio_versionado_codificar(uint8_t *dst, size_t cap, dsm_cabecera_t *cab,
+                                     const dsm_anuncio_t *msg, size_t *out);
+/* msg->datos es una vista prestada del buffer recibido. */
+int dsm_anuncio_versionado_decodificar(const uint8_t *src, size_t n,
+                                       dsm_cabecera_t *cab, dsm_anuncio_t *msg);
 
 #endif

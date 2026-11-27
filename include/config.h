@@ -6,11 +6,15 @@
 #include <stdint.h>
 
 enum {
-    DSM_CONFIG_MAX_NODOS = 16,
+    DSM_CONFIG_MAX_NODOS = 60,
     DSM_CONFIG_NOMBRE = 64,
     DSM_CONFIG_PUERTO_MIN = 27200,
     DSM_CONFIG_PUERTO_MAX = 27299
 };
+
+/* Las mascaras MSI, aportantes y avisos usan uint64_t; algunos filtros
+ * construyen (1 << cantidad_nodos)-1 y requieren una cota menor que 64. */
+_Static_assert(DSM_CONFIG_MAX_NODOS < 64, "Las mascaras requieren menos de 64 puestos");
 
 typedef struct dsm_nodo_cfg {
     uint16_t id;

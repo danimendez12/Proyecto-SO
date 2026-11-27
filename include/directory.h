@@ -8,6 +8,7 @@
 #include "protocol.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -44,7 +45,21 @@ typedef struct dsm_pagina_desc {
     void *ubicacion_local;
     uint32_t orden;
     uint8_t perdida;
+    uint32_t proc;
+    uint8_t publica;
 } dsm_pagina_desc_t;
+
+enum {
+    DSM_CONTA_LECTURA = 0,
+    DSM_CONTA_ESCRITURA,
+    DSM_CONTA_INV_ENV,
+    DSM_CONTA_INV_REC,
+    DSM_CONTA_PAG_ENV,
+    DSM_CONTA_PAG_REC,
+    DSM_CONTA_BYTES_ENV,
+    DSM_CONTA_BYTES_REC,
+    DSM_CONTA_N
+};
 
 typedef struct dsm_directorio {
     uint16_t nodo_id;
@@ -81,7 +96,7 @@ typedef struct dsm_directorio {
     dsm_directorio_id_t nuevo_id;
     void *envio_ctx;
     uint32_t retardo_ms;
-    uint32_t fuera;
+    uint64_t fuera;
     int campana_espera;
     uint16_t campana_par;
     uint32_t campana_id;
@@ -92,6 +107,8 @@ typedef struct dsm_directorio {
     uint8_t ack_trama[DSM_CONTROL_BYTES];
     uint8_t *campana_buf;
     size_t campana_cap;
+    dsm_nodo_cfg_t local;
+    _Atomic uint64_t contadores[DSM_CONTA_N];
 } dsm_directorio_t;
 
 /* Un directorio inicializado contiene un mutex y no se copia. */
@@ -164,6 +181,15 @@ int dsm_directorio_describir(dsm_directorio_t *dir, uint64_t gpn, dsm_pagina_des
  */
 int dsm_directorio_copiar_controlado(dsm_directorio_t *dir, uint32_t reserva, uint64_t gpn,
                                      size_t offset, void *scratch, size_t bytes, int escritura);
+/* Captura y escritura atomicas respecto del directorio. Los buffers son del
+ * gestor; restaurar no pide permisos ni cambia version/estado MSI. Ar local
+ * solapada requiere sincronizacion de la aplicacion tambien durante la copia. */
+int dsm_directorio_escribir_respaldo(dsm_directorio_t *dir, uint32_t reserva, uint64_t gpn,
+                                     size_t offset, const void *nuevo, void *previo,
+                                     size_t bytes, uint32_t *version);
+int dsm_directorio_restaurar_respaldo(dsm_directorio_t *dir, uint32_t reserva, uint64_t gpn,
+                                      size_t offset, const void *previo, const void *escrito,
+                                      size_t bytes, uint32_t version);
 /* Copia la version vigente. Si el poseedor es remoto, pide la bajada por la red activa. */
 int dsm_directorio_copiar(dsm_directorio_t *dir, uint64_t gpn, void *imagen, size_t n,
                           dsm_pagina_desc_t *desc);
@@ -180,5 +206,14 @@ void dsm_directorio_par_fuera(dsm_directorio_t *dir, uint16_t par);
 void dsm_directorio_par_linea(dsm_directorio_t *dir, uint16_t par);
 /* Retardo del poseedor antes de reconocer una invalidacion. Cero en produccion. */
 void dsm_directorio_fijar_retardo(dsm_directorio_t *dir, uint32_t ms);
+void dsm_directorio_contar(dsm_directorio_t *dir, int indice, uint64_t n);
+/* Copia las paginas conocidas y los ocho contadores. paginas puede ser NULL. */
+int dsm_directorio_exportar(dsm_directorio_t *dir, uint64_t contadores[DSM_CONTA_N],
+                            dsm_pagina_desc_t *paginas, size_t capacidad, size_t *cantidad,
+                            uint32_t *libres, uint32_t *totales);
+/* Snapshot acotado: inventario del bitmap autoritativo o vistas locales,
+ * ordenado por GPN. paginas se libera por el llamador. Sin RPC bajo mutex. */
+int dsm_directorio_consulta_rango(dsm_directorio_t *dir, const dsm_stats_request_t *pedido,
+                                  dsm_stats_reply_t *salida);
 
 #endif
