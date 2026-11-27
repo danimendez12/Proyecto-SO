@@ -59,6 +59,8 @@ static struct aviso *libre(dsm_avisos_t *s)
     return NULL;
 }
 
+/* Al caer o cambiar el enlace, una consulta ya no debe presentar las claves
+ * de la sesión anterior. Los demás autores conservan sus propias entradas. */
 static void olvidar(dsm_avisos_t *s, uint16_t par)
 {
     uint64_t bit = UINT64_C(1) << par;
@@ -135,6 +137,9 @@ static void *difundir(void *ctx)
             pthread_cond_wait(&s->cambio, &s->mutex);
             continue;
         }
+        /* tomar_envio() copió los datos y eligió la generación bajo el mutex.
+         * Se conserva la época del enlace y se suelta el mutex antes del envío
+         * para que el lector TCP pueda registrar mensajes o cambios de sesión. */
         uint64_t enlace = s->enlaces[par];
         pthread_mutex_unlock(&s->mutex);
         dsm_cabecera_t cab = {
@@ -294,6 +299,9 @@ static int publicar(dsm_coherencia_t *c, uint16_t autor, const char *clave,
     if (n != 0) {
         memcpy(a->datos, datos, n);
     }
+    /* Cada bit delega un envío al trabajador de difusión. Una actualización
+     * de la misma clave reemplaza el valor local. Cuando se incorpora otro
+     * par, conectado() encola para él el último estado del autor. */
     a->pendientes = s->conectados;
     if (banderas == DSM_ANUNCIO_RETIRADO && a->pendientes == 0) {
         memset(a, 0, sizeof *a);
@@ -396,6 +404,9 @@ static int leer(dsm_coherencia_t *c, const char *clave, uint16_t *autor,
         (n != 0 && datos == NULL) || (exacto && *autor >= s->cantidad)) {
         return DSM_ERR_INVAL;
     }
+    /* El tamaño forma parte del criterio de lectura. vigente() verifica el
+     * token que conoce la red para ese autor. Así un reinicio del autor no
+     * hace reaparecer datos de la sesión anterior. */
     struct aviso *mejor = NULL;
     pthread_mutex_lock(&s->mutex);
     for (size_t i = 0; i < AVISOS_MAX; i++) {

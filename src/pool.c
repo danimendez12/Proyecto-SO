@@ -24,7 +24,8 @@ static void preparar_fork(void) { pthread_mutex_lock(&mutex); }
 static void padre_fork(void) { pthread_mutex_unlock(&mutex); }
 static void hijo_fork(void)
 {
-    /* El padre conserva su referencia al socket guardia. */
+    /* Solo se descarta la copia del hijo: el padre conserva el socket guardia.
+     * Estos hooks protegen el pool, no los hilos/mutex de un contexto DSM. */
     if (candado >= 0) {
         close(candado);
         candado = -1;
@@ -87,7 +88,9 @@ static int reclamar_endpoint(uint32_t ip, uint16_t puerto)
         errno = EINVAL;
         return -1;
     }
-    /* Sin CLOEXEC: dsm_unir entrega el reclamo al programa con exec. */
+    /* Sin CLOEXEC, un exec conserva este descriptor, pero no adopta el estado
+     * C del pool en la imagen nueva. El dsm_unir actual ejecuta la consola y
+     * es ella quien reclama su propio puesto después de ese exec. */
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     socklen_t largo = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1u + (size_t)n);
@@ -109,11 +112,15 @@ int dsm_pool_reclamar(const char *ruta, uint16_t *id)
     if (dsm_config_cargar(ruta, &cfg) != 0) {
         return DSM_ERR_CONFIG;
     }
+    /* Instalar una vez los hooks que serializan fork con este mutex local;
+     * es distinto del mutex del API y aquí no se inicializa ningún contexto. */
     pthread_once(&una_vez, iniciar_fork);
     if (error_fork != 0) {
         return DSM_ERR_ESTADO;
     }
     pthread_mutex_lock(&mutex);
+    /* Idempotencia por endpoint: puede devolverse su ID en esta configuración,
+     * pero no se cambia de reclamo mientras el guardia siga retenido. */
     if (candado >= 0) {
         for (uint16_t i = 0; i < cfg.cantidad_nodos; i++) {
             if (cfg.nodos[i].ipv4_host == ip_tomada && cfg.nodos[i].puerto == puerto_tomado) {
@@ -131,6 +138,9 @@ int dsm_pool_reclamar(const char *ruta, uint16_t *id)
         if (!direccion_local(nodo->ipv4_host)) {
             continue;
         }
+        /* El bind UNIX abstracto excluye a otros usuarios cooperantes del pool
+         * para esta IPv4/puerto y namespace. La sonda TCP es temporal; iniciar
+         * deberá obtener después el listener real y todavía puede fallar. */
         int fd = reclamar_endpoint(nodo->ipv4_host, nodo->puerto);
         if (fd < 0) {
             if (errno == EADDRINUSE) continue;
@@ -154,6 +164,9 @@ int dsm_pool_reclamar(const char *ruta, uint16_t *id)
 
 void dsm_pool_liberar(void)
 {
+    /* Retirar únicamente el descriptor que conoce este pool. No se desmontan
+     * vistas ni se cierra TCP: dsm_cerrar() completa esas capas antes de llegar
+     * aquí. Sin guardia es una operación local idempotente, sin semáforos. */
     pthread_mutex_lock(&mutex);
     if (candado >= 0) {
         close(candado);

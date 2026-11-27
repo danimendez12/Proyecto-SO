@@ -35,6 +35,10 @@ struct copia {
     struct copia *siguiente;
 };
 
+/* Estado del puesto visible al usuario mediante un puntero opaco. El directorio
+ * mantiene los GPN y permisos. Las vinculaciones de este contexto permiten pasar
+ * de un ID a la ventana Ar del proceso. trabajadores y consultas cuentan usuarios
+ * que aún necesitan el contexto y que dsm_cerrar() debe respetar. */
 struct dsm_context {
     dsm_config_t cfg;
     dsm_directorio_t directorio;
@@ -87,6 +91,8 @@ static int error_api(int error)
     }
 }
 
+/* Devuelve el enlace de la lista, también al insertar. El mutex del API debe
+ * seguir tomado mientras se usa: este préstamo no retiene por sí solo la vista. */
 static struct vinculacion **posicion(dsm_context_t *ctx, uint32_t id)
 {
     struct vinculacion **pos = &ctx->reservas;
@@ -96,6 +102,8 @@ static struct vinculacion **posicion(dsm_context_t *ctx, uint32_t id)
     return pos;
 }
 
+/* Elimina solo el registro del API; el llamador ya concluyó la retirada de
+ * vistas y aportes, o comprobó que nunca llegaron a existir. */
 static void quitar(struct vinculacion **pos)
 {
     struct vinculacion *v = *pos;
@@ -112,6 +120,8 @@ int dsm_iniciar(const char *ruta_config, dsm_node_id_t nodo, dsm_context_t **sal
     if (dsm_config_cargar(ruta_config, &cfg) != 0 || dsm_config_nodo(&cfg, nodo) == NULL) {
         return DSM_ERR_CONFIG;
     }
+    /* La configuración se lee antes del bloqueo; después se conserva el
+     * mutex del API hasta publicar o descartar el único contexto activo. */
     pthread_mutex_lock(&mutex);
     if (activo != NULL) {
         return salir(DSM_ERR_ESTADO);
@@ -122,16 +132,26 @@ int dsm_iniciar(const char *ruta_config, dsm_node_id_t nodo, dsm_context_t **sal
     }
     ctx->cfg = cfg;
     ctx->nodo = nodo;
+    /* Orden de dependencia: el directorio prepara capacidad y sus mutex;
+     * coherencia referencia ctx->cfg, activa el directorio y crea red/avisos;
+     * el paginador vacío enlaza el resolutor de coherencia. Este último crea
+     * su mutex, semáforo y Pthread e instala SIGSEGV/SIGUSR1 sin registrar
+     * todavía al llamador. Las referencias usan la copia duradera de cfg. */
     if (dsm_directorio_init(&ctx->directorio, &cfg, nodo) != 0 ||
         dsm_coherencia_iniciar(&ctx->coherencia, &ctx->cfg, nodo, &ctx->directorio) != 0 ||
         dsm_pager_iniciar_vacio(&ctx->pager, cfg.page_size, cfg.max_hilos, nodo,
                                 cfg.rpc_timeout_ms, dsm_coherencia_resolver, ctx->coherencia) != 0) {
         int rc = error_api(errno);
+        /* Capturar errno antes de desmontar coherencia y luego directorio.
+         * dsm_pager_iniciar_vacio() limpia internamente su propio fallo.
+         * El reclamo del pool, si existía, sigue siendo del llamador. */
         dsm_coherencia_cerrar(ctx->coherencia);
         dsm_directorio_cerrar(&ctx->directorio);
         free(ctx);
         return salir(rc);
     }
+    /* Solo se entrega propiedad del contexto tras completar las tres capas;
+     * los HELLO de otros puestos aún pueden estar pendientes en la red. */
     activo = ctx;
     *salida = ctx;
     return salir(DSM_OK);
@@ -146,6 +166,8 @@ int dsm_proc_abrir(dsm_context_t *ctx, dsm_proc_id_t *salida)
     if (salida == NULL) {
         return salir(DSM_ERR_INVAL);
     }
+    /* entrar() conserva el mutex del API. Una sola identidad local sirve a
+     * todas las reservas y tareas del contexto; aquí no se crea un PID. */
     if (ctx->proceso != 0) {
         return salir(DSM_ERR_ESTADO);
     }
@@ -156,11 +178,16 @@ int dsm_proc_abrir(dsm_context_t *ctx, dsm_proc_id_t *salida)
 
 static int registrar(dsm_context_t *ctx)
 {
+    /* Con el mutex del API tomado, evitar que un nuevo usuario de Ar entre
+     * durante una retirada que todavía conserva una ventana publicada. */
     for (struct vinculacion *v = ctx->reservas; v != NULL; v = v->siguiente) {
         if (v->retirando && v->base != NULL) {
             return DSM_ERR_OCUPADA;
         }
     }
+    /* El pager toma su mutex y dsm_senales_registrar() el control de señales:
+     * reservan ranura/TLS y bloquean SIGUSR1. El manejador solo publicará la
+     * solicitud y hará sem_post; el Pthread paginador resolverá fuera de él. */
     if (dsm_pager_registrar(ctx->pager) != 0) {
         return errno == ENOSPC ? DSM_ERR_HILOS : DSM_ERR_ESTADO;
     }
@@ -171,6 +198,9 @@ static int registrar(dsm_context_t *ctx)
 
 static int desregistrar(dsm_context_t *ctx)
 {
+    /* El mutex del pager ordena esta retirada con el último pthread_kill.
+     * Señales drena SIGUSR1 y restaura su bit anterior antes de liberar TLS;
+     * las cuentas del API solo cambian cuando esa cadena termina bien. */
     if (!registrado || dsm_pager_desregistrar(ctx->pager) != 0) {
         return DSM_ERR_ESTADO;
     }
@@ -185,16 +215,22 @@ int dsm_hilo_registrar(dsm_context_t *ctx, dsm_proc_id_t proceso)
     if (rc != DSM_OK) {
         return rc;
     }
+    /* La identidad pertenece al contexto; el registro pertenece al Pthread
+     * que llama, no al hilo que hubiera abierto el proceso lógico. */
     return salir(proceso != 0 && proceso == ctx->proceso ? registrar(ctx) : DSM_ERR_INVAL);
 }
 
 int dsm_hilo_desregistrar(dsm_context_t *ctx)
 {
+    /* registrado es TLS: este punto no permite retirar a otro trabajador. */
     int rc = entrar(ctx);
     return rc == DSM_OK ? salir(desregistrar(ctx)) : rc;
 }
 
-/* El manifiesto y el respaldo ya estan validados por el directorio. */
+/* El directorio conserva las vistas Ar/Cr y valida el manifiesto. Asociar
+ * incorpora sus pares reserva/GPN al paginador, obtiene el tamaño lógico y
+ * recién entonces presta Ar al registro del API. Publicar corresponde al
+ * creador, después de que esta asociación termine correctamente. */
 static int asociar(dsm_context_t *ctx, struct vinculacion *v, dsm_vistas_t *vista)
 {
     if (dsm_coherencia_asociar(ctx->coherencia, ctx->pager, v->id, vista, &v->bytes) != 0) {
@@ -204,8 +240,10 @@ static int asociar(dsm_context_t *ctx, struct vinculacion *v, dsm_vistas_t *vist
     return DSM_OK;
 }
 
-/* Una respuesta perdida deja al participante en la lista hasta que confirme
- * la cancelacion. Cada hogar puede devolver capacidad independientemente. */
+/* Cancela una creación provisional bajo el mutex del API. Retira primero su
+ * ventana del paginador, si llegó a asociarse, y confirma CAP_CANCEL por hogar.
+ * Solo limpia un bit al recibir confirmación: una respuesta perdida conserva
+ * el registro y los participantes pendientes para un reintento posterior. */
 static int cancelar(dsm_context_t *ctx, struct vinculacion **pos)
 {
     struct vinculacion *v = *pos;
@@ -233,6 +271,8 @@ static int cancelar(dsm_context_t *ctx, struct vinculacion **pos)
     return resultado;
 }
 
+/* Una nueva reserva aprovecha la lista para completar cancelaciones antiguas.
+ * Los fallos conservan sus registros; no impiden intentar otra creación. */
 static void reintentar_cancelaciones(dsm_context_t *ctx)
 {
     struct vinculacion **pos = &ctx->reservas;
@@ -244,6 +284,10 @@ static void reintentar_cancelaciones(dsm_context_t *ctx)
     }
 }
 
+/* PREPARE reserva capacidad real en un hogar. Solo agrega tramos públicos del
+ * ID esperado, contiguos en orden lógico y contenidos en su intervalo de GPN.
+ * La falta de espacio deja probar otro hogar; cualquier respuesta ambigua
+ * conserva su bit para que cancelar() pueda retirar la preparación. */
 static int preparar_hogar(dsm_context_t *ctx, struct vinculacion *v, dsm_region_info_t *mapa,
                            uint16_t hogar, uint32_t *orden)
 {
@@ -260,7 +304,7 @@ static int preparar_hogar(dsm_context_t *ctx, struct vinculacion *v, dsm_region_
             return DSM_OK;
         }
         /* Conserva el bit ante una respuesta ambigua: cancelar() debe poder
-         * retirar tambien una preparacion cuyo ACK no llego. */
+         * retirar también una preparación cuyo ACK no llegó. */
         return error_api(errno);
     }
     if (parcial.reserva_id != v->id || parcial.publica != 1 || parcial.cantidad_tramos == 0 ||
@@ -279,16 +323,21 @@ static int preparar_hogar(dsm_context_t *ctx, struct vinculacion *v, dsm_region_
     return DSM_OK;
 }
 
+/* Selecciona aportantes sin esperar un plazo individual por cada ausente. Un
+ * hogar ya preparado no se vuelve a consultar con otro ordinal del mismo ID.
+ * Si queda capacidad sin cubrir, distingue hogares no visitados de falta de
+ * espacio entre todos los participantes; el llamador cancela lo acumulado. */
 static int preparar_mapa(dsm_context_t *ctx, struct vinculacion *v, dsm_region_info_t *mapa)
 {
     uint32_t orden = 0;
     uint64_t visitados = UINT64_C(1) << ctx->nodo;
     int rc = preparar_hogar(ctx, v, mapa, ctx->nodo, &orden);
     if (rc != DSM_OK) return rc;
-    /* Primero capacidad local, despues hogares ya conectados. Si no alcanza,
-     * una sola ronda con plazo comun permite entrar a donantes tardios; nunca
+    /* Primero capacidad local, después hogares ya conectados. Si no alcanza,
+     * una sola ronda con plazo común permite entrar a donantes tardíos; nunca
      * se acumula un timeout por cada puesto ausente. PREPARE sigue siendo la
-     * autoridad de capacidad, sin fiarse de estadisticas potencialmente viejas. */
+     * autoridad de capacidad, sin fiarse de estadísticas potencialmente viejas.
+     * El sondeo comparte presupuesto; las RPC de capacidad tienen sus plazos. */
     for (unsigned ronda = 0; ronda < 2 && orden < mapa->total_paginas; ronda++) {
         if (ronda != 0 && dsm_coherencia_sondear(ctx->coherencia, ctx->cfg.rpc_timeout_ms) != 0)
             return error_api(errno);
@@ -316,6 +365,9 @@ static int preparar_mapa(dsm_context_t *ctx, struct vinculacion *v, dsm_region_i
     return DSM_OK;
 }
 
+/* COMMIT confirma el mismo mapa en cada aportante. El creador registra su
+ * ventana en el paginador antes de admitir LOOKUP. Un fallo intermedio puede
+ * dejar hogares confirmados: reservar() conserva la ruta de cancelación. */
 static int confirmar(dsm_context_t *ctx, struct vinculacion *v, const dsm_region_info_t *mapa)
 {
     for (uint16_t hogar = 0; hogar < ctx->cfg.cantidad_nodos; hogar++) {
@@ -336,6 +388,9 @@ static int confirmar(dsm_context_t *ctx, struct vinculacion *v, const dsm_region
     return rc;
 }
 
+/* Mantiene el mutex del API durante preparación, confirmación y publicación.
+ * Los lectores TCP y el servicio del directorio progresan con sus propios
+ * bloqueos. Las salidas solo se publican después de completar las tres etapas. */
 int dsm_reservar(dsm_context_t *ctx, dsm_proc_id_t proceso, size_t bytes,
                  dsm_reserva_id_t *id, void **base)
 {
@@ -359,6 +414,8 @@ int dsm_reservar(dsm_context_t *ctx, dsm_proc_id_t proceso, size_t bytes,
         free(v);
         return salir(rc);
     }
+    /* Listar antes de la primera RPC permite conservar preparaciones cuyo
+     * resultado quede ambiguo, aunque el ID todavía no se entregue al usuario. */
     v->provisional = 1;
     v->retirando = 1;
     v->siguiente = ctx->reservas;
@@ -384,8 +441,11 @@ int dsm_reservar(dsm_context_t *ctx, dsm_proc_id_t proceso, size_t bytes,
     return salir(DSM_OK);
 }
 
-/* Un cierre ambiguo conserva el registro para reintentar con el mismo ID.
- * Ningun trabajador vuelve a usar una vista que se esta retirando. */
+/* Marca el retiro antes de las RPC para impedir nuevas aperturas del registro.
+ * Coherencia revoca copias por hogar y cierra el pin en el creador; después se
+ * retira la ventana del paginador y la vinculación del directorio. Un donante
+ * puede conservar su respaldo de servicio aunque abandone la vista de cliente.
+ * Un error conserva el ID y el avance parcial para reintentar, sin prestar Ar. */
 static int desvincular(dsm_context_t *ctx, struct vinculacion **pos)
 {
     struct vinculacion *v = *pos;
@@ -404,6 +464,9 @@ static int desvincular(dsm_context_t *ctx, struct vinculacion **pos)
     return DSM_OK;
 }
 
+/* Una vinculación sana existente evita otro LOOKUP y otro pin. Una nueva se
+ * lista antes de consultar al creador para poder cerrar también una apertura
+ * sin respuesta. Se conserva el error inicial aunque su limpieza quede pendiente. */
 int dsm_abrir_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, void **base, size_t *bytes)
 {
     int rc = entrar(ctx);
@@ -414,13 +477,15 @@ int dsm_abrir_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, void **base, size
     if (base == NULL || bytes == NULL || (uint16_t)id == 0 || creador >= ctx->cfg.cantidad_nodos) {
         return salir(DSM_ERR_INVAL);
     }
+    /* Reutilizar el registro evita sumar pins por aperturas repetidas; una
+     * retirada pendiente conserva el ID, pero no vuelve a prestar su Ar. */
     struct vinculacion **pos = posicion(ctx, id);
     if (*pos == NULL) {
         if (creador == ctx->nodo) {
             return salir(DSM_ERR_INVAL);
         }
         if (dsm_coherencia_esperar(ctx->coherencia, creador) != 0) {
-            /* No se envio una solicitud a este nodo. */
+            /* No se envió una solicitud a este nodo. */
             return salir(DSM_ERR_NODO);
         }
         struct vinculacion *v = calloc(1, sizeof *v);
@@ -454,6 +519,8 @@ int dsm_abrir_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, void **base, size
     return salir(DSM_OK);
 }
 
+/* Observa la lista bajo el mutex del API. Ocultar base durante preparación o
+ * retiro evita prestar una ventana a medio asociar/desmontar; no crea un pin. */
 int dsm_consultar_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, dsm_reserva_estado_t *salida)
 {
     int rc = entrar(ctx);
@@ -461,6 +528,8 @@ int dsm_consultar_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, dsm_reserva_e
     if (salida == NULL) return salir(DSM_ERR_INVAL);
     struct vinculacion *v = *posicion(ctx, id);
     if (v == NULL) return salir(DSM_ERR_INVAL);
+    /* El estado puede describir recursos pendientes sin una Ar utilizable;
+     * observarlo no añade un trabajador ni retiene la vista al retornar. */
     *salida = (dsm_reserva_estado_t){
         .id = v->id, .bytes = v->bytes, .retirando = v->retirando,
         .provisional = v->provisional,
@@ -469,6 +538,8 @@ int dsm_consultar_reserva(dsm_context_t *ctx, dsm_reserva_id_t id, dsm_reserva_e
     return salir(DSM_OK);
 }
 
+/* El contador es del contexto completo, no de una reserva: ningún trabajador
+ * registrado puede coexistir con el desmontaje de sus ventanas. */
 int dsm_desvincular_reserva(dsm_context_t *ctx, dsm_reserva_id_t id)
 {
     int rc = entrar(ctx);
@@ -482,11 +553,15 @@ int dsm_desvincular_reserva(dsm_context_t *ctx, dsm_reserva_id_t id)
     if ((id >> 16) == ctx->nodo) {
         return salir(DSM_ERR_ESTADO);
     }
+    /* El contador incluye trabajadores de cualquier reserva de ctx; la ruta
+     * de retirada conserva su avance si una confirmación o el desmontaje fallan. */
     return salir(ctx->trabajadores == 0 ? desvincular(ctx, pos) : DSM_ERR_OCUPADA);
 }
 
-/* El creador cierra LOOKUP bajo el mutex del directorio antes de devolver
- * capacidad. Los bits se limpian tras cada ACK para poder reintentar. */
+/* El creador bloquea nuevos LOOKUP solo después de comprobar que no hay pins.
+ * Cierra sus copias antes de retirar la ventana del paginador y soltar aportes;
+ * el aporte local se devuelve al final. Cada ACK limpia su bit, de modo que
+ * un error conserva solo las etapas pendientes. Un provisional usa CANCEL. */
 static int liberar(dsm_context_t *ctx, struct vinculacion **pos)
 {
     struct vinculacion *v = *pos;
@@ -530,6 +605,8 @@ static int liberar(dsm_context_t *ctx, struct vinculacion **pos)
     return DSM_OK;
 }
 
+/* Valida propiedad y exclusión de trabajadores antes de iniciar la retirada.
+ * Si liberar() falla después de empezar, el registro permite continuar por ID. */
 int dsm_liberar(dsm_context_t *ctx, dsm_reserva_id_t id)
 {
     int rc = entrar(ctx);
@@ -540,6 +617,8 @@ int dsm_liberar(dsm_context_t *ctx, dsm_reserva_id_t id)
     if (*pos == NULL || (id >> 16) != ctx->nodo) {
         return salir(*pos == NULL ? DSM_ERR_INVAL : DSM_ERR_ESTADO);
     }
+    /* liberar() cancela provisionales o continúa los bits pendientes de un
+     * retiro propio. Solo el éxito permite olvidar el ID y sus punteros. */
     return salir(ctx->trabajadores == 0 ? liberar(ctx, pos) : DSM_ERR_OCUPADA);
 }
 
@@ -549,9 +628,15 @@ int dsm_cerrar(dsm_context_t *ctx)
     if (rc != DSM_OK) {
         return rc;
     }
+    /* entrar() mantiene el mutex del API. Los registros fijan la vida de Ar
+     * y las consultas fijan la del contexto mientras sueltan ese mutex. */
     if (ctx->trabajadores != 0 || ctx->consultas != 0) {
         return salir(DSM_ERR_OCUPADA);
     }
+    /* Primero entregar las copias remotas; después liberar las propias y
+     * cancelar preparaciones. Cada éxito elimina su entrada inmediatamente:
+     * un error posterior conserva ctx, pero no revierte cierres anteriores.
+     * Los lectores TCP y callbacks del pager no toman el mutex del API. */
     struct vinculacion **pos = &ctx->reservas;
     while (*pos != NULL) {
         if (((*pos)->id >> 16) == ctx->nodo) {
@@ -566,10 +651,16 @@ int dsm_cerrar(dsm_context_t *ctx)
             return salir(rc);
         }
     }
+    /* El directorio puede seguir aportando a reservas ajenas aunque la lista
+     * del API esté vacía. Solo tras comprobarlo se cierra el pager: restaura
+     * acciones, hace sem_post de cierre, une su Pthread y destruye recursos.
+     * Un fallo en esta etapa tampoco vuelve atómico el cierre precedente. */
     if (dsm_directorio_preparar_cierre(&ctx->directorio) != 0 ||
         dsm_pager_cerrar(ctx->pager) != 0) {
         return salir(error_api(errno));
     }
+    /* El pager ya no puede llamar al resolutor. Coherencia detiene capacidad,
+     * avisos y red antes de destruir el directorio y devolver el puesto. */
     dsm_coherencia_cerrar(ctx->coherencia);
     dsm_directorio_cerrar(&ctx->directorio);
     dsm_pool_liberar();
@@ -578,6 +669,8 @@ int dsm_cerrar(dsm_context_t *ctx)
     return salir(DSM_OK);
 }
 
+/* La resta comprueba el intervalo lógico sin sumar offset+bytes y desbordar.
+ * Una operación vacía admite el extremo final, pero no un ID ausente o retirándose. */
 static int validar_rango(struct vinculacion *v, size_t offset, size_t bytes)
 {
     if (v == NULL || offset > v->bytes || bytes > v->bytes - offset) {
@@ -586,6 +679,8 @@ static int validar_rango(struct vinculacion *v, size_t offset, size_t bytes)
     return v->retirando ? DSM_ERR_OCUPADA : DSM_OK;
 }
 
+/* El ordinal se valida contra el tamaño lógico y se traduce con el mapa local
+ * del directorio. Consultar esta identidad no resuelve datos ni permisos MSI. */
 int dsm_ubicacion_pagina(dsm_context_t *ctx, dsm_reserva_id_t id, size_t orden,
                          dsm_node_id_t *hogar, uint64_t *gpn)
 {
@@ -601,6 +696,8 @@ int dsm_ubicacion_pagina(dsm_context_t *ctx, dsm_reserva_id_t id, size_t orden,
     if (v->retirando) {
         return salir(DSM_ERR_OCUPADA);
     }
+    /* Leer el descriptor conserva el ordinal lógico y no requiere traer su
+     * imagen: un GPN válido no demuestra disponibilidad actual de sus datos. */
     dsm_pagina_desc_t pagina;
     if (dsm_directorio_pagina_reserva(&ctx->directorio, id, orden, &pagina) != 0) {
         return salir(error_api(errno));
@@ -610,6 +707,9 @@ int dsm_ubicacion_pagina(dsm_context_t *ctx, dsm_reserva_id_t id, size_t orden,
     return salir(DSM_OK);
 }
 
+/* Exclusión de copias controladas locales: dos lectores pueden coincidir,
+ * pero un solapamiento con escritura espera. Ar directa y otros nodos no
+ * participan en esta lista; requieren sincronización del usuario y MSI. */
 static int hay_conflicto(const dsm_context_t *ctx, const struct copia *nueva)
 {
     for (const struct copia *c = ctx->copias; c != NULL; c = c->siguiente) {
@@ -621,6 +721,9 @@ static int hay_conflicto(const dsm_context_t *ctx, const struct copia *nueva)
     return 0;
 }
 
+/* Reconoce un buffer contenido en una Ar conocida y valida su rango lógico.
+ * Así también el extremo de la copia que parece un puntero C usa coherencia.
+ * La accesibilidad de un buffer ordinario sigue siendo deber del llamador. */
 static int buscar_buffer(dsm_context_t *ctx, const void *buffer, size_t bytes,
                           struct vinculacion **vinculo, size_t *offset)
 {
@@ -649,6 +752,8 @@ static int buscar_buffer(dsm_context_t *ctx, const void *buffer, size_t bytes,
     return DSM_OK;
 }
 
+/* El ordinal identifica el GPN; coherencia consigue/revalida S o M y copia
+ * mediante Cr bajo el mutex del directorio. Esta ruta no desreferencia Ar. */
 static int copiar_pagina(dsm_context_t *ctx, struct vinculacion *v, size_t offset,
                           void *scratch, size_t bytes, int escritura, const struct timespec *plazo)
 {
@@ -675,6 +780,7 @@ struct respaldo_copia {
     size_t cantidad, capacidad;
 };
 
+/* Libera el diario temporal; restaurar datos es una operación independiente. */
 static void descartar_respaldo(struct respaldo_copia *r)
 {
     free(r->previo);
@@ -682,9 +788,11 @@ static void descartar_respaldo(struct respaldo_copia *r)
     free(r->trozos);
 }
 
+/* Reserva antes de escribir los bytes previos/nuevos y un registro por trozo.
+ * Los cortes de ambas vistas pueden producir más trozos que páginas destino. */
 static int crear_respaldo(struct respaldo_copia *r, size_t bytes, size_t pagina)
 {
-    /* Cada vista agrega a lo sumo un corte por pagina, mas sus extremos. */
+    /* Cada vista agrega a lo sumo un corte por página, más sus extremos. */
     if (bytes / pagina > (SIZE_MAX - 3) / 2) {
         return DSM_ERR_NOMEM;
     }
@@ -702,6 +810,9 @@ static int crear_respaldo(struct respaldo_copia *r, size_t bytes, size_t pagina)
     return DSM_OK;
 }
 
+/* Capturar el valor previo y escribir el nuevo ocurre en la misma sección
+ * crítica del directorio, con M vigente. Se anotan solo trozos completados,
+ * junto con la versión que debe conservarse para permitir la restauración. */
 static int escribir_respaldado(dsm_context_t *ctx, struct vinculacion *v, size_t offset,
                                 void *scratch, size_t bytes, size_t inicio,
                                 struct respaldo_copia *respaldo, const struct timespec *plazo)
@@ -726,12 +837,15 @@ static int escribir_respaldado(dsm_context_t *ctx, struct vinculacion *v, size_t
     return DSM_OK;
 }
 
+/* Deshace en orden inverso únicamente trozos aún propios, M, de igual versión
+ * y con el contenido que dejó la copia. Pérdida, invalidación o cambios ajenos
+ * impiden restaurar ese trozo; se ignora ese fallo para conservar el original. */
 static void restaurar_copia(dsm_context_t *ctx, struct vinculacion *v,
                              const struct respaldo_copia *respaldo)
 {
     for (size_t i = respaldo->cantidad; i-- > 0;) {
         const struct trozo_respaldo *t = &respaldo->trozos[i];
-        /* No RPC ni nueva concesion: si cambio la version, el permiso o los
+        /* No RPC ni nueva concesión: si cambió la versión, el permiso o los
          * datos se conserva lo vigente y el llamador recibe su error original. */
         (void)dsm_directorio_restaurar_respaldo(&ctx->directorio, v->id, t->gpn,
                                                 t->destino % ctx->cfg.page_size,
@@ -741,6 +855,10 @@ static void restaurar_copia(dsm_context_t *ctx, struct vinculacion *v,
     }
 }
 
+/* Comparte un plazo monotónico entre resoluciones, sin reiniciarlo por página.
+ * El sentido de memmove y los cortes de ambas vistas preservan solapamientos;
+ * cada trozo cabe en scratch. Una lectura a almacenamiento temporal pospone
+ * publicar el destino ordinario, pero no convierte las páginas en una instantánea. */
 static int copiar_trozos(dsm_context_t *ctx, struct vinculacion *fuente, size_t offset_fuente,
                           const void *origen, struct vinculacion *receptor, size_t offset_receptor,
                           void *destino, size_t bytes, unsigned char *scratch,
@@ -805,6 +923,8 @@ static int copiar_trozos(dsm_context_t *ctx, struct vinculacion *fuente, size_t 
     return DSM_OK;
 }
 
+/* El llamador recuperó el mutex del API; retira su intervalo antes de despertar
+ * las copias en espera y, si corresponde, desregistrar el trabajador temporal. */
 static void retirar_copia(dsm_context_t *ctx, struct copia *copia)
 {
     struct copia **actual = &ctx->copias;
@@ -814,6 +934,11 @@ static void retirar_copia(dsm_context_t *ctx, struct copia *copia)
     *actual = copia->siguiente;
 }
 
+/* Valida ambos rangos bajo el mutex del API y mantiene un trabajador registrado
+ * para impedir el desmontaje de las vistas mientras libera ese mutex durante
+ * las copias/RPC. Los intervalos serializan conflictos locales; los permisos
+ * y datos por página los protege el directorio. El usuario sincroniza buffers
+ * ordinarios y accesos Ar directos, que no pasan por esta lista de intervalos. */
 static int copiar(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
                   void *destino, const void *origen, size_t bytes, int escritura)
 {
@@ -863,6 +988,8 @@ static int copiar(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
                           .escritura = escritura};
     struct copia adicional = {.reserva = buffer, .inicio = offset_buffer,
                               .fin = offset_buffer + bytes, .escritura = !escritura};
+    /* Esta espera local precede al plazo de resolución y conserva el registro
+     * del hilo; rpc_timeout_ms no limita la duración total de esta llamada. */
     while (hay_conflicto(ctx, &copia) || (buffer != NULL && hay_conflicto(ctx, &adicional))) {
         pthread_cond_wait(&fin_copia, &mutex);
     }
@@ -874,7 +1001,7 @@ static int copiar(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
     ctx->copias = &copia;
     pthread_mutex_unlock(&mutex);
 
-    /* El registro mantiene vivas ambas vistas durante un RPC. Solo scratch
+    /* El registro mantiene vivas ambas vistas durante una RPC. Solo scratch
      * cruza el mutex del directorio, y la copia conserva el orden de memmove. */
     unsigned char *direccion = (unsigned char *)v->base + offset;
     if (escritura) {
@@ -899,24 +1026,36 @@ static int copiar(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
         retirar_copia(ctx, &adicional);
     }
     pthread_cond_broadcast(&fin_copia);
+    /* El destino pudo publicarse al terminar la copia. Un fallo únicamente de
+     * desregistro se devuelve sin deshacer esa publicación; si ya falló la
+     * copia, su error conserva prioridad sobre el de limpieza del registro. */
     int desregistro = temporal ? desregistrar(ctx) : DSM_OK;
     return salir(rc != DSM_OK ? rc : desregistro);
 }
 
+/* Hacia memoria ordinaria, copiar() prepara toda la lectura antes de publicarla;
+ * hacia otra Ar, adquiere permisos y escribe trozos sin diario de restauración. */
 int dsm_leer(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
              void *destino, size_t bytes)
 {
+    /* copiar() pospone publicar el destino ordinario hasta completar la
+     * lectura DSM; hacia Ar escribe por trozos. Un desregistro temporal que
+     * falle después de publicar puede devolver error con los bytes ya copiados. */
     return copiar(ctx, id, offset, destino, NULL, bytes, 0);
 }
 
+/* Activa el diario por trozo y el intento de restauración local ante fallo. */
 int dsm_escribir(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset,
                  const void *origen, size_t bytes)
 {
-    /* La restauracion local es condicional: nunca recupera permisos por RPC
-     * ni sobrescribe una version o bytes que hayan cambiado desde la copia. */
+    /* La restauración por error de copia es condicional: conserva cambios
+     * ajenos y nunca recupera permisos por RPC. Un fallo solo del desregistro
+     * temporal ocurre después de publicar y no activa esa restauración. */
     return copiar(ctx, id, offset, NULL, origen, bytes, 1);
 }
 
+/* Una RPC STATS histórica por intento: el destino local se despacha sin TCP.
+ * Al tener éxito, msg->paginas es temporal y debe liberarse en este nivel. */
 static int pedir_stats(dsm_context_t *ctx, uint16_t par, uint8_t seleccion, dsm_stats_reply_t *msg)
 {
     if (dsm_coherencia_stats(ctx->coherencia, par, seleccion, msg) != 0) {
@@ -925,12 +1064,15 @@ static int pedir_stats(dsm_context_t *ctx, uint16_t par, uint8_t seleccion, dsm_
     return DSM_OK;
 }
 
-/* Un par apagado no aporta páginas. La consulta lo anota como fuera y sigue. */
+/* Solo NODO/TIEMPO admiten cobertura degradada. Cada API decide si representa
+ * al ausente, omite sus filas o propaga el error; su ocupación es desconocida. */
 static int par_mudo(int rc)
 {
     return rc == DSM_ERR_NODO || rc == DSM_ERR_TIEMPO;
 }
 
+/* Conserva identidad y bytes nominales, sin inventar medidas de ocupación ni
+ * contadores. respondio queda a cero y distingue estos ceros de una respuesta. */
 static void anotar_sin_respuesta(dsm_nodo_info_t *info, const dsm_nodo_cfg_t *nodo, int error)
 {
     memset(info, 0, sizeof *info);
@@ -959,6 +1101,9 @@ static void llenar_nodo(dsm_nodo_info_t *info, const dsm_ficha_t *ficha, const u
     info->respondio = 1;
 }
 
+/* Publicación diferida para nodos/páginas históricos. NULL/0 cuenta sin
+ * copiar, pero sus llamadores ya reunieron las respuestas; no ahorra RPC.
+ * NOMEM por cap corto conserva tanto el prefijo copiado como el total real. */
 static int publicar(void *salida, size_t cap, size_t tam, size_t total, const void *origen,
                     size_t *cantidad)
 {
@@ -973,8 +1118,10 @@ static int publicar(void *salida, size_t cap, size_t tam, size_t total, const vo
     return total <= cap ? DSM_OK : DSM_ERR_NOMEM;
 }
 
-/* Una consulta usa la configuración inmutable y su propia RPC. El cierre
- * observa esta referencia sin bloquear a lectores, avisos ni otras consultas. */
+/* entrar deja tomado el mutex del API. La referencia impide que dsm_cerrar
+ * consuma ctx, pero no inmoviliza reservas ni sus descriptores. Se suelta antes
+ * de RPC, copias de salida o E/S: el directorio protege cada respuesta con su
+ * propio mutex, sin crear una instantánea del recorrido. No registra el hilo. */
 static int comenzar_consulta(dsm_context_t *ctx)
 {
     int rc = entrar(ctx);
@@ -985,6 +1132,8 @@ static int comenzar_consulta(dsm_context_t *ctx)
     return rc;
 }
 
+/* Emparejar toda salida posterior a comenzar_consulta exitoso. Solo se toma
+ * el mutex del API para retirar la referencia; no se altera el resultado. */
 static int fin_consulta(dsm_context_t *ctx, int rc)
 {
     pthread_mutex_lock(&mutex);
@@ -992,6 +1141,9 @@ static int fin_consulta(dsm_context_t *ctx, int rc)
     return salir(rc);
 }
 
+/* Copia por valor: el último solicitante nunca redefine al propietario.
+ * Solo PUB1 acredita procedencia pública; libres está en páginas y puede ser
+ * UINT32_MAX cuando el emisor desconoce la ocupación del hogar de esta copia. */
 static dsm_pagina_info_t pagina_publica(const dsm_pagina_consulta_t *p, uint32_t libres)
 {
     return (dsm_pagina_info_t){
@@ -1013,6 +1165,8 @@ int dsm_consultar_nodo(dsm_context_t *ctx, uint16_t nodo, dsm_nodo_info_t *salid
     if (rc != DSM_OK) return rc;
     if (salida == NULL || nodo >= ctx->cfg.cantidad_nodos)
         return fin_consulta(ctx, DSM_ERR_INVAL);
+    /* La referencia de consulta mantiene vivo el contexto durante pedir_stats().
+     * Solo una respuesta válida aporta ocupación y contadores para esta ficha. */
     dsm_stats_reply_t msg;
     rc = pedir_stats(ctx, nodo, DSM_STATS_NODOS, &msg);
     if (rc == DSM_OK) {
@@ -1034,6 +1188,8 @@ int dsm_consultar_nodos(dsm_context_t *ctx, dsm_nodo_info_t *salida, size_t cap,
     *cantidad = 0;
     uint16_t nodos = ctx->cfg.cantidad_nodos;
     dsm_nodo_info_t tabla[DSM_CONFIG_MAX_NODOS];
+    /* Se consulta toda la configuración aunque cap sea cero. Los ausentes
+     * conservan fila nominal; otros errores abortan sin publicar esta tabla. */
     for (uint16_t id = 0; id < nodos; id++) {
         dsm_stats_reply_t msg;
         rc = pedir_stats(ctx, id, DSM_STATS_NODOS, &msg);
@@ -1068,6 +1224,8 @@ int dsm_consultar_paginas(dsm_context_t *ctx, uint16_t hogar, dsm_pagina_info_t 
     dsm_pagina_info_t *tabla = NULL;
     size_t total = 0;
     int parcial = 0;
+    /* STATS_HOGAR enumera descriptores asignados, no bitmap ni preparaciones.
+     * Se acumulan todos antes de publicar, incluso si salida es NULL/0. */
     for (uint16_t id = desde; id < hasta; id++) {
         dsm_stats_reply_t msg;
         rc = pedir_stats(ctx, id, DSM_STATS_HOGAR, &msg);
@@ -1098,6 +1256,7 @@ int dsm_consultar_paginas(dsm_context_t *ctx, uint16_t hogar, dsm_pagina_info_t 
     }
     rc = publicar(salida, cap, sizeof *salida, total, tabla, cantidad);
     free(tabla);
+    /* Un cap insuficiente conserva NOMEM, aun si también faltaron hogares. */
     return fin_consulta(ctx, rc == DSM_OK && parcial ? DSM_ERR_PARCIAL : rc);
 }
 
@@ -1112,6 +1271,8 @@ int dsm_consultar_rango(dsm_context_t *ctx, uint16_t hogar, int copias,
         (hogar != DSM_HOGAR_TODOS && hogar >= ctx->cfg.cantidad_nodos) ||
         (copias && hogar != ctx->nodo)) return fin_consulta(ctx, DSM_ERR_INVAL);
     *cantidad = 0; *siguiente = desde; *mas = 0;
+    /* A diferencia de publicar(), este recorrido escribe cada respuesta de
+     * inmediato. Un error posterior no deshace el prefijo ni sus cursores. */
     uint16_t inicio = hogar == DSM_HOGAR_TODOS ? 0 : hogar;
     uint16_t fin = hogar == DSM_HOGAR_TODOS ? ctx->cfg.cantidad_nodos : (uint16_t)(hogar + 1u);
     uint64_t total_gpn = ctx->directorio.limites_gpn[ctx->cfg.cantidad_nodos];
@@ -1134,6 +1295,8 @@ int dsm_consultar_rango(dsm_context_t *ctx, uint16_t hogar, int copias,
         }
         if (par_mudo(rc) && hogar == DSM_HOGAR_TODOS) {
             parcial = 1;
+            /* El cursor cruza este hueco cuando aún se buscaban filas. Un
+             * reintento desde siguiente no recuperará el intervalo ausente. */
             if (*cantidad < limite) *siguiente = fin_hogar;
             continue;
         }
@@ -1141,6 +1304,7 @@ int dsm_consultar_rango(dsm_context_t *ctx, uint16_t hogar, int copias,
         if (*cantidad < limite) {
             for (uint32_t i = 0; i < msg.p; i++)
                 salida[(*cantidad)++] = pagina_publica(&msg.paginas[i],
+                    /* La ficha local no mide los libres del hogar remoto. */
                     copias && msg.paginas[i].hogar != ctx->nodo ? UINT32_MAX : msg.fichas[0].libres);
             *siguiente = msg.siguiente;
             *mas = msg.mas;
@@ -1170,6 +1334,9 @@ int dsm_imprimir(dsm_context_t *ctx, FILE *salida, int global)
     uint16_t hasta = global ? ctx->cfg.cantidad_nodos : (uint16_t)(ctx->nodo + 1u);
     int parcial = 0;
     for (uint16_t id = desde; id < hasta; id++) {
+        /* Local conserva todos los descriptores conocidos (no solo ventanas
+         * vinculadas); global conserva solo los asignados en cada hogar.
+         * Ambos formatos son históricos, sin inventario ni paginación. */
         dsm_stats_reply_t msg;
         rc = pedir_stats(ctx, id, global ? DSM_STATS_HOGAR : DSM_STATS_AMBOS, &msg);
         if (global && par_mudo(rc)) {
@@ -1205,6 +1372,9 @@ int dsm_imprimir(dsm_context_t *ctx, FILE *salida, int global)
                 msg.contadores[DSM_CONTA_BYTES_ENV], msg.contadores[DSM_CONTA_BYTES_REC]);
         for (uint32_t i = 0; i < msg.p; i++) {
             const dsm_pagina_consulta_t *p = &msg.paginas[i];
+            /* Compatibilidad de la impresión histórica: libres procede del
+             * emisor incluso si este descriptor local tiene hogar remoto.
+             * El recorrido nuevo de copias usa UINT32_MAX para ese hogar. */
             fprintf(salida,
                     "pagina gpn %" PRIu64 " hogar %u poseedor %u msi %c reserva %" PRIu32
                     " orden %" PRIu32 " proceso %" PRIu32 " memoria_libre %u version %" PRIu32 " mascara %" PRIu64 " permiso %u tabla %s\n",
@@ -1214,9 +1384,14 @@ int dsm_imprimir(dsm_context_t *ctx, FILE *salida, int global)
         }
         free(msg.paginas);
     }
+    /* Solo aquí se inspecciona el flujo. Los errores RPC retornan antes y el
+     * texto ya emitido queda en manos del llamador, sin fflush ni rollback. */
     return fin_consulta(ctx, ferror(salida) ? DSM_ERR_ESTADO : parcial ? DSM_ERR_PARCIAL : DSM_OK);
 }
 
+/* Solo aritmética sobre una vista vinculada y un byte lógico válido. Este
+ * préstamo no consulta la red ni asegura la disponibilidad de esa página;
+ * desreferenciar Ar requiere registro y puede entrar al manejador de SIGSEGV. */
 int dsm_traducir(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset, void **salida)
 {
     int rc = entrar(ctx);
@@ -1224,6 +1399,8 @@ int dsm_traducir(dsm_context_t *ctx, dsm_reserva_id_t id, size_t offset, void **
         return rc;
     }
     struct vinculacion *v = *posicion(ctx, id);
+    /* Validar un byte excluye el extremo final. Devolver una dirección no
+     * implica acceder a Ar ni adquirir el permiso necesario para hacerlo. */
     rc = validar_rango(v, offset, 1);
     if (salida != NULL && rc == DSM_OK) {
         *salida = (unsigned char *)v->base + offset;
@@ -1237,6 +1414,8 @@ int dsm_aviso_publicar(dsm_context_t *ctx, const char *clave, const void *datos,
     if (rc != DSM_OK) {
         return rc;
     }
+    /* dsm_aviso_emitir() copia el valor con la identidad de este nodo. El
+     * trabajador difundir() se encarga del TCP después de encolarlo. */
     rc = dsm_aviso_emitir(ctx->coherencia, ctx->nodo, clave, datos, n);
     return salir(rc);
 }
@@ -1248,6 +1427,8 @@ int dsm_aviso_consultar(dsm_context_t *ctx, const char *clave, uint16_t *autor,
     if (rc != DSM_OK) {
         return rc;
     }
+    /* dsm_aviso_leer() elige el menor autor vigente que tenga exactamente n
+     * bytes. El mutex del API mantiene vivo el contexto durante esta lectura. */
     return salir(dsm_aviso_leer(ctx->coherencia, clave, autor, datos, n));
 }
 
@@ -1258,6 +1439,8 @@ int dsm_aviso_participantes(dsm_context_t *ctx, const char *clave, uint16_t *aut
     if (rc != DSM_OK) {
         return rc;
     }
+    /* dsm_aviso_autores() cuenta también las coincidencias que no caben.
+     * El grupo de la aplicación puede así detectar una lista incompleta. */
     return salir(dsm_aviso_autores(ctx->coherencia, clave, autores, cap, cantidad));
 }
 
@@ -1268,6 +1451,8 @@ int dsm_aviso_consultar_autor(dsm_context_t *ctx, const char *clave,
     if (rc != DSM_OK) {
         return rc;
     }
+    /* dsm_aviso_leer_autor() filtra por el ID pedido y revalida la sesión
+     * antes de copiar, para descartar anuncios de una instancia anterior. */
     return salir(dsm_aviso_leer_autor(ctx->coherencia, clave, autor, datos, n));
 }
 
@@ -1277,6 +1462,8 @@ int dsm_aviso_retirar(dsm_context_t *ctx, const char *clave)
     if (rc != DSM_OK) {
         return rc;
     }
+    /* dsm_aviso_quitar() marca la publicación propia como retirada. Una
+     * publicación con la misma clave de otro autor sigue siendo independiente. */
     return salir(dsm_aviso_quitar(ctx->coherencia, clave));
 }
 
@@ -1286,16 +1473,25 @@ int dsm_aviso_sesion(dsm_context_t *ctx, uint16_t autor, uint64_t *sesion)
     if (rc != DSM_OK) {
         return rc;
     }
+    /* dsm_coherencia_sesion() devuelve el token propio o consulta el enlace
+     * del par bajo el mutex de red. No necesita enviar una solicitud TCP. */
     rc = dsm_coherencia_sesion(ctx->coherencia, autor, sesion);
     return salir(rc == 0 ? DSM_OK : error_api(errno));
 }
 
 int dsm_sondear(dsm_context_t *ctx, uint32_t plazo_ms)
 {
+    /* comenzar_consulta() incrementa la referencia de vida y suelta el mutex
+     * del API: cerrar devolverá OCUPADA mientras la red espera con su propia
+     * condición CLOCK_MONOTONIC. No interviene el semáforo del paginador. */
     int rc = comenzar_consulta(ctx);
     if (rc != DSM_OK) {
         return rc;
     }
+    /* La red adelanta reintentos salientes a IDs mayores y observa entradas
+     * de los menores. ETIMEDOUT de la ronda con ausentes se convierte allí
+     * en éxito; solo errores efectivos llegan a error_api(). */
     rc = dsm_coherencia_sondear(ctx->coherencia, plazo_ms);
+    /* Recuperar el mutex y liberar la referencia incluso si el sondeo falló. */
     return fin_consulta(ctx, rc == 0 ? DSM_OK : error_api(errno));
 }
